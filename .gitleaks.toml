@@ -1,0 +1,11 @@
+title = "stardust"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Local build output is not source"
+paths = [
+  '''(^|/)\.ci-tools/''',
+  '''(^|/)target/''',
+]

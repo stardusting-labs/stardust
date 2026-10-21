@@ -1,0 +1,24 @@
+[package]
+name = "stardust"
+description = "Tray companion that shows ORBIT check results"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+stardust-core = { path = "../stardust-core" }
+chrono = { workspace = true }
+iana-time-zone = "0.1.65"
+keyring = "4.2.0"
+notify-rust = "4.18.2"
+open = "5.4.4"
+softbuffer = "0.4.8"
+tokio = { workspace = true }
+tray-icon = { version = "0.26.1", default-features = false }
+winit = "0.30.13"
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
