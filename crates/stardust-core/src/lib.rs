@@ -13,6 +13,7 @@ pub mod copy;
 pub mod integrations;
 pub mod mcp;
 pub mod outbound;
+pub mod pet;
 pub mod policy;
 pub mod position;
 pub mod schedule;

@@ -10,6 +10,7 @@ pub struct Wake;
 pub enum UiMsg {
     Menu(String),
     Checked(Presentation),
+    Pet,
 }
 
 #[derive(Clone)]

@@ -2600,6 +2600,7 @@ dependencies = [
  "keyring",
  "notify-rust",
  "open",
+ "png",
  "softbuffer",
  "stardust-core",
  "tokio",

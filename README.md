@@ -12,6 +12,22 @@ Each check asks the alerts endpoint once. The summary has a count, an optional s
 
 The character can be shown or hidden. The exact screen position is stored either way. While the character is hidden, only the bubble appears, at that stored position. While the character is shown, the bubble sits just above it. A position that falls outside every monitor is clamped for display and left unchanged in the config file. The bubble window exists only while a result is on screen.
 
+## Pet
+
+The tray pet has two skins. Astronaut is the default. Star is the other. Either skin, and a size of 2x or 3x, can be chosen from the tray menu. The choice is saved in the config file and applies without a restart.
+
+Sprites are nearest-neighbour scaled. At 2x the astronaut is 48px and the star is 64px. At 3x those are 72px and 96px. A status mark sits on the pet's top-right corner. The normal face has no mark.
+
+The face follows the latest check, and whether quiet hours are in effect when the pet is drawn:
+
+- Before the first check, the pet is normal. During quiet hours it sleeps.
+- A high-severity item uses the alert face, including during quiet hours.
+- A failed check uses the error face.
+- A check with nothing new uses the happy face, or sleeps during quiet hours.
+- Any other new or changed item uses the alert face, or sleeps during quiet hours.
+
+The tray icon uses the normal, alert, or error picture at 16, 32, or 64 pixels, from the monitor scale. Sleep and happy keep the normal tray picture. Art credits and the full MIT license texts are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Schedule
 
 Timing is yours:
@@ -44,6 +60,8 @@ Config is JSON. On Linux it is `$XDG_CONFIG_HOME/stardust/config.json` or `~/.co
 {
   "character_visible": false,
   "character_position": { "x": 64, "y": 64 },
+  "pet_skin": "astronaut",
+  "pet_scale": 2,
   "schedule": {
     "interval_minutes": 45,
     "clock_times": ["09:00", "13:00", "18:00"],
@@ -81,7 +99,7 @@ stardust integration connect slack
 
 ## Dependencies
 
-No font file is bundled. The on-screen letters are an original bitmap, so no OFL font is included. No government dataset is bundled. Check results still come from ORBIT.
+No font file is bundled. The on-screen letters are an original bitmap, so no OFL font is included. No government dataset is bundled. Check results still come from ORBIT. Pet and tray pictures are bundled. Credits and the MIT license texts are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Direct crates:
 
@@ -90,8 +108,9 @@ Direct crates:
 | sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | uuid | 1.28.0 | Apache-2.0 OR MIT |
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
+| png | 0.18.1 | MIT OR Apache-2.0 |
 
-`uuid` was already in the tree. `sha2` 0.11.1 was already in the tree; 0.10.9 is the version this crate calls. The HTTPS client adds these crates:
+`uuid` was already in the tree. `sha2` 0.11.1 was already in the tree; 0.10.9 is the version this crate calls. `png` 0.18.1 was already in the tree through the tray icon. This crate calls it, with default features off, to decode the pet sprites. No new transitive crates were added. The HTTPS client adds these crates:
 
 | Crate | Version | License |
 | --- | --- | --- |
@@ -143,4 +162,4 @@ Measured on Linux x86_64 with the release binary, the character hidden, a 24 hou
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [SECURITY.md](SECURITY.md).
+Apache-2.0. See [LICENSE](LICENSE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and [SECURITY.md](SECURITY.md).

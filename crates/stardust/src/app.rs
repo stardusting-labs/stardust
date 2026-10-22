@@ -3,6 +3,7 @@ use crate::cli::{self, CharacterAction, Command};
 use crate::deliver;
 use crate::inbox::{Inbox, UiMsg};
 use crate::keychain::KeychainTokenStore;
+use crate::live::LivePet;
 use crate::notify;
 use crate::tray::Tray;
 use crate::window::{self, Session};
@@ -11,6 +12,7 @@ use stardust_core::api::{MockOrbitClient, OrbitClient};
 use stardust_core::check::{note_anchor, note_success, perform_check, CheckKind};
 use stardust_core::config::{default_config_path, load_config, save_config, Config};
 use stardust_core::outbound::prepare_posts;
+use stardust_core::pet::{pet_pose, tray_glyph, ObservedCheck};
 use stardust_core::position::ScreenPoint;
 use stardust_core::schedule::{parse_timezone, FireSource};
 use stardust_core::text::menu_text;
@@ -100,8 +102,13 @@ fn show_schedule(path: &Path, config: &Config) {
         "hidden"
     };
     let position = config.character_position();
+    let skin = match config.pet_skin() {
+        stardust_core::pet::PetSkin::Astronaut => "astronaut",
+        stardust_core::pet::PetSkin::Star => "star",
+    };
     println!("{}", path.display());
     println!("character {visibility} at {}, {}", position.x, position.y);
+    println!("pet {skin} at {}x", config.pet_scale().factor());
     println!("{}", text.schedule);
     println!("{}", text.integrations);
     println!("{}", text.last_checked);
@@ -120,6 +127,7 @@ fn check_once(path: &Path) -> Result<(), String> {
         &config,
         path,
         &KeychainTokenStore::new(),
+        &LivePet::new(1.0),
         &CheckKind::Manual,
     ))?;
     for line in &presentation.summary.lines {
@@ -139,12 +147,19 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
     let quit = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(tokio::sync::Notify::new());
     let tray = Rc::new(RefCell::new(None));
+    let live = LivePet::new(if headless {
+        1.0
+    } else {
+        window::detect_scale_factor()
+    });
     if !headless {
-        let text = {
+        let (text, glyph) = {
             let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-            menu_text(&loaded, Utc::now())
+            let text = menu_text(&loaded, Utc::now());
+            let glyph = glyph_for(&loaded, live.observed());
+            (text, glyph)
         };
-        let installed = Tray::install(&inbox, &text)?;
+        let installed = Tray::install(&inbox, &text, glyph, live.scale_factor())?;
         *tray.borrow_mut() = Some(installed);
     }
     let scheduler = {
@@ -154,9 +169,10 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
         let wake = Arc::clone(&wake);
         let inbox = inbox.clone();
         let path = path.clone();
+        let live = live.clone();
         thread::Builder::new()
             .name("stardust-schedule".to_string())
-            .spawn(move || scheduler_thread(config, path, manual, quit, wake, inbox))
+            .spawn(move || scheduler_thread(config, path, manual, quit, wake, inbox, live))
             .map_err(|err| err.to_string())?
     };
     let mut windows_unavailable = false;
@@ -177,6 +193,7 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
                 quit: Arc::clone(&quit),
                 wake: Arc::clone(&wake),
                 tray: Rc::clone(&tray),
+                live: live.clone(),
             };
             if let Err(err) = window::run_session(session) {
                 windows_unavailable = true;
@@ -187,7 +204,7 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
                     }
                 }
             }
-            refresh_tray(&config, &tray);
+            refresh_tray(&config, &live, &tray);
             continue;
         }
         match inbox.wait_timeout(Duration::from_secs(45)) {
@@ -220,7 +237,7 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
                         break;
                     }
                 }
-                refresh_tray(&config, &tray);
+                refresh_tray(&config, &live, &tray);
             }
             Some(UiMsg::Checked(presentation)) => {
                 if headless || windows_unavailable {
@@ -229,9 +246,10 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
                     inbox.push(UiMsg::Checked(presentation));
                     continue;
                 }
-                refresh_tray(&config, &tray);
+                refresh_tray(&config, &live, &tray);
             }
-            None => refresh_tray(&config, &tray),
+            Some(UiMsg::Pet) => refresh_tray(&config, &live, &tray),
+            None => refresh_tray(&config, &live, &tray),
         }
     }
     quit.store(true, Ordering::SeqCst);
@@ -247,6 +265,7 @@ fn scheduler_thread(
     quit: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
     inbox: Inbox,
+    live: LivePet,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -266,10 +285,12 @@ fn scheduler_thread(
                 break;
             }
             if manual.swap(false, Ordering::SeqCst) {
-                if let Ok(presentation) =
-                    run_check(&client, &config, &path, &tokens, &CheckKind::Manual).await
-                {
-                    inbox.push(UiMsg::Checked(presentation));
+                match run_check(&client, &config, &path, &tokens, &live, &CheckKind::Manual).await {
+                    Ok(presentation) => {
+                        inbox.push(UiMsg::Pet);
+                        inbox.push(UiMsg::Checked(presentation));
+                    }
+                    Err(_) => inbox.push(UiMsg::Pet),
                 }
                 continue;
             }
@@ -288,8 +309,12 @@ fn scheduler_thread(
                 slot: slot.at,
                 source: slot.source,
             };
-            if let Ok(presentation) = run_check(&client, &config, &path, &tokens, &kind).await {
-                inbox.push(UiMsg::Checked(presentation));
+            match run_check(&client, &config, &path, &tokens, &live, &kind).await {
+                Ok(presentation) => {
+                    inbox.push(UiMsg::Pet);
+                    inbox.push(UiMsg::Checked(presentation));
+                }
+                Err(_) => inbox.push(UiMsg::Pet),
             }
         }
     });
@@ -339,6 +364,7 @@ async fn run_check<C: OrbitClient>(
     config: &Mutex<Config>,
     path: &Path,
     tokens: &KeychainTokenStore,
+    live: &LivePet,
     kind: &CheckKind,
 ) -> Result<stardust_core::policy::Presentation, String> {
     let now = Utc::now();
@@ -355,6 +381,11 @@ async fn run_check<C: OrbitClient>(
     };
     match perform_check(client, cursor.as_deref(), now, &schedule, kind).await {
         Ok(outcome) => {
+            let item_count = u32::try_from(outcome.items.len()).unwrap_or(u32::MAX);
+            let high_severity = outcome
+                .items
+                .iter()
+                .any(|item| item.severity.is_high_or_above());
             let records = {
                 let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
                 note_anchor(loaded.state_mut(), kind);
@@ -364,6 +395,10 @@ async fn run_check<C: OrbitClient>(
                 }
                 loaded.integrations().to_vec()
             };
+            live.set_observed(ObservedCheck::Succeeded {
+                item_count,
+                high_severity,
+            });
             let local = now.with_timezone(&schedule.timezone());
             let notes = prepare_posts(
                 &records,
@@ -387,18 +422,27 @@ async fn run_check<C: OrbitClient>(
             if let Err(save_err) = save_config(path, &loaded) {
                 eprintln!("stardust: could not save config: {save_err}");
             }
+            drop(loaded);
+            live.set_observed(ObservedCheck::Failed);
             Err(err.to_string())
         }
     }
 }
 
-fn refresh_tray(config: &Mutex<Config>, tray: &RefCell<Option<Tray>>) {
-    let text = {
+fn glyph_for(config: &Config, observed: ObservedCheck) -> stardust_core::pet::TrayGlyph {
+    let local = Utc::now().with_timezone(&config.schedule().timezone());
+    tray_glyph(pet_pose(observed, config.schedule().is_quiet_at(local)))
+}
+
+fn refresh_tray(config: &Mutex<Config>, live: &LivePet, tray: &RefCell<Option<Tray>>) {
+    let observed = live.observed();
+    let scale = live.scale_factor();
+    let (text, glyph) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-        menu_text(&loaded, Utc::now())
+        (menu_text(&loaded, Utc::now()), glyph_for(&loaded, observed))
     };
     if let Some(tray) = tray.borrow().as_ref() {
-        if let Err(err) = tray.apply(&text) {
+        if let Err(err) = tray.apply(&text, glyph, scale) {
             eprintln!("stardust: could not update the tray menu: {err}");
         }
     }
