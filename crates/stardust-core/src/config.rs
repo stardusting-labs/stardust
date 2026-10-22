@@ -2,6 +2,10 @@
 //!
 //! Tokens are not stored here.
 
+use crate::integrations::{
+    parse_id, IntegrationError, IntegrationKind, IntegrationRecord, MAX_INTEGRATIONS,
+};
+use crate::outbound::public_https;
 use crate::position::ScreenPoint;
 use crate::schedule::{
     day_token, parse_clock, parse_interval, parse_quiet, parse_timezone, parse_weekdays, Schedule,
@@ -9,6 +13,7 @@ use crate::schedule::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -57,6 +62,8 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Schedule(#[from] ScheduleError),
+    #[error(transparent)]
+    Integration(#[from] IntegrationError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +84,8 @@ struct ConfigFile {
     schedule: ScheduleFile,
     #[serde(default)]
     state: CheckState,
+    #[serde(default)]
+    integrations: Vec<IntegrationRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,7 +95,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn default_for(timezone: &str) -> Result<Self, ScheduleError> {
+    pub fn default_for(timezone: &str) -> Result<Self, ConfigError> {
         let file = ConfigFile {
             character_visible: false,
             character_position: ScreenPoint { x: 64, y: 64 },
@@ -101,6 +110,7 @@ impl Config {
                 timezone: timezone.to_string(),
             },
             state: CheckState::default(),
+            integrations: Vec::new(),
         };
         Self::from_file(file)
     }
@@ -131,6 +141,84 @@ impl Config {
 
     pub fn state_mut(&mut self) -> &mut CheckState {
         &mut self.file.state
+    }
+
+    pub fn integrations(&self) -> &[IntegrationRecord] {
+        &self.file.integrations
+    }
+
+    pub fn add_integration(
+        &mut self,
+        kind: IntegrationKind,
+        id: &str,
+    ) -> Result<(), IntegrationError> {
+        if self.file.integrations.len() >= MAX_INTEGRATIONS {
+            return Err(IntegrationError::Full);
+        }
+        let record = IntegrationRecord::new(kind, id)?;
+        if self
+            .file
+            .integrations
+            .iter()
+            .any(|item| item.id == record.id)
+        {
+            return Err(IntegrationError::Duplicate);
+        }
+        self.file.integrations.push(record);
+        Ok(())
+    }
+
+    pub fn set_integration_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), IntegrationError> {
+        self.integration_mut(id)?.enabled = enabled;
+        Ok(())
+    }
+
+    pub fn set_integration_host(&mut self, id: &str, host: &str) -> Result<(), IntegrationError> {
+        if !valid_host(host) {
+            return Err(IntegrationError::Endpoint);
+        }
+        self.integration_mut(id)?.host = Some(host.to_ascii_lowercase());
+        Ok(())
+    }
+
+    pub fn set_integration_endpoint(
+        &mut self,
+        id: &str,
+        endpoint: &str,
+    ) -> Result<(), IntegrationError> {
+        let checked = public_https(endpoint).map_err(|_| IntegrationError::Endpoint)?;
+        let record = self.integration_mut(id)?;
+        if record.kind != IntegrationKind::OrbitMcp {
+            return Err(IntegrationError::Endpoint);
+        }
+        record.endpoint = Some(checked.url);
+        record.host = Some(checked.host);
+        Ok(())
+    }
+
+    pub fn set_integration_client_id(
+        &mut self,
+        id: &str,
+        client_id: &str,
+    ) -> Result<(), IntegrationError> {
+        if !valid_client_id(client_id) {
+            return Err(IntegrationError::Id);
+        }
+        self.integration_mut(id)?.client_id = Some(client_id.to_string());
+        Ok(())
+    }
+
+    fn integration_mut(&mut self, id: &str) -> Result<&mut IntegrationRecord, IntegrationError> {
+        let id = parse_id(id)?;
+        self.file
+            .integrations
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(IntegrationError::Missing(id))
     }
 
     pub fn apply_schedule_update(
@@ -178,12 +266,63 @@ impl Config {
         Ok(serde_json::to_string_pretty(&self.file)?)
     }
 
-    fn from_file(file: ConfigFile) -> Result<Self, ScheduleError> {
+    fn from_file(file: ConfigFile) -> Result<Self, ConfigError> {
         let schedule = schedule_from_file(&file.schedule)?;
+        validate_integrations(&file.integrations)?;
         let mut file = file;
         file.schedule = schedule_file(&schedule);
         Ok(Self { file, schedule })
     }
+}
+
+fn validate_integrations(records: &[IntegrationRecord]) -> Result<(), IntegrationError> {
+    if records.len() > MAX_INTEGRATIONS {
+        return Err(IntegrationError::Full);
+    }
+    let mut seen = BTreeSet::new();
+    for record in records {
+        let id = parse_id(&record.id)?;
+        if id != record.id {
+            return Err(IntegrationError::Id);
+        }
+        if !seen.insert(id) {
+            return Err(IntegrationError::Duplicate);
+        }
+        if let Some(endpoint) = &record.endpoint {
+            public_https(endpoint).map_err(|_| IntegrationError::Endpoint)?;
+            if record.kind != IntegrationKind::OrbitMcp {
+                return Err(IntegrationError::Endpoint);
+            }
+        }
+        if let Some(host) = &record.host {
+            if !valid_host(host) {
+                return Err(IntegrationError::Endpoint);
+            }
+        }
+        if let Some(client_id) = &record.client_id {
+            if !valid_client_id(client_id) {
+                return Err(IntegrationError::Id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_host(host: &str) -> bool {
+    (1..=253).contains(&host.len())
+        && !host.starts_with(['.', '-', ':'])
+        && !host.ends_with(['.', '-', ':'])
+        && !host.contains("..")
+        && host.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-' | ':')
+        })
+}
+
+fn valid_client_id(client_id: &str) -> bool {
+    (1..=64).contains(&client_id.len())
+        && client_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
 fn schedule_from_file(file: &ScheduleFile) -> Result<Schedule, ScheduleError> {
@@ -230,7 +369,7 @@ fn schedule_file(schedule: &Schedule) -> ScheduleFile {
 
 pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     let file: ConfigFile = serde_json::from_str(text)?;
-    Ok(Config::from_file(file)?)
+    Config::from_file(file)
 }
 
 pub fn load_config(path: &Path) -> Result<Option<Config>, ConfigError> {
@@ -418,6 +557,43 @@ mod tests {
             config_path_from(None, Some("/home/person"), None),
             std::path::PathBuf::from("/home/person/.config/stardust/config.json")
         );
+    }
+
+    #[test]
+    fn integrations_stay_off_and_keep_urls_out_of_the_file() {
+        let minimal = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon","tue","wed","thu","fri","sat","sun"],"timezone":"UTC"}}"#;
+        let mut config = parse_config(minimal).unwrap();
+        assert!(config.integrations().is_empty());
+        config
+            .add_integration(crate::integrations::IntegrationKind::SlackIncoming, "ops")
+            .unwrap();
+        assert!(!config.integrations()[0].enabled);
+        config.set_integration_host("ops", "hooks.example").unwrap();
+        let text = config.to_json().unwrap();
+        assert!(!text.contains("http"));
+        assert!(!text.contains("token"));
+        let loaded = parse_config(&text).unwrap();
+        assert_eq!(
+            loaded.integrations()[0].host.as_deref(),
+            Some("hooks.example")
+        );
+        assert!(config
+            .add_integration(crate::integrations::IntegrationKind::SlackIncoming, "ops")
+            .is_err());
+        assert!(config
+            .set_integration_endpoint("ops", "https://helloorbit.app/mcp")
+            .is_err());
+        config
+            .add_integration(crate::integrations::IntegrationKind::OrbitMcp, "orbit")
+            .unwrap();
+        config
+            .set_integration_endpoint("orbit", "https://helloorbit.app/mcp")
+            .unwrap();
+        assert!(config
+            .set_integration_endpoint("orbit", "https://127.0.0.1/mcp")
+            .is_err());
+        let with_secret = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"},"integrations":[{"id":"ops","kind":"slack_incoming","enabled":false,"url":"https://helloorbit.app/hook"}]}"#;
+        assert!(parse_config(with_secret).is_err());
     }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);

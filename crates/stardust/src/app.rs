@@ -1,5 +1,6 @@
 use crate::actions::{apply_menu, MenuEffect};
 use crate::cli::{self, CharacterAction, Command};
+use crate::deliver;
 use crate::inbox::{Inbox, UiMsg};
 use crate::keychain::KeychainTokenStore;
 use crate::notify;
@@ -9,6 +10,7 @@ use chrono::{DateTime, Utc};
 use stardust_core::api::{MockOrbitClient, OrbitClient};
 use stardust_core::check::{note_anchor, note_success, perform_check, CheckKind};
 use stardust_core::config::{default_config_path, load_config, save_config, Config};
+use stardust_core::outbound::prepare_posts;
 use stardust_core::position::ScreenPoint;
 use stardust_core::schedule::{parse_timezone, FireSource};
 use stardust_core::text::menu_text;
@@ -59,6 +61,9 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             show_schedule(&path, &loaded);
             Ok(())
         }
+        Command::Integration { config, action } => {
+            crate::integrations_cmd::apply(&config_path(config), action)
+        }
     }
 }
 
@@ -98,6 +103,7 @@ fn show_schedule(path: &Path, config: &Config) {
     println!("{}", path.display());
     println!("character {visibility} at {}, {}", position.x, position.y);
     println!("{}", text.schedule);
+    println!("{}", text.integrations);
     println!("{}", text.last_checked);
     println!("{}", text.next_check);
 }
@@ -349,14 +355,26 @@ async fn run_check<C: OrbitClient>(
     };
     match perform_check(client, cursor.as_deref(), now, &schedule, kind).await {
         Ok(outcome) => {
-            {
+            let records = {
                 let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
                 note_anchor(loaded.state_mut(), kind);
                 note_success(loaded.state_mut(), now, outcome.next_cursor);
                 if let Err(err) = save_config(path, &loaded) {
                     eprintln!("stardust: could not save config: {err}");
                 }
-            }
+                loaded.integrations().to_vec()
+            };
+            let local = now.with_timezone(&schedule.timezone());
+            let notes = prepare_posts(
+                &records,
+                tokens,
+                &outcome.items,
+                schedule.is_quiet_at(local),
+                matches!(kind, CheckKind::Manual),
+                now,
+                schedule.interval_minutes().unwrap_or(1440),
+            );
+            deliver::deliver(&notes);
             if outcome.presentation.show_os_notification {
                 notify::show(&outcome.presentation);
             }

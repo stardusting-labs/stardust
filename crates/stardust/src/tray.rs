@@ -41,6 +41,7 @@ fn build_menu(text: &MenuText) -> Result<Menu, String> {
     append_item(&menu, "next", &text.next_check, false)?;
     append_item(&menu, "last", &text.last_checked, false)?;
     append_item(&menu, "schedule", &text.schedule, false)?;
+    append_item(&menu, "integrations", &text.integrations, false)?;
     append_separator(&menu)?;
     append_item(&menu, "character", &text.character, true)?;
     append_item(&menu, "check-now", "Check now", true)?;

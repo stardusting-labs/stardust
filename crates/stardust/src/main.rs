@@ -9,11 +9,14 @@
 mod actions;
 mod app;
 mod cli;
+mod deliver;
 mod font;
 mod icon;
 mod inbox;
+mod integrations_cmd;
 mod keychain;
 mod notify;
+mod oauth;
 mod tray;
 mod window;
 
