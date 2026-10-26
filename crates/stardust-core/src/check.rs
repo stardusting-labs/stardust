@@ -3,11 +3,12 @@
 //! The alerts endpoint is called once. The next poll stays on the schedule
 //! even when the check fails or a high-severity item is present.
 
-use crate::api::{AlertItem, AlertsPage, OrbitClient, OrbitError};
+use crate::api::{AlertItem, AlertsPage, DesktopApi, OrbitError};
 use crate::policy::{present, Presentation};
 use crate::schedule::{FireSource, Schedule};
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckKind {
@@ -25,20 +26,23 @@ pub struct CheckOutcome {
     pub items: Vec<AlertItem>,
 }
 
-pub async fn perform_check<C: OrbitClient + Sync>(
+pub async fn perform_check<C: DesktopApi + Sync>(
     client: &C,
+    access_token: &str,
     cursor: Option<&str>,
     now_utc: DateTime<Utc>,
     schedule: &Schedule,
     kind: &CheckKind,
+    server_base: &str,
 ) -> Result<CheckOutcome, OrbitError> {
-    let page = client.desktop_alerts(cursor).await?;
+    let _status = client.desktop_status(access_token).await?;
+    let page = client.desktop_alerts(access_token, cursor).await?;
     let next_cursor = page.next_cursor.clone();
     let items = deduped(page);
     let local = now_utc.with_timezone(&schedule.timezone());
     let quiet = schedule.is_quiet_at(local);
     let force_bubble = matches!(kind, CheckKind::Manual);
-    let presentation = present(&items, quiet, local, force_bubble);
+    let presentation = present(&items, quiet, local, force_bubble, server_base);
     Ok(CheckOutcome {
         presentation,
         next_cursor,
@@ -62,6 +66,24 @@ pub fn note_anchor(state: &mut crate::config::CheckState, kind: &CheckKind) {
     }
 }
 
+/// Wait at least the schedule, and longer after a soft failure.
+///
+/// A zero delay becomes one second so a slot that never moves cannot spin.
+pub fn retry_delay(schedule_delay: Duration, failures: u32) -> Duration {
+    let backoff = if failures == 0 {
+        Duration::ZERO
+    } else {
+        let shift = failures.saturating_sub(1).min(6);
+        Duration::from_secs(30_u64 << shift)
+    };
+    let delay = schedule_delay.max(backoff);
+    if delay.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        delay
+    }
+}
+
 pub fn note_success(
     state: &mut crate::config::CheckState,
     now: DateTime<Utc>,
@@ -73,11 +95,9 @@ pub fn note_success(
 
 #[cfg(test)]
 mod tests {
-    use super::{note_anchor, note_success, perform_check, CheckKind};
+    use super::{note_anchor, note_success, perform_check, retry_delay, CheckKind};
     use crate::api::{
-        AlertItem, AlertsPage, DesktopStatus, DeviceAuthorizeRequest, DeviceAuthorizeResponse,
-        DeviceTokenRequest, DeviceTokenResponse, OrbitClient, OrbitError, RevokeSessionRequest,
-        Severity,
+        AlertItem, AlertsPage, DesktopApi, DesktopStatus, OrbitError, Severity, DEFAULT_SERVER_BASE,
     };
     use crate::config::CheckState;
     use crate::schedule::{parse_quiet, parse_weekdays, FireSource, Schedule};
@@ -85,45 +105,36 @@ mod tests {
     use chrono_tz::UTC;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct Script {
         pages: std::sync::Mutex<Vec<AlertsPage>>,
+        status: std::sync::Mutex<Result<(), OrbitError>>,
         alerts_calls: AtomicUsize,
+        status_calls: AtomicUsize,
     }
 
-    impl OrbitClient for Script {
-        async fn desktop_status(&self) -> Result<DesktopStatus, OrbitError> {
-            Ok(DesktopStatus {
+    impl DesktopApi for Script {
+        fn desktop_status(
+            &self,
+            _: &str,
+        ) -> impl std::future::Future<Output = Result<DesktopStatus, OrbitError>> + Send {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self.status.lock().unwrap().clone().map(|()| DesktopStatus {
                 last_scan_time: None,
                 counts_by_severity: BTreeMap::new(),
-            })
+            });
+            async move { result }
         }
 
-        async fn desktop_alerts(&self, _since: Option<&str>) -> Result<AlertsPage, OrbitError> {
+        fn desktop_alerts<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<&'a str>,
+        ) -> impl std::future::Future<Output = Result<AlertsPage, OrbitError>> + Send {
             self.alerts_calls.fetch_add(1, Ordering::SeqCst);
-            self.pages
-                .lock()
-                .unwrap()
-                .pop()
-                .ok_or(OrbitError::ProposedEndpoint { path: "/unused" })
-        }
-
-        async fn device_authorize(
-            &self,
-            _: &DeviceAuthorizeRequest,
-        ) -> Result<DeviceAuthorizeResponse, OrbitError> {
-            Err(OrbitError::ProposedEndpoint { path: "/unused" })
-        }
-
-        async fn device_token(
-            &self,
-            _: &DeviceTokenRequest,
-        ) -> Result<DeviceTokenResponse, OrbitError> {
-            Err(OrbitError::ProposedEndpoint { path: "/unused" })
-        }
-
-        async fn revoke_session(&self, _: &RevokeSessionRequest) -> Result<(), OrbitError> {
-            Err(OrbitError::ProposedEndpoint { path: "/unused" })
+            let page = self.pages.lock().unwrap().pop().ok_or(OrbitError::Response);
+            async move { page }
         }
     }
 
@@ -145,7 +156,7 @@ mod tests {
                 severity: Severity::High,
                 title: "Example high connection".to_string(),
                 first_seen: Utc.with_ymd_and_hms(2026, 10, 21, 14, 0, 0).unwrap(),
-                link: "https://helloorbit.app/workspace/high".to_string(),
+                workspace_path: "/workspace/high".to_string(),
             }],
             next_cursor: Some("cursor-2".to_string()),
         }
@@ -155,11 +166,14 @@ mod tests {
     async fn scheduled_check_calls_alerts_once_and_shows_high_severity_now() {
         let client = Script {
             pages: std::sync::Mutex::new(vec![high_page()]),
+            status: std::sync::Mutex::new(Ok(())),
             alerts_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
         };
         let now = Utc.with_ymd_and_hms(2026, 10, 21, 14, 5, 0).unwrap();
         let outcome = perform_check(
             &client,
+            "example-access",
             None,
             now,
             &schedule(true),
@@ -167,9 +181,11 @@ mod tests {
                 slot: now,
                 source: FireSource::Interval,
             },
+            DEFAULT_SERVER_BASE,
         )
         .await
         .unwrap();
+        assert_eq!(client.status_calls.load(Ordering::SeqCst), 1);
         assert_eq!(client.alerts_calls.load(Ordering::SeqCst), 1);
         assert!(outcome.presentation.show_bubble);
         assert!(outcome.presentation.show_os_notification);
@@ -203,5 +219,46 @@ mod tests {
             },
         );
         assert_eq!(state.interval_anchor, Some(slot));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_turned_off_server_does_not_ask_for_alerts() {
+        let client = Script {
+            pages: std::sync::Mutex::new(vec![high_page()]),
+            status: std::sync::Mutex::new(Err(OrbitError::FeatureOff)),
+            alerts_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
+        };
+        let now = Utc.with_ymd_and_hms(2026, 10, 21, 14, 5, 0).unwrap();
+        let err = perform_check(
+            &client,
+            "example-access",
+            None,
+            now,
+            &schedule(false),
+            &CheckKind::Manual,
+            DEFAULT_SERVER_BASE,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, OrbitError::FeatureOff);
+        assert_eq!(client.alerts_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            retry_delay(Duration::from_secs(60), 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(retry_delay(Duration::ZERO, 0), Duration::from_secs(1));
+        assert_eq!(
+            retry_delay(Duration::from_secs(60), 1),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            retry_delay(Duration::from_secs(1), 1),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            retry_delay(Duration::from_secs(1), 7),
+            Duration::from_secs(1920)
+        );
     }
 }

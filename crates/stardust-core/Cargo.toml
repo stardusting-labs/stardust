@@ -6,7 +6,7 @@ publish.workspace = true
 version.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Schedule, check policy, and proposed ORBIT types for the Stardust tray app"
+description = "Schedule, check policy, and ORBIT client for the Stardust tray app"
 
 [dependencies]
 chrono = { workspace = true }
@@ -15,6 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+ureq = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

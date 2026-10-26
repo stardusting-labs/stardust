@@ -18,6 +18,7 @@ mod keychain;
 mod live;
 mod notify;
 mod oauth;
+mod signin;
 mod sprites;
 mod tray;
 mod window;

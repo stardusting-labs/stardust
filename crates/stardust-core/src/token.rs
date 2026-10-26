@@ -1,14 +1,15 @@
 //! Keychain record for a short-lived access token.
 //!
-//! Sign-in is not implemented. Callers can store a token only when it expires
-//! within 15 minutes. Debug output redacts the secret.
+//! The access token from ORBIT device sign-in is stored here. Callers can
+//! store a token only when it expires within 24 hours. Debug output redacts
+//! the secret.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Mutex;
 
-pub const MAX_ACCESS_TOKEN_LIFETIME: TimeDelta = TimeDelta::minutes(15);
+pub const MAX_ACCESS_TOKEN_LIFETIME: TimeDelta = TimeDelta::hours(24);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TokenError {
@@ -16,7 +17,7 @@ pub enum TokenError {
     Empty,
     #[error("token is already expired")]
     AlreadyExpired,
-    #[error("token must expire within 15 minutes")]
+    #[error("token must expire within 24 hours")]
     LifetimeTooLong,
     #[error("stored token could not be read")]
     Corrupt,
@@ -194,9 +195,16 @@ mod tests {
             TokenError::AlreadyExpired
         );
         assert_eq!(
-            StoredToken::issue("example", None, now + TimeDelta::minutes(16), now).unwrap_err(),
+            StoredToken::issue(
+                "example",
+                None,
+                now + TimeDelta::hours(24) + TimeDelta::seconds(1),
+                now
+            )
+            .unwrap_err(),
             TokenError::LifetimeTooLong
         );
+        assert!(StoredToken::issue("example", None, now + TimeDelta::minutes(16), now).is_ok());
         let token = StoredToken::issue(
             "super-secret-token",
             Some("super-secret-refresh".into()),

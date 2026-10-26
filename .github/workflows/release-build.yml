@@ -1,0 +1,142 @@
+name: release-build
+
+# Manual unsigned installers. This workflow does not publish a GitHub release
+# and does not run on push or tag. Artifacts are the workflow run's uploads.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+
+      - name: Build Linux archive
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked
+          tar -C target/release -czf stardust-linux-x86_64.tar.gz stardust
+
+      - name: Build Windows archive
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked
+
+      - name: Windows signing placeholder
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          # Optional repository secret. Do not put a certificate in this file.
+          # The step exits without signing when the secret is absent.
+          WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX }}
+        run: |
+          # Placeholder. When WINDOWS_SIGNING_PFX is set, a later change can
+          # decode it and call signtool. This step does not sign the binary
+          # and does not print the secret.
+          if [ -z "${WINDOWS_SIGNING_PFX}" ]; then
+            echo "Windows signing skipped: WINDOWS_SIGNING_PFX is not set."
+          else
+            echo "Windows signing skipped: signtool is not enabled."
+          fi
+
+      - name: Package Windows zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/stardust.exe -DestinationPath stardust-windows-x86_64.zip
+
+      - name: Build macOS universal app
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p Stardust.app/Contents/MacOS
+          lipo -create \
+            target/aarch64-apple-darwin/release/stardust \
+            target/x86_64-apple-darwin/release/stardust \
+            -output Stardust.app/Contents/MacOS/stardust
+          cat > Stardust.app/Contents/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Stardust</string>
+            <key>CFBundleDisplayName</key><string>Stardust</string>
+            <key>CFBundleIdentifier</key><string>app.helloorbit.stardust</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleExecutable</key><string>stardust</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSUIElement</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Apple notarization placeholder
+        if: runner.os == 'macOS'
+        env:
+          # Optional repository secret. Do not put a notary key in this file.
+          # The step exits without notarizing when the secret is absent.
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+        run: |
+          # Placeholder. When APPLE_NOTARIZATION_KEY is set, a later change can
+          # run `xcrun notarytool submit`. This step does not submit the app
+          # and does not print the secret.
+          if [ -z "${APPLE_NOTARIZATION_KEY}" ]; then
+            echo "Apple notarization skipped: APPLE_NOTARIZATION_KEY is not set."
+          else
+            echo "Apple notarization skipped: notarytool is not enabled."
+          fi
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent Stardust.app stardust-macos-universal.zip
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: stardust-${{ matrix.name }}
+          path: stardust-*
+          if-no-files-found: error
+
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: stardust-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        run: |
+          cd dist
+          sha256sum stardust-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS

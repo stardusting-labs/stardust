@@ -1,8 +1,8 @@
 //! Shared logic for the Stardust tray app.
 //!
-//! The desktop endpoints described in [`api`] are proposed. ORBIT does not
-//! serve them yet. This crate prepares outbound posts and does not open a
-//! network connection.
+//! Device sign-in follows the ORBIT account routes. [`http`] calls the
+//! desktop status and alerts routes. Webhook helpers still do not open a
+//! socket; only the ORBIT client does.
 
 #![forbid(unsafe_code)]
 
@@ -10,6 +10,7 @@ pub mod api;
 pub mod check;
 pub mod config;
 pub mod copy;
+pub mod http;
 pub mod integrations;
 pub mod mcp;
 pub mod outbound;

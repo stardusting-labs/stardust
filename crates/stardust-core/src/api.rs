@@ -1,31 +1,51 @@
-//! Proposed ORBIT desktop API.
+//! ORBIT device sign-in and the desktop status and alerts surface.
 //!
-//! These endpoints are not available on ORBIT yet. [`MockOrbitClient`] is the
-//! only backend this preview runs. The placeholder origin is
-//! `https://helloorbit.app`.
+//! Sign-in matches `crates/orbit-axum-auth/src/pqc_device_signin.rs` on
+//! rust-orbit: `POST /api/pqc/v1/account/device/code` and
+//! `POST /api/pqc/v1/account/device/token`. A signed-in browser session calls
+//! `POST /api/pqc/v1/account/device/approve`. This client does not.
+//!
+//! [`DesktopApi`] is isolated from sign-in. Its JSON is provisional until
+//! `docs/contracts/stardust-desktop-api-v1.md` is published. Both desktop
+//! routes take `Authorization: Bearer`. A 404 means the feature is off. A 401
+//! means the token is no longer accepted.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
-pub const PLACEHOLDER_ORIGIN: &str = "https://helloorbit.app";
-pub const PATH_DEVICE_AUTHORIZE: &str = "/api/pqc/v1/device/authorize";
-pub const PATH_DEVICE_TOKEN: &str = "/api/pqc/v1/device/token";
+pub const DEFAULT_SERVER_BASE: &str = "https://helloorbit.app";
+pub const ENV_SERVER_URL: &str = "STARDUST_SERVER_URL";
+pub const PATH_DEVICE_CODE: &str = "/api/pqc/v1/account/device/code";
+pub const PATH_DEVICE_TOKEN: &str = "/api/pqc/v1/account/device/token";
+pub const PATH_DEVICE_APPROVE: &str = "/api/pqc/v1/account/device/approve";
 pub const PATH_DESKTOP_STATUS: &str = "/api/pqc/v1/desktop/status";
 pub const PATH_DESKTOP_ALERTS: &str = "/api/pqc/v1/desktop/alerts";
-pub const PATH_DEVICE_SESSION: &str = "/api/pqc/v1/device/sessions";
-pub const PROPOSED_SCOPE: &str = "alerts:read status:read";
-pub const PROPOSED_CLIENT_ID: &str = "stardust-preview";
 pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// Kept so older notes that say "placeholder origin" still point at the default host.
+pub const PLACEHOLDER_ORIGIN: &str = DEFAULT_SERVER_BASE;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OrbitError {
-    #[error("proposed endpoint is not available yet: {path}")]
-    ProposedEndpoint { path: &'static str },
+    #[error("ORBIT desktop alerts are turned off")]
+    FeatureOff,
+    #[error("ORBIT sign-in expired")]
+    Unauthorized,
+    #[error("ORBIT could not be reached")]
+    Unreachable,
+    #[error("ORBIT response could not be read")]
+    Response,
+    #[error("ORBIT refused the request")]
+    Refused,
+    #[error("the sign-in code expired")]
+    Expired,
+    #[error("ORBIT denied the sign-in")]
+    Denied,
+    #[error("server address was refused")]
+    ServerBase,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -45,66 +65,69 @@ impl Severity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DesktopStatus {
     pub last_scan_time: Option<DateTime<Utc>>,
     pub counts_by_severity: BTreeMap<Severity, u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AlertItem {
     pub id: String,
     pub severity: Severity,
     pub title: String,
     pub first_seen: DateTime<Utc>,
-    pub link: String,
+    pub workspace_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AlertsPage {
     pub items: Vec<AlertItem>,
+    #[serde(default)]
     pub next_cursor: Option<String>,
 }
 
-/// Proposed `POST /api/pqc/v1/device/authorize` body.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceAuthorizeRequest {
-    pub client_id: String,
-    pub scope: String,
-}
-
-/// Proposed device-authorization response. Field names follow RFC 8628.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceAuthorizeResponse {
+/// `POST /api/pqc/v1/account/device/code` response.
+///
+/// `device_code` is a secret. Debug output redacts it.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct DeviceCodeResponse {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
+    pub verification_uri_complete: String,
     pub expires_in: u64,
     pub interval: u64,
 }
 
-/// Proposed `POST /api/pqc/v1/device/token` body.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl fmt::Debug for DeviceCodeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceCodeResponse")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+/// `POST /api/pqc/v1/account/device/token` body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DeviceTokenRequest {
     pub grant_type: String,
     pub device_code: String,
-    pub client_id: String,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceTokenResponse {
     pub access_token: String,
+    #[serde(default)]
     pub token_type: String,
+    #[serde(default)]
     pub expires_in: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
-    pub scope: String,
+    #[serde(default)]
+    pub expires_at_epoch_ms: Option<u64>,
 }
 
 impl fmt::Debug for DeviceTokenResponse {
@@ -114,52 +137,36 @@ impl fmt::Debug for DeviceTokenResponse {
             .field("access_token", &"<redacted>")
             .field("token_type", &self.token_type)
             .field("expires_in", &self.expires_in)
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("scope", &self.scope)
+            .field("expires_at_epoch_ms", &self.expires_at_epoch_ms)
             .finish()
     }
 }
 
-/// Proposed `DELETE /api/pqc/v1/device/sessions/{id}`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RevokeSessionRequest {
-    pub session_id: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DevicePoll {
+    Pending,
+    SlowDown,
+    Approved(DeviceTokenResponse),
 }
 
-pub trait OrbitClient: Send + Sync {
-    fn desktop_status(&self) -> impl Future<Output = Result<DesktopStatus, OrbitError>> + Send;
+/// Status and alerts. Kept separate from device sign-in.
+pub trait DesktopApi: Send + Sync {
+    fn desktop_status(
+        &self,
+        access_token: &str,
+    ) -> impl Future<Output = Result<DesktopStatus, OrbitError>> + Send;
     fn desktop_alerts<'a>(
         &'a self,
-        since: Option<&'a str>,
+        access_token: &'a str,
+        cursor: Option<&'a str>,
     ) -> impl Future<Output = Result<AlertsPage, OrbitError>> + Send;
-    fn device_authorize<'a>(
-        &'a self,
-        request: &'a DeviceAuthorizeRequest,
-    ) -> impl Future<Output = Result<DeviceAuthorizeResponse, OrbitError>> + Send;
-    fn device_token<'a>(
-        &'a self,
-        request: &'a DeviceTokenRequest,
-    ) -> impl Future<Output = Result<DeviceTokenResponse, OrbitError>> + Send;
-    fn revoke_session<'a>(
-        &'a self,
-        request: &'a RevokeSessionRequest,
-    ) -> impl Future<Output = Result<(), OrbitError>> + Send;
 }
 
+/// Sample items for `--demo` and tests. This client does not open a socket.
 #[derive(Debug)]
 pub struct MockOrbitClient {
     status: DesktopStatus,
     first_page: AlertsPage,
-    alerts_calls: AtomicUsize,
-    status_calls: AtomicUsize,
-    authorize_calls: AtomicUsize,
-    token_calls: AtomicUsize,
-    revoke_calls: AtomicUsize,
-    last_since: Mutex<Option<String>>,
 }
 
 impl MockOrbitClient {
@@ -180,146 +187,259 @@ impl MockOrbitClient {
                     severity: Severity::Medium,
                     title: "Example connection finding".to_string(),
                     first_seen: seen,
-                    link: format!("{PLACEHOLDER_ORIGIN}/workspace/example"),
+                    workspace_path: "/workspace/example".to_string(),
                 }],
                 next_cursor: Some("mock-1".to_string()),
             },
-            alerts_calls: AtomicUsize::new(0),
-            status_calls: AtomicUsize::new(0),
-            authorize_calls: AtomicUsize::new(0),
-            token_calls: AtomicUsize::new(0),
-            revoke_calls: AtomicUsize::new(0),
-            last_since: Mutex::new(None),
         }
-    }
-
-    pub fn alerts_calls(&self) -> usize {
-        self.alerts_calls.load(Ordering::SeqCst)
-    }
-
-    pub fn status_calls(&self) -> usize {
-        self.status_calls.load(Ordering::SeqCst)
     }
 }
 
-impl OrbitClient for MockOrbitClient {
-    async fn desktop_status(&self) -> Result<DesktopStatus, OrbitError> {
-        self.status_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.status.clone())
+impl DesktopApi for MockOrbitClient {
+    fn desktop_status(
+        &self,
+        _access_token: &str,
+    ) -> impl Future<Output = Result<DesktopStatus, OrbitError>> + Send {
+        let status = self.status.clone();
+        async move { Ok(status) }
     }
 
-    async fn desktop_alerts(&self, since: Option<&str>) -> Result<AlertsPage, OrbitError> {
-        self.alerts_calls.fetch_add(1, Ordering::SeqCst);
-        *self
-            .last_since
-            .lock()
-            .unwrap_or_else(|err| err.into_inner()) = since.map(str::to_string);
-        if since == self.first_page.next_cursor.as_deref() {
-            return Ok(AlertsPage {
+    fn desktop_alerts<'a>(
+        &'a self,
+        _access_token: &'a str,
+        cursor: Option<&'a str>,
+    ) -> impl Future<Output = Result<AlertsPage, OrbitError>> + Send {
+        let page = if cursor == self.first_page.next_cursor.as_deref() {
+            AlertsPage {
                 items: Vec::new(),
                 next_cursor: self.first_page.next_cursor.clone(),
-            });
+            }
+        } else {
+            self.first_page.clone()
+        };
+        async move { Ok(page) }
+    }
+}
+
+pub fn resolve_server_base(
+    configured: Option<&str>,
+    env_value: Option<&str>,
+) -> Result<String, OrbitError> {
+    let chosen = env_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| configured.map(str::trim).filter(|value| !value.is_empty()))
+        .unwrap_or(DEFAULT_SERVER_BASE);
+    parse_server_base(chosen)
+}
+
+pub fn parse_server_base(value: &str) -> Result<String, OrbitError> {
+    let trimmed = value.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or(OrbitError::ServerBase)?;
+    if rest.is_empty()
+        || trimmed.contains([' ', '\\', '@', '#', '?'])
+        || trimmed.contains("://") && trimmed.matches("://").count() != 1
+    {
+        return Err(OrbitError::ServerBase);
+    }
+    let (host_port, path) = match rest.split_once('/') {
+        Some((host, path)) => (host, path),
+        None => (rest, ""),
+    };
+    if !path.is_empty() || split_host_port(host_port).is_none() {
+        return Err(OrbitError::ServerBase);
+    }
+    let scheme = if trimmed.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    Ok(format!("{scheme}://{host_port}"))
+}
+
+pub fn https_origin(server_base: &str) -> Option<String> {
+    let base = parse_server_base(server_base).ok()?;
+    base.starts_with("https://").then_some(base)
+}
+
+/// Join a workspace path onto the configured https origin.
+///
+/// Anything that is not a path on that origin is rejected. Full URLs, other
+/// hosts, and non-https bases produce no link.
+pub fn workspace_url(server_base: &str, workspace_path: &str) -> Option<String> {
+    let origin = https_origin(server_base)?;
+    let path = safe_workspace_path(workspace_path)?;
+    Some(format!("{origin}{path}"))
+}
+
+pub fn is_allowed_https_url(server_base: &str, candidate: &str) -> bool {
+    let Ok(base) = parse_server_base(server_base) else {
+        return false;
+    };
+    if !base.starts_with("https://") {
+        return false;
+    }
+    let Some(base_host) = base.strip_prefix("https://") else {
+        return false;
+    };
+    let candidate = candidate.trim();
+    let Some(rest) = candidate.strip_prefix("https://") else {
+        return false;
+    };
+    if candidate.contains([' ', '\\', '@']) || rest.is_empty() {
+        return false;
+    }
+    let (host_port, path) = match rest.split_once('/') {
+        Some((host, path)) => (host, path),
+        None => (rest, ""),
+    };
+    if path.contains('\\') || host_port.is_empty() {
+        return false;
+    }
+    hosts_match(base_host, host_port)
+}
+
+pub fn verification_url(server_base: &str, response: &DeviceCodeResponse) -> Option<String> {
+    let candidate = if response.verification_uri_complete.is_empty() {
+        response.verification_uri.as_str()
+    } else {
+        response.verification_uri_complete.as_str()
+    };
+    is_allowed_https_url(server_base, candidate).then(|| candidate.to_string())
+}
+
+pub fn bumped_interval(current: u64, slow_down: bool) -> u64 {
+    let current = current.clamp(1, 30);
+    if slow_down {
+        (current + 5).min(30)
+    } else {
+        current
+    }
+}
+
+fn safe_workspace_path(value: &str) -> Option<&str> {
+    let path = value.trim();
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
+        return None;
+    }
+    if path
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '@' || ch == '#')
+    {
+        return None;
+    }
+    let (path_part, query) = path
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((path, None));
+    if path_part
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return None;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains("://")
+    {
+        return None;
+    }
+    if query.is_some_and(|query| query.contains(['@', '\\', ' '])) {
+        return None;
+    }
+    Some(path)
+}
+
+fn hosts_match(base_host: &str, candidate_host: &str) -> bool {
+    let Some((base_name, base_port)) = split_host_port(base_host) else {
+        return false;
+    };
+    let Some((candidate_name, candidate_port)) = split_host_port(candidate_host) else {
+        return false;
+    };
+    if !base_name.eq_ignore_ascii_case(candidate_name) {
+        return false;
+    }
+    port_or_https(base_port) == port_or_https(candidate_port)
+}
+
+fn port_or_https(port: Option<u16>) -> u16 {
+    port.unwrap_or(443)
+}
+
+fn split_host_port(host_port: &str) -> Option<(&str, Option<u16>)> {
+    if host_port.is_empty() {
+        return None;
+    }
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, port) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
         }
-        Ok(self.first_page.clone())
+        let port = if let Some(port) = port.strip_prefix(':') {
+            if port.is_empty() {
+                return None;
+            }
+            Some(port.parse().ok()?)
+        } else if port.is_empty() {
+            None
+        } else {
+            return None;
+        };
+        return Some((host, port));
     }
-
-    async fn device_authorize(
-        &self,
-        _request: &DeviceAuthorizeRequest,
-    ) -> Result<DeviceAuthorizeResponse, OrbitError> {
-        self.authorize_calls.fetch_add(1, Ordering::SeqCst);
-        Err(OrbitError::ProposedEndpoint {
-            path: PATH_DEVICE_AUTHORIZE,
-        })
+    if host_port.matches(':').count() > 1 {
+        return None;
     }
-
-    async fn device_token(
-        &self,
-        _request: &DeviceTokenRequest,
-    ) -> Result<DeviceTokenResponse, OrbitError> {
-        self.token_calls.fetch_add(1, Ordering::SeqCst);
-        Err(OrbitError::ProposedEndpoint {
-            path: PATH_DEVICE_TOKEN,
-        })
-    }
-
-    async fn revoke_session(&self, _request: &RevokeSessionRequest) -> Result<(), OrbitError> {
-        self.revoke_calls.fetch_add(1, Ordering::SeqCst);
-        Err(OrbitError::ProposedEndpoint {
-            path: PATH_DEVICE_SESSION,
-        })
+    match host_port.split_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() => {
+            Some((host, Some(port.parse().ok()?)))
+        }
+        Some(_) => None,
+        None => Some((host_port, None)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceAuthorizeRequest, DeviceTokenRequest, DeviceTokenResponse, MockOrbitClient,
-        OrbitClient, OrbitError, RevokeSessionRequest, Severity, DEVICE_GRANT_TYPE,
-        PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS, PATH_DEVICE_AUTHORIZE, PATH_DEVICE_SESSION,
-        PATH_DEVICE_TOKEN, PLACEHOLDER_ORIGIN, PROPOSED_CLIENT_ID, PROPOSED_SCOPE,
+        bumped_interval, is_allowed_https_url, parse_server_base, resolve_server_base,
+        workspace_url, DesktopApi, DeviceCodeResponse, DeviceTokenResponse, MockOrbitClient,
+        Severity, DEFAULT_SERVER_BASE, ENV_SERVER_URL, PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS,
+        PATH_DEVICE_APPROVE, PATH_DEVICE_CODE, PATH_DEVICE_TOKEN,
     };
 
     #[tokio::test(flavor = "current_thread")]
     async fn mock_returns_one_page_then_nothing_new() {
         let client = MockOrbitClient::example();
-        let page = client.desktop_alerts(None).await.unwrap();
+        let page = client.desktop_alerts("", None).await.unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].severity, Severity::Medium);
-        assert!(page.items[0]
-            .link
-            .starts_with(&format!("{PLACEHOLDER_ORIGIN}/")));
+        assert_eq!(page.items[0].workspace_path, "/workspace/example");
+        assert_eq!(
+            workspace_url(DEFAULT_SERVER_BASE, &page.items[0].workspace_path).as_deref(),
+            Some("https://helloorbit.app/workspace/example")
+        );
         let next = page.next_cursor.clone();
-        let again = client.desktop_alerts(next.as_deref()).await.unwrap();
+        let again = client.desktop_alerts("", next.as_deref()).await.unwrap();
         assert!(again.items.is_empty());
-        assert_eq!(client.alerts_calls(), 2);
-
-        let status = client.desktop_status().await.unwrap();
+        let status = client.desktop_status("").await.unwrap();
         assert_eq!(status.counts_by_severity.get(&Severity::Medium), Some(&1));
-        assert_eq!(client.status_calls(), 1);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn device_flow_is_proposed_and_not_implemented() {
-        let client = MockOrbitClient::example();
-        let authorize = client
-            .device_authorize(&DeviceAuthorizeRequest {
-                client_id: PROPOSED_CLIENT_ID.to_string(),
-                scope: PROPOSED_SCOPE.to_string(),
-            })
-            .await;
-        assert_eq!(
-            authorize.unwrap_err(),
-            OrbitError::ProposedEndpoint {
-                path: PATH_DEVICE_AUTHORIZE
-            }
-        );
-        let token = client
-            .device_token(&DeviceTokenRequest {
-                grant_type: DEVICE_GRANT_TYPE.to_string(),
-                device_code: "not-issued".to_string(),
-                client_id: PROPOSED_CLIENT_ID.to_string(),
-            })
-            .await;
-        assert_eq!(
-            token.unwrap_err(),
-            OrbitError::ProposedEndpoint {
-                path: PATH_DEVICE_TOKEN
-            }
-        );
-        let revoke = client
-            .revoke_session(&RevokeSessionRequest {
-                session_id: "not-issued".to_string(),
-            })
-            .await;
-        assert_eq!(
-            revoke.unwrap_err(),
-            OrbitError::ProposedEndpoint {
-                path: PATH_DEVICE_SESSION
-            }
-        );
+    #[test]
+    fn routes_match_the_orbit_device_sign_in_paths() {
+        assert_eq!(PATH_DEVICE_CODE, "/api/pqc/v1/account/device/code");
+        assert_eq!(PATH_DEVICE_TOKEN, "/api/pqc/v1/account/device/token");
+        assert_eq!(PATH_DEVICE_APPROVE, "/api/pqc/v1/account/device/approve");
         assert_eq!(PATH_DESKTOP_STATUS, "/api/pqc/v1/desktop/status");
         assert_eq!(PATH_DESKTOP_ALERTS, "/api/pqc/v1/desktop/alerts");
+        assert_eq!(ENV_SERVER_URL, "STARDUST_SERVER_URL");
     }
 
     #[test]
@@ -328,14 +448,91 @@ mod tests {
             access_token: "secret-access".to_string(),
             token_type: "Bearer".to_string(),
             expires_in: 900,
-            refresh_token: Some("secret-refresh".to_string()),
-            scope: PROPOSED_SCOPE.to_string(),
+            expires_at_epoch_ms: None,
         };
         let rendered = format!("{response:?}");
         assert!(!rendered.contains("secret-access"));
-        assert!(!rendered.contains("secret-refresh"));
+        let code = DeviceCodeResponse {
+            device_code: "secret-device".to_string(),
+            user_code: "ABCD-EFGH".to_string(),
+            verification_uri: "https://helloorbit.app/account".to_string(),
+            verification_uri_complete: "https://helloorbit.app/account?user_code=ABCD-EFGH"
+                .to_string(),
+            expires_in: 600,
+            interval: 5,
+        };
+        let rendered = format!("{code:?}");
+        assert!(!rendered.contains("secret-device"));
+        assert!(rendered.contains("ABCD-EFGH"));
         assert!(!Severity::Medium.is_high_or_above());
         assert!(Severity::High.is_high_or_above());
         assert!(Severity::Critical.is_high_or_above());
+    }
+
+    #[test]
+    fn server_base_and_workspace_links_stay_on_the_configured_https_host() {
+        assert_eq!(
+            resolve_server_base(None, None).unwrap(),
+            DEFAULT_SERVER_BASE
+        );
+        assert_eq!(
+            resolve_server_base(Some("https://helloorbit.app/"), Some("  ")).unwrap(),
+            DEFAULT_SERVER_BASE
+        );
+        assert_eq!(
+            resolve_server_base(Some("https://helloorbit.app"), Some("http://127.0.0.1:9"))
+                .unwrap(),
+            "http://127.0.0.1:9"
+        );
+        assert!(parse_server_base("https://user:pass@helloorbit.app").is_err());
+        assert!(parse_server_base("https://helloorbit.app/workspace").is_err());
+        assert!(parse_server_base("helloorbit.app").is_err());
+
+        assert_eq!(
+            workspace_url(DEFAULT_SERVER_BASE, "/workspace/high").as_deref(),
+            Some("https://helloorbit.app/workspace/high")
+        );
+        assert_eq!(workspace_url("http://127.0.0.1:9", "/workspace/high"), None);
+        for rejected in [
+            "https://helloorbit.app/workspace/high",
+            "http://helloorbit.app/workspace/high",
+            "//helloorbit.app/workspace/high",
+            "/workspace/../secret",
+            "/workspace/./high",
+            "javascript:open(1)",
+            "/workspace/high\\evil",
+            "/workspace/%2e%2e/secret",
+            "https://evil.example/workspace/high",
+        ] {
+            assert_eq!(
+                workspace_url(DEFAULT_SERVER_BASE, rejected),
+                None,
+                "{rejected}"
+            );
+        }
+        assert!(is_allowed_https_url(
+            DEFAULT_SERVER_BASE,
+            "https://helloorbit.app/workspace/high"
+        ));
+        assert!(is_allowed_https_url(
+            DEFAULT_SERVER_BASE,
+            "https://HelloOrbit.app:443/account?user_code=ABCD-EFGH"
+        ));
+        assert!(!is_allowed_https_url(
+            DEFAULT_SERVER_BASE,
+            "https://evil.example/workspace/high"
+        ));
+        assert!(!is_allowed_https_url(
+            DEFAULT_SERVER_BASE,
+            "http://helloorbit.app/workspace/high"
+        ));
+        assert!(!is_allowed_https_url(
+            "http://127.0.0.1:9",
+            "https://127.0.0.1/workspace/high"
+        ));
+        assert_eq!(bumped_interval(5, false), 5);
+        assert_eq!(bumped_interval(5, true), 10);
+        assert_eq!(bumped_interval(28, true), 30);
+        assert_eq!(bumped_interval(0, false), 1);
     }
 }

@@ -2,6 +2,7 @@
 //!
 //! Tokens are not stored here.
 
+use crate::api::parse_server_base;
 use crate::integrations::{
     parse_id, IntegrationError, IntegrationKind, IntegrationRecord, MAX_INTEGRATIONS,
 };
@@ -65,6 +66,8 @@ pub enum ConfigError {
     Schedule(#[from] ScheduleError),
     #[error(transparent)]
     Integration(#[from] IntegrationError),
+    #[error("server address was refused")]
+    ServerBase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +98,8 @@ struct ConfigFile {
     state: CheckState,
     #[serde(default)]
     integrations: Vec<IntegrationRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +127,7 @@ impl Config {
             },
             state: CheckState::default(),
             integrations: Vec::new(),
+            server_base_url: None,
         };
         Self::from_file(file)
     }
@@ -172,6 +178,10 @@ impl Config {
 
     pub fn integrations(&self) -> &[IntegrationRecord] {
         &self.file.integrations
+    }
+
+    pub fn server_base_url(&self) -> Option<&str> {
+        self.file.server_base_url.as_deref()
     }
 
     pub fn add_integration(
@@ -297,6 +307,10 @@ impl Config {
         let schedule = schedule_from_file(&file.schedule)?;
         validate_integrations(&file.integrations)?;
         let mut file = file;
+        if let Some(base) = file.server_base_url.as_deref() {
+            file.server_base_url =
+                Some(parse_server_base(base).map_err(|_| ConfigError::ServerBase)?);
+        }
         file.schedule = schedule_file(&schedule);
         Ok(Self { file, schedule })
     }
@@ -599,6 +613,15 @@ mod tests {
             config_path_from(None, Some("/home/person"), None),
             std::path::PathBuf::from("/home/person/.config/stardust/config.json")
         );
+        assert!(config.server_base_url().is_none());
+        assert!(!config.to_json().unwrap().contains("server_base_url"));
+        let custom = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon","tue","wed","thu","fri","sat","sun"],"timezone":"UTC"},"server_base_url":"https://helloorbit.app/"}"#;
+        assert_eq!(
+            parse_config(custom).unwrap().server_base_url(),
+            Some("https://helloorbit.app")
+        );
+        let bad = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"},"server_base_url":"https://user:pass@helloorbit.app"}"#;
+        assert!(parse_config(bad).is_err());
     }
 
     #[test]

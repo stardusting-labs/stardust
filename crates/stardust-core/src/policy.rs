@@ -4,7 +4,7 @@
 //! during quiet hours. Other results stay hidden during quiet hours. The
 //! speech bubble is a short summary, not a conversation.
 
-use crate::api::{AlertItem, PLACEHOLDER_ORIGIN};
+use crate::api::{https_origin, workspace_url, AlertItem};
 use chrono::{DateTime, Timelike};
 use chrono_tz::Tz;
 use std::time::Duration;
@@ -30,17 +30,45 @@ pub struct Presentation {
     pub summary: Summary,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notice {
+    Unavailable,
+    SignedOut,
+}
+
+pub fn calm_notice(kind: Notice, server_base: &str) -> Presentation {
+    let lines = match kind {
+        Notice::Unavailable => vec![
+            "ORBIT is not available right now".to_string(),
+            "Stardust will try again later".to_string(),
+        ],
+        Notice::SignedOut => vec![
+            "Sign in to see ORBIT items".to_string(),
+            "Use stardust sign-in in a terminal".to_string(),
+        ],
+    };
+    Presentation {
+        show_bubble: true,
+        show_os_notification: false,
+        summary: Summary {
+            lines,
+            details_url: https_origin(server_base).unwrap_or_default(),
+        },
+    }
+}
+
 pub fn present(
     items: &[AlertItem],
     quiet: bool,
     checked_local: DateTime<Tz>,
     force_bubble: bool,
+    server_base: &str,
 ) -> Presentation {
     let high = items
         .iter()
         .filter(|item| item.severity.is_high_or_above())
         .count();
-    let summary = summarize(items, high, checked_local);
+    let summary = summarize(items, high, checked_local, server_base);
     let mut show_bubble = !quiet || high > 0;
     let show_os_notification = high > 0;
     if force_bubble {
@@ -53,7 +81,12 @@ pub fn present(
     }
 }
 
-fn summarize(items: &[AlertItem], high: usize, checked_local: DateTime<Tz>) -> Summary {
+fn summarize(
+    items: &[AlertItem],
+    high: usize,
+    checked_local: DateTime<Tz>,
+    server_base: &str,
+) -> Summary {
     let mut lines = vec![count_line(items.len(), high)];
     if let Some(title) = items.iter().find(|item| item.severity.is_high_or_above()) {
         lines.push(clean_title(&title.title));
@@ -61,7 +94,7 @@ fn summarize(items: &[AlertItem], high: usize, checked_local: DateTime<Tz>) -> S
     lines.push(format!("Last checked time {}", clock(checked_local)));
     Summary {
         lines,
-        details_url: details_url(items),
+        details_url: details_url(items, server_base),
     }
 }
 
@@ -95,42 +128,37 @@ fn clock(local: DateTime<Tz>) -> String {
     format!("{:02}:{:02}", local.hour(), local.minute())
 }
 
-pub fn details_url(items: &[AlertItem]) -> String {
+pub fn details_url(items: &[AlertItem], server_base: &str) -> String {
     let preferred = items
         .iter()
         .filter(|item| item.severity.is_high_or_above())
-        .find_map(|item| http_url(&item.link))
-        .or_else(|| items.iter().find_map(|item| http_url(&item.link)));
-    preferred.unwrap_or(PLACEHOLDER_ORIGIN).to_string()
-}
-
-fn http_url(value: &str) -> Option<&str> {
-    let url = value.trim();
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    if rest.is_empty() || rest.contains([' ', '\\', '@']) {
-        return None;
-    }
-    Some(url)
+        .find_map(|item| workspace_url(server_base, &item.workspace_path))
+        .or_else(|| {
+            items
+                .iter()
+                .find_map(|item| workspace_url(server_base, &item.workspace_path))
+        });
+    preferred
+        .or_else(|| https_origin(server_base))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{details_url, present, BUBBLE_VISIBLE_FOR};
-    use crate::api::{AlertItem, Severity, PLACEHOLDER_ORIGIN};
+    use super::{calm_notice, details_url, present, Notice, BUBBLE_VISIBLE_FOR};
+    use crate::api::{AlertItem, Severity, DEFAULT_SERVER_BASE, PLACEHOLDER_ORIGIN};
     use crate::copy::find_disallowed_copy;
     use chrono::{TimeZone, Utc};
     use chrono_tz::UTC;
 
-    fn item(id: &str, severity: Severity, link: &str) -> AlertItem {
+    fn item(id: &str, severity: Severity, workspace_path: &str) -> AlertItem {
         AlertItem {
             id: id.to_string(),
             severity,
             title: "Example connection finding with a very long title that should be cut"
                 .to_string(),
             first_seen: Utc.with_ymd_and_hms(2026, 10, 21, 14, 5, 0).unwrap(),
-            link: link.to_string(),
+            workspace_path: workspace_path.to_string(),
         }
     }
 
@@ -140,8 +168,14 @@ mod tests {
 
     #[test]
     fn high_severity_is_shown_immediately_including_quiet_hours() {
-        let high = item("h", Severity::High, "https://helloorbit.app/workspace/high");
-        let shown = present(std::slice::from_ref(&high), true, at_local(), false);
+        let high = item("h", Severity::High, "/workspace/high");
+        let shown = present(
+            std::slice::from_ref(&high),
+            true,
+            at_local(),
+            false,
+            DEFAULT_SERVER_BASE,
+        );
         assert!(shown.show_bubble);
         assert!(shown.show_os_notification);
         assert_eq!(shown.summary.lines[0], "1 high-severity item");
@@ -160,18 +194,32 @@ mod tests {
 
     #[test]
     fn quiet_hours_hide_other_results_unless_the_user_asked() {
-        let medium = item(
-            "m",
-            Severity::Medium,
-            "https://helloorbit.app/workspace/example",
+        let medium = item("m", Severity::Medium, "/workspace/example");
+        let quiet = present(
+            std::slice::from_ref(&medium),
+            true,
+            at_local(),
+            false,
+            DEFAULT_SERVER_BASE,
         );
-        let quiet = present(std::slice::from_ref(&medium), true, at_local(), false);
         assert!(!quiet.show_bubble);
         assert!(!quiet.show_os_notification);
-        let asked = present(std::slice::from_ref(&medium), true, at_local(), true);
+        let asked = present(
+            std::slice::from_ref(&medium),
+            true,
+            at_local(),
+            true,
+            DEFAULT_SERVER_BASE,
+        );
         assert!(asked.show_bubble);
         assert!(!asked.show_os_notification);
-        let open = present(std::slice::from_ref(&medium), false, at_local(), false);
+        let open = present(
+            std::slice::from_ref(&medium),
+            false,
+            at_local(),
+            false,
+            DEFAULT_SERVER_BASE,
+        );
         assert!(open.show_bubble);
         assert!(!open.show_os_notification);
         assert_eq!(open.summary.lines[0], "1 new or changed item");
@@ -181,25 +229,34 @@ mod tests {
     fn summary_copy_and_links_stay_plain() {
         let items = vec![
             item("m", Severity::Medium, "notes/local"),
-            item(
-                "h",
-                Severity::Critical,
-                "https://helloorbit.app/workspace/critical",
-            ),
+            item("h", Severity::Critical, "/workspace/critical"),
         ];
-        let shown = present(&items, false, at_local(), false);
+        let shown = present(&items, false, at_local(), false, DEFAULT_SERVER_BASE);
         assert_eq!(shown.summary.lines[0], "1 high-severity item");
         assert!(shown.summary.lines[1].ends_with("..."));
         assert_eq!(
             shown.summary.details_url,
             "https://helloorbit.app/workspace/critical"
         );
-        let empty = present(&[], false, at_local(), false);
+        let empty = present(&[], false, at_local(), false, DEFAULT_SERVER_BASE);
         assert_eq!(empty.summary.lines[0], "No new or changed items");
         assert_eq!(empty.summary.details_url, PLACEHOLDER_ORIGIN);
         assert_eq!(
-            details_url(&[item("x", Severity::Low, "javascript:open(1)")]),
+            details_url(
+                &[item("x", Severity::Low, "javascript:open(1)")],
+                DEFAULT_SERVER_BASE
+            ),
             PLACEHOLDER_ORIGIN
+        );
+        let calm = calm_notice(Notice::Unavailable, DEFAULT_SERVER_BASE);
+        assert!(calm.show_bubble);
+        assert!(!calm.show_os_notification);
+        assert_eq!(calm.summary.details_url, PLACEHOLDER_ORIGIN);
+        assert_eq!(
+            calm_notice(Notice::SignedOut, "http://127.0.0.1:9")
+                .summary
+                .details_url,
+            ""
         );
         for line in &shown.summary.lines {
             assert_eq!(find_disallowed_copy(line), None, "{line}");
