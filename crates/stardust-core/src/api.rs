@@ -306,12 +306,20 @@ pub fn parse_server_base(value: &str) -> Result<String, OrbitError> {
         Some((host, path)) => (host, path),
         None => (rest, ""),
     };
-    if !path.is_empty() || split_host_port(host_port).is_none() {
+    let Some((host, _)) = split_host_port(host_port) else {
+        return Err(OrbitError::ServerBase);
+    };
+    if !path.is_empty() {
         return Err(OrbitError::ServerBase);
     }
     let scheme = if trimmed.starts_with("https://") {
         "https"
     } else {
+        // The bearer token rides on every request, so plain http is only
+        // accepted for a loopback host (local development and tests).
+        if !is_loopback_host(host) {
+            return Err(OrbitError::ServerBase);
+        }
         "http"
     };
     Ok(format!("{scheme}://{host_port}"))
@@ -427,6 +435,13 @@ fn hosts_match(base_host: &str, candidate_host: &str) -> bool {
 
 fn port_or_https(port: Option<u16>) -> u16 {
     port.unwrap_or(443)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn split_host_port(host_port: &str) -> Option<(&str, Option<u16>)> {
@@ -635,5 +650,15 @@ mod tests {
         assert_eq!(bumped_interval(5, true), 10);
         assert_eq!(bumped_interval(28, true), 30);
         assert_eq!(bumped_interval(0, false), 1);
+    }
+
+    #[test]
+    fn plain_http_server_base_is_loopback_only() {
+        assert!(parse_server_base("http://127.0.0.1:9").is_ok());
+        assert!(parse_server_base("http://localhost:8080").is_ok());
+        assert!(parse_server_base("http://[::1]:8080").is_ok());
+        assert!(parse_server_base("http://helloorbit.app").is_err());
+        assert!(parse_server_base("http://10.0.0.5:8080").is_err());
+        assert!(parse_server_base("https://helloorbit.app").is_ok());
     }
 }
