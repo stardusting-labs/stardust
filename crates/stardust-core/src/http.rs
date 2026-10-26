@@ -8,9 +8,9 @@
 
 use crate::api::{
     bumped_interval, AlertsPage, DesktopApi, DesktopStatus, DeviceCodeResponse, DevicePoll,
-    DeviceTokenRequest, DeviceTokenResponse, OrbitError, DEVICE_CODE_TTL_SECONDS,
-    DEVICE_GRANT_TYPE, PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS, PATH_DEVICE_CODE,
-    PATH_DEVICE_TOKEN,
+    DeviceTokenRequest, DeviceTokenResponse, OrbitError, RefreshTokenRequest,
+    DEVICE_CODE_TTL_SECONDS, DEVICE_GRANT_TYPE, PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS,
+    PATH_DEVICE_CODE, PATH_DEVICE_TOKEN, PATH_TOKEN_REFRESH, REFRESH_GRANT_TYPE,
 };
 use serde::Deserialize;
 use std::io::Read;
@@ -82,6 +82,37 @@ impl HttpOrbitClient {
                     .unwrap_or_else(|| bumped_interval(5, true))
                     .clamp(1, 30),
             }),
+            Some(err) => Err(classify_code(status, err.code)),
+            None => Err(classify_status(status)),
+        }
+    }
+
+    /// Trade a refresh token for a new access token.
+    ///
+    /// A rejected refresh token (`invalid_grant`, or a 401) is
+    /// [`OrbitError::Unauthorized`], and the caller signs the user out.
+    pub fn refresh_access_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<DeviceTokenResponse, OrbitError> {
+        if !token_chars(refresh_token) {
+            return Err(OrbitError::Unauthorized);
+        }
+        let request = RefreshTokenRequest {
+            grant_type: REFRESH_GRANT_TYPE.to_string(),
+            refresh_token: refresh_token.to_string(),
+        };
+        let body = serde_json::to_vec(&request).map_err(|_| OrbitError::Refused)?;
+        let (status, bytes) = self.exchange("POST", PATH_TOKEN_REFRESH, None, Some(&body))?;
+        if status == 200 {
+            let token: DeviceTokenResponse =
+                serde_json::from_slice(&bytes).map_err(|_| OrbitError::Response)?;
+            if !accepted_token(&token) {
+                return Err(OrbitError::Response);
+            }
+            return Ok(token);
+        }
+        match oauth_error(&bytes) {
             Some(err) => Err(classify_code(status, err.code)),
             None => Err(classify_status(status)),
         }
@@ -240,16 +271,21 @@ fn valid_user_code(value: &str) -> bool {
             .all(|byte| ALPHABET.contains(&byte))
 }
 
+fn token_chars(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_whitespace())
+}
+
 fn accepted_token(token: &DeviceTokenResponse) -> bool {
-    !token.access_token.is_empty()
+    token_chars(&token.access_token)
         && token.token == token.access_token
         && token.token_type == "Bearer"
         && token.expires_in > 0
         && token.expires_at_epoch_ms > 0
-        && token
-            .access_token
-            .bytes()
-            .all(|byte| byte.is_ascii() && !byte.is_ascii_whitespace())
+        && token.refresh_token.as_deref().is_none_or(token_chars)
+        && token.refresh_expires_in != Some(0)
 }
 
 fn accepted_status(status: &DesktopStatus) -> bool {
@@ -290,6 +326,7 @@ fn classify_code(status: u16, code: &str) -> OrbitError {
     match code {
         "expired_token" => OrbitError::Expired,
         "access_denied" | "origin_denied" => OrbitError::Denied,
+        "invalid_grant" => OrbitError::Unauthorized,
         "invalid_token" | "invalid_request" if status == 401 => OrbitError::Unauthorized,
         "temporarily_unavailable" => OrbitError::Unreachable,
         _ => classify_status(status),
@@ -327,6 +364,7 @@ fn oauth_error(body: &[u8]) -> Option<OauthError> {
         "origin_denied" => "origin_denied",
         "invalid_request" => "invalid_request",
         "invalid_token" => "invalid_token",
+        "invalid_grant" => "invalid_grant",
         "unsupported_grant_type" => "unsupported_grant_type",
         "temporarily_unavailable" => "temporarily_unavailable",
         _ => "other",
@@ -377,6 +415,7 @@ mod tests {
         polls: u32,
         mode: Mode,
         saw_query: bool,
+        refreshes: u32,
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -387,6 +426,7 @@ mod tests {
             polls: 0,
             mode: Mode::On,
             saw_query: false,
+            refreshes: 0,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let server = {
@@ -490,6 +530,44 @@ mod tests {
         let _ = server.join();
     }
 
+    #[test]
+    fn local_server_trades_a_refresh_token_and_refuses_an_unknown_one() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(Fake {
+            polls: 0,
+            mode: Mode::On,
+            saw_query: false,
+            refreshes: 0,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || serve(listener, state, stop))
+        };
+        let client =
+            HttpOrbitClient::with_timeout(&format!("http://{address}"), Duration::from_secs(2))
+                .unwrap();
+        let next = client.refresh_access_token("example-refresh").unwrap();
+        assert_eq!(next.access_token, EXAMPLE_TOKEN);
+        assert_eq!(next.refresh_token.as_deref(), Some("example-refresh-next"));
+        assert_eq!(next.refresh_expires_in, Some(86_400));
+        assert!(!format!("{next:?}").contains("example-refresh-next"));
+        assert_eq!(
+            client.refresh_access_token("revoked-refresh").unwrap_err(),
+            OrbitError::Unauthorized
+        );
+        assert_eq!(
+            client.refresh_access_token("has space").unwrap_err(),
+            OrbitError::Unauthorized
+        );
+        assert_eq!(state.lock().unwrap().refreshes, 2);
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(address);
+        let _ = server.join();
+    }
+
     fn serve(listener: TcpListener, state: Arc<Mutex<Fake>>, stop: Arc<AtomicBool>) {
         listener.set_nonblocking(true).ok();
         while !stop.load(Ordering::SeqCst) {
@@ -519,8 +597,30 @@ mod tests {
             }
             collected.extend_from_slice(&buf[..read]);
         }
+        let head_end = collected
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4)
+            .unwrap_or(collected.len());
+        let wanted = String::from_utf8_lossy(&collected[..head_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+            .min(8192);
+        while collected.len() < head_end + wanted {
+            let read = stream.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            collected.extend_from_slice(&buf[..read]);
+        }
         let text = String::from_utf8_lossy(&collected);
-        let (head, _) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+        let (head, request_body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
         let mut lines = head.lines();
         let request = lines.next().unwrap_or("");
         let mut parts = request.split_whitespace();
@@ -535,7 +635,14 @@ mod tests {
             name.eq_ignore_ascii_case("authorization")
                 .then(|| value.trim().to_string())
         });
-        let (status, reason, body) = route(method, path, query, authorization.as_deref(), state);
+        let (status, reason, body) = route(
+            method,
+            path,
+            query,
+            authorization.as_deref(),
+            request_body,
+            state,
+        );
         let content_type = if body.is_empty() {
             ""
         } else {
@@ -553,6 +660,7 @@ mod tests {
         path: &str,
         query: Option<&str>,
         authorization: Option<&str>,
+        request_body: &str,
         state: &Mutex<Fake>,
     ) -> (u16, &'static str, String) {
         if query.is_some() {
@@ -574,6 +682,28 @@ mod tests {
                     r#"{{"device_code":"{DEVICE_CODE}","user_code":"ABCD-EFGH","verification_uri":"https://helloorbit.app/rust-preview/pqc/account","verification_uri_complete":"https://helloorbit.app/rust-preview/pqc/account?user_code=ABCD-EFGH","expires_in":600,"interval":5}}"#
                 ),
             );
+        }
+        if method == "POST"
+            && path == PATH_DEVICE_TOKEN
+            && request_body.contains(r#""grant_type":"refresh_token""#)
+        {
+            let mut fake = state.lock().unwrap_or_else(|err| err.into_inner());
+            fake.refreshes = fake.refreshes.saturating_add(1);
+            return if request_body.contains(r#""refresh_token":"example-refresh""#) {
+                (
+                    200,
+                    "OK",
+                    format!(
+                        r#"{{"token":"{EXAMPLE_TOKEN}","access_token":"{EXAMPLE_TOKEN}","token_type":"Bearer","expires_in":300,"expires_at_epoch_ms":1893456000000,"refresh_token":"example-refresh-next","refresh_expires_in":86400}}"#
+                    ),
+                )
+            } else {
+                (
+                    400,
+                    "Bad Request",
+                    r#"{"error":"invalid_grant"}"#.to_string(),
+                )
+            };
         }
         if method == "POST" && path == PATH_DEVICE_TOKEN {
             let mut fake = state.lock().unwrap_or_else(|err| err.into_inner());

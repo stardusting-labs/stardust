@@ -11,6 +11,15 @@ pub enum UiMsg {
     Menu(String),
     Checked(Presentation),
     Pet,
+    SignIn(SignInUpdate),
+}
+
+/// Progress from the background sign-in thread. The user code is shown in
+/// the settings window; it is not a secret. Tokens never pass through here.
+pub enum SignInUpdate {
+    Code(String),
+    Done,
+    Failed,
 }
 
 #[derive(Clone)]
@@ -54,15 +63,6 @@ impl Inbox {
         {
             let _ = proxy.send_event(Wake);
         }
-    }
-
-    pub fn has_bubble(&self) -> bool {
-        self.inner
-            .queue
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .iter()
-            .any(|message| matches!(message, UiMsg::Checked(presentation) if presentation.show_bubble))
     }
 
     pub fn try_pop(&self) -> Option<UiMsg> {

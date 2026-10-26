@@ -6,11 +6,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod a11y;
 pub mod api;
+pub mod autostart;
 pub mod check;
 pub mod config;
 pub mod copy;
 pub mod http;
+pub mod i18n;
 pub mod integrations;
 pub mod mcp;
 pub mod outbound;
@@ -18,5 +21,7 @@ pub mod pet;
 pub mod policy;
 pub mod position;
 pub mod schedule;
+pub mod session;
+pub mod settings;
 pub mod text;
 pub mod token;
