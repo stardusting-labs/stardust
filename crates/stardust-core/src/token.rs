@@ -1,7 +1,7 @@
 //! Keychain record for a short-lived access token.
 //!
 //! The access token from ORBIT device sign-in is stored here. Callers can
-//! store a token only when it expires within 24 hours. Debug output redacts
+//! store a token only when it expires within 5 minutes. Debug output redacts
 //! the secret.
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Mutex;
 
-pub const MAX_ACCESS_TOKEN_LIFETIME: TimeDelta = TimeDelta::hours(24);
+pub const MAX_ACCESS_TOKEN_LIFETIME: TimeDelta = TimeDelta::seconds(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TokenError {
@@ -17,7 +17,7 @@ pub enum TokenError {
     Empty,
     #[error("token is already expired")]
     AlreadyExpired,
-    #[error("token must expire within 24 hours")]
+    #[error("token must expire within 5 minutes")]
     LifetimeTooLong,
     #[error("stored token could not be read")]
     Corrupt,
@@ -162,15 +162,15 @@ mod tests {
         let token = StoredToken::issue(
             "example-access",
             Some("example-refresh".into()),
-            now + TimeDelta::minutes(10),
+            now + TimeDelta::seconds(240),
             now,
         )
         .unwrap();
         store.store(&token).unwrap();
-        let loaded = store.load(now + TimeDelta::minutes(5)).unwrap().unwrap();
+        let loaded = store.load(now + TimeDelta::seconds(120)).unwrap().unwrap();
         assert_eq!(loaded.access_token(), "example-access");
-        assert!(store.load(now + TimeDelta::minutes(10)).unwrap().is_none());
-        assert!(store.load(now + TimeDelta::minutes(11)).unwrap().is_none());
+        assert!(store.load(now + TimeDelta::seconds(240)).unwrap().is_none());
+        assert!(store.load(now + TimeDelta::seconds(241)).unwrap().is_none());
     }
 
     #[test]
@@ -195,16 +195,10 @@ mod tests {
             TokenError::AlreadyExpired
         );
         assert_eq!(
-            StoredToken::issue(
-                "example",
-                None,
-                now + TimeDelta::hours(24) + TimeDelta::seconds(1),
-                now
-            )
-            .unwrap_err(),
+            StoredToken::issue("example", None, now + TimeDelta::seconds(301), now).unwrap_err(),
             TokenError::LifetimeTooLong
         );
-        assert!(StoredToken::issue("example", None, now + TimeDelta::minutes(16), now).is_ok());
+        assert!(StoredToken::issue("example", None, now + TimeDelta::seconds(300), now).is_ok());
         let token = StoredToken::issue(
             "super-secret-token",
             Some("super-secret-refresh".into()),

@@ -22,39 +22,42 @@ pub enum CheckKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckOutcome {
     pub presentation: Presentation,
-    pub next_cursor: Option<String>,
     pub items: Vec<AlertItem>,
 }
 
 pub async fn perform_check<C: DesktopApi + Sync>(
     client: &C,
     access_token: &str,
-    cursor: Option<&str>,
     now_utc: DateTime<Utc>,
     schedule: &Schedule,
     kind: &CheckKind,
     server_base: &str,
 ) -> Result<CheckOutcome, OrbitError> {
-    let _status = client.desktop_status(access_token).await?;
-    let page = client.desktop_alerts(access_token, cursor).await?;
-    let next_cursor = page.next_cursor.clone();
+    let status = client.desktop_status(access_token).await?;
+    let page = client.desktop_alerts(access_token).await?;
     let items = deduped(page);
     let local = now_utc.with_timezone(&schedule.timezone());
     let quiet = schedule.is_quiet_at(local);
     let force_bubble = matches!(kind, CheckKind::Manual);
-    let presentation = present(&items, quiet, local, force_bubble, server_base);
+    let presentation = present(
+        &items,
+        quiet,
+        local,
+        force_bubble,
+        server_base,
+        &status.workspace_path,
+    );
     Ok(CheckOutcome {
         presentation,
-        next_cursor,
         items,
     })
 }
 
 fn deduped(page: AlertsPage) -> Vec<AlertItem> {
     let mut seen = BTreeSet::new();
-    page.items
+    page.alerts
         .into_iter()
-        .filter(|item| !item.id.is_empty() && seen.insert(item.id.clone()))
+        .filter(|item| seen.insert(item.id.clone()))
         .collect()
 }
 
@@ -97,13 +100,14 @@ pub fn note_success(
 mod tests {
     use super::{note_anchor, note_success, perform_check, retry_delay, CheckKind};
     use crate::api::{
-        AlertItem, AlertsPage, DesktopApi, DesktopStatus, OrbitError, Severity, DEFAULT_SERVER_BASE,
+        AlertItem, AlertsPage, DesktopApi, DesktopStatus, ImmediateSeverity, OrbitError,
+        ScheduleOwner, Severity, DEFAULT_SERVER_BASE, WORKSPACE_FINDINGS,
+        WORKSPACE_NEEDS_ATTENTION,
     };
     use crate::config::CheckState;
     use crate::schedule::{parse_quiet, parse_weekdays, FireSource, Schedule};
     use chrono::{TimeZone, Utc};
     use chrono_tz::UTC;
-    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -121,16 +125,21 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<DesktopStatus, OrbitError>> + Send {
             self.status_calls.fetch_add(1, Ordering::SeqCst);
             let result = self.status.lock().unwrap().clone().map(|()| DesktopStatus {
-                last_scan_time: None,
-                counts_by_severity: BTreeMap::new(),
+                organization_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                observation_count: 0,
+                alert_count: 0,
+                high_severity_count: 0,
+                immediate_severity: ImmediateSeverity::High,
+                schedule_owner: ScheduleOwner::Client,
+                workspace_path: WORKSPACE_FINDINGS.to_string(),
+                as_of_unix: 1_761_436_800,
             });
             async move { result }
         }
 
-        fn desktop_alerts<'a>(
-            &'a self,
-            _: &'a str,
-            _: Option<&'a str>,
+        fn desktop_alerts(
+            &self,
+            _: &str,
         ) -> impl std::future::Future<Output = Result<AlertsPage, OrbitError>> + Send {
             self.alerts_calls.fetch_add(1, Ordering::SeqCst);
             let page = self.pages.lock().unwrap().pop().ok_or(OrbitError::Response);
@@ -151,14 +160,14 @@ mod tests {
 
     fn high_page() -> AlertsPage {
         AlertsPage {
-            items: vec![AlertItem {
+            alerts: vec![AlertItem {
                 id: "h1".to_string(),
                 severity: Severity::High,
                 title: "Example high connection".to_string(),
-                first_seen: Utc.with_ymd_and_hms(2026, 10, 21, 14, 0, 0).unwrap(),
-                workspace_path: "/workspace/high".to_string(),
+                created_at: Utc.with_ymd_and_hms(2026, 10, 21, 14, 0, 0).unwrap(),
+                workspace_path: WORKSPACE_NEEDS_ATTENTION.to_string(),
+                immediate: true,
             }],
-            next_cursor: Some("cursor-2".to_string()),
         }
     }
 
@@ -174,7 +183,6 @@ mod tests {
         let outcome = perform_check(
             &client,
             "example-access",
-            None,
             now,
             &schedule(true),
             &CheckKind::Scheduled {
@@ -190,7 +198,10 @@ mod tests {
         assert!(outcome.presentation.show_bubble);
         assert!(outcome.presentation.show_os_notification);
         assert_eq!(outcome.items.len(), 1);
-        assert_eq!(outcome.next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(
+            outcome.presentation.summary.details_url,
+            "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention"
+        );
     }
 
     #[test]
@@ -233,7 +244,6 @@ mod tests {
         let err = perform_check(
             &client,
             "example-access",
-            None,
             now,
             &schedule(false),
             &CheckKind::Manual,

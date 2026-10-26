@@ -173,11 +173,11 @@ fn one_destination(
     if record.kind == IntegrationKind::GenericJson && signing.as_deref().unwrap_or("").is_empty() {
         return Err(missing(&record.id, "signing secret"));
     }
-    let high = items.iter().any(|item| item.severity.is_high_or_above());
+    let high = items.iter().any(AlertItem::shows_immediately);
     let plan = send_plan(true, window.quiet, high, window.manual);
     let mut posts = Vec::new();
     if matches!(plan, SendPlan::Immediate | SendPlan::Both) {
-        for item in items.iter().filter(|item| item.severity.is_high_or_above()) {
+        for item in items.iter().filter(|item| item.shows_immediately()) {
             posts.push(render_post(
                 record,
                 &checked,
@@ -254,10 +254,7 @@ fn immediate_body(item: &AlertItem, window: &DeliveryWindow<'_>) -> Value {
 }
 
 fn summary_body(items: &[AlertItem], window: &DeliveryWindow<'_>) -> Value {
-    let high = items
-        .iter()
-        .filter(|item| item.severity.is_high_or_above())
-        .count();
+    let high = items.iter().filter(|item| item.shows_immediately()).count();
     let summary = if items.is_empty() {
         "No new or changed items".to_string()
     } else if high > 0 {
@@ -273,7 +270,7 @@ fn summary_body(items: &[AlertItem], window: &DeliveryWindow<'_>) -> Value {
                 "id": clip_id(&item.id),
                 "severity": wire_severity(item.severity),
                 "summary": clip_text(&item.title),
-                "last_checked_at": stamp(item.first_seen),
+                "last_checked_at": stamp(item.created_at),
                 "workspace_url": workspace_link(window.server_base, &item.workspace_path),
             })
         })
@@ -288,7 +285,7 @@ fn summary_body(items: &[AlertItem], window: &DeliveryWindow<'_>) -> Value {
         "summary": summary,
         "last_checked_at": stamp(window.now),
         "check_interval_minutes": window.interval_minutes.clamp(1, 10_080),
-        "workspace_url": details_url(items, window.server_base),
+        "workspace_url": details_url(items, window.server_base, ""),
         "attention_count": high,
         "finding_count": items.len(),
         "check_count": 1,
@@ -503,9 +500,9 @@ fn host_blocked(host: &str) -> bool {
 
 fn wire_severity(severity: Severity) -> &'static str {
     match severity {
-        Severity::Info | Severity::Low => "low",
+        Severity::Low => "low",
         Severity::Medium => "medium",
-        Severity::High | Severity::Critical => "high",
+        Severity::High => "high",
     }
 }
 
@@ -573,8 +570,9 @@ mod tests {
             id: "finding-1".to_string(),
             severity,
             title: "Example connection finding".to_string(),
-            first_seen: Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap(),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap(),
             workspace_path: "/workspace/example".to_string(),
+            immediate: severity == Severity::High,
         }
     }
 

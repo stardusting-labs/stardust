@@ -1,18 +1,15 @@
 //! ORBIT device sign-in and the desktop status and alerts surface.
 //!
-//! Sign-in matches `crates/orbit-axum-auth/src/pqc_device_signin.rs` on
-//! rust-orbit: `POST /api/pqc/v1/account/device/code` and
-//! `POST /api/pqc/v1/account/device/token`. A signed-in browser session calls
-//! `POST /api/pqc/v1/account/device/approve`. This client does not.
+//! JSON matches `docs/contracts/stardust-desktop-api-v1.md`.
+//! `POST /api/pqc/v1/account/device/code` and
+//! `POST /api/pqc/v1/account/device/token` are the device flow. A signed-in
+//! browser calls `POST /api/pqc/v1/account/device/approve`. This client does not.
 //!
-//! [`DesktopApi`] is isolated from sign-in. Its JSON is provisional until
-//! `docs/contracts/stardust-desktop-api-v1.md` is published. Both desktop
-//! routes take `Authorization: Bearer`. A 404 means the feature is off. A 401
-//! means the token is no longer accepted.
+//! [`DesktopApi`] is the two bearer GETs. A 404 with an empty body means the
+//! feature flag is off. A 401 means the bearer was missing or rejected.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 
@@ -24,6 +21,13 @@ pub const PATH_DEVICE_APPROVE: &str = "/api/pqc/v1/account/device/approve";
 pub const PATH_DESKTOP_STATUS: &str = "/api/pqc/v1/desktop/status";
 pub const PATH_DESKTOP_ALERTS: &str = "/api/pqc/v1/desktop/alerts";
 pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+pub const DEVICE_CODE_TTL_SECONDS: u64 = 600;
+pub const ACCESS_TOKEN_LIFETIME_SECONDS: u64 = 300;
+pub const WORKSPACE_FINDINGS: &str = "/rust-preview/pqc/studio/app/findings";
+pub const WORKSPACE_FINDINGS_BY_SEVERITY: &str =
+    "/rust-preview/pqc/studio/app/findings/by-severity";
+pub const WORKSPACE_NEEDS_ATTENTION: &str =
+    "/rust-preview/pqc/studio/app/control-room/needs-attention";
 
 /// Kept so older notes that say "placeholder origin" still point at the default host.
 pub const PLACEHOLDER_ORIGIN: &str = DEFAULT_SERVER_BASE;
@@ -48,48 +52,68 @@ pub enum OrbitError {
     ServerBase,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
-    Info,
     Low,
     Medium,
     High,
-    Critical,
 }
 
-impl Severity {
-    pub fn is_high_or_above(self) -> bool {
-        matches!(self, Self::High | Self::Critical)
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleOwner {
+    Client,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmediateSeverity {
+    High,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DesktopStatus {
-    pub last_scan_time: Option<DateTime<Utc>>,
-    pub counts_by_severity: BTreeMap<Severity, u32>,
+    pub organization_id: String,
+    pub observation_count: u64,
+    pub alert_count: u64,
+    pub high_severity_count: u64,
+    pub immediate_severity: ImmediateSeverity,
+    pub schedule_owner: ScheduleOwner,
+    pub workspace_path: String,
+    pub as_of_unix: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlertItem {
     pub id: String,
     pub severity: Severity,
     pub title: String,
-    pub first_seen: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
     pub workspace_path: String,
+    pub immediate: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl AlertItem {
+    /// High alerts are marked immediate by the server.
+    pub fn shows_immediately(&self) -> bool {
+        self.immediate || self.severity == Severity::High
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlertsPage {
-    pub items: Vec<AlertItem>,
-    #[serde(default)]
-    pub next_cursor: Option<String>,
+    pub alerts: Vec<AlertItem>,
 }
 
 /// `POST /api/pqc/v1/account/device/code` response.
 ///
 /// `device_code` is a secret. Debug output redacts it.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceCodeResponse {
     pub device_code: String,
     pub user_code: String,
@@ -120,20 +144,20 @@ pub struct DeviceTokenRequest {
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceTokenResponse {
+    pub token: String,
     pub access_token: String,
-    #[serde(default)]
     pub token_type: String,
-    #[serde(default)]
     pub expires_in: u64,
-    #[serde(default)]
-    pub expires_at_epoch_ms: Option<u64>,
+    pub expires_at_epoch_ms: u64,
 }
 
 impl fmt::Debug for DeviceTokenResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DeviceTokenResponse")
+            .field("token", &"<redacted>")
             .field("access_token", &"<redacted>")
             .field("token_type", &self.token_type)
             .field("expires_in", &self.expires_in)
@@ -145,7 +169,7 @@ impl fmt::Debug for DeviceTokenResponse {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DevicePoll {
     Pending,
-    SlowDown,
+    SlowDown { interval: u64 },
     Approved(DeviceTokenResponse),
 }
 
@@ -155,10 +179,9 @@ pub trait DesktopApi: Send + Sync {
         &self,
         access_token: &str,
     ) -> impl Future<Output = Result<DesktopStatus, OrbitError>> + Send;
-    fn desktop_alerts<'a>(
-        &'a self,
-        access_token: &'a str,
-        cursor: Option<&'a str>,
+    fn desktop_alerts(
+        &self,
+        access_token: &str,
     ) -> impl Future<Output = Result<AlertsPage, OrbitError>> + Send;
 }
 
@@ -174,22 +197,26 @@ impl MockOrbitClient {
         let seen = DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z")
             .expect("fixed example timestamp")
             .with_timezone(&Utc);
-        let mut counts = BTreeMap::new();
-        counts.insert(Severity::Medium, 1);
         Self {
             status: DesktopStatus {
-                last_scan_time: Some(seen),
-                counts_by_severity: counts,
+                organization_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                observation_count: 1,
+                alert_count: 1,
+                high_severity_count: 0,
+                immediate_severity: ImmediateSeverity::High,
+                schedule_owner: ScheduleOwner::Client,
+                workspace_path: WORKSPACE_FINDINGS.to_string(),
+                as_of_unix: seen.timestamp(),
             },
             first_page: AlertsPage {
-                items: vec![AlertItem {
+                alerts: vec![AlertItem {
                     id: "example-1".to_string(),
                     severity: Severity::Medium,
                     title: "Example connection finding".to_string(),
-                    first_seen: seen,
-                    workspace_path: "/workspace/example".to_string(),
+                    created_at: seen,
+                    workspace_path: WORKSPACE_FINDINGS_BY_SEVERITY.to_string(),
+                    immediate: false,
                 }],
-                next_cursor: Some("mock-1".to_string()),
             },
         }
     }
@@ -204,19 +231,11 @@ impl DesktopApi for MockOrbitClient {
         async move { Ok(status) }
     }
 
-    fn desktop_alerts<'a>(
-        &'a self,
-        _access_token: &'a str,
-        cursor: Option<&'a str>,
+    fn desktop_alerts(
+        &self,
+        _access_token: &str,
     ) -> impl Future<Output = Result<AlertsPage, OrbitError>> + Send {
-        let page = if cursor == self.first_page.next_cursor.as_deref() {
-            AlertsPage {
-                items: Vec::new(),
-                next_cursor: self.first_page.next_cursor.clone(),
-            }
-        } else {
-            self.first_page.clone()
-        };
+        let page = self.first_page.clone();
         async move { Ok(page) }
     }
 }
@@ -320,7 +339,7 @@ pub fn bumped_interval(current: u64, slow_down: bool) -> u64 {
     }
 }
 
-fn safe_workspace_path(value: &str) -> Option<&str> {
+pub(crate) fn safe_workspace_path(value: &str) -> Option<&str> {
     let path = value.trim();
     if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
         return None;
@@ -407,29 +426,39 @@ fn split_host_port(host_port: &str) -> Option<(&str, Option<u16>)> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::{
         bumped_interval, is_allowed_https_url, parse_server_base, resolve_server_base,
-        workspace_url, DesktopApi, DeviceCodeResponse, DeviceTokenResponse, MockOrbitClient,
-        Severity, DEFAULT_SERVER_BASE, ENV_SERVER_URL, PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS,
-        PATH_DEVICE_APPROVE, PATH_DEVICE_CODE, PATH_DEVICE_TOKEN,
+        workspace_url, AlertItem, DesktopApi, DeviceCodeResponse, DeviceTokenResponse,
+        ImmediateSeverity, MockOrbitClient, ScheduleOwner, Severity, ACCESS_TOKEN_LIFETIME_SECONDS,
+        DEFAULT_SERVER_BASE, DEVICE_CODE_TTL_SECONDS, ENV_SERVER_URL, PATH_DESKTOP_ALERTS,
+        PATH_DESKTOP_STATUS, PATH_DEVICE_APPROVE, PATH_DEVICE_CODE, PATH_DEVICE_TOKEN,
+        WORKSPACE_FINDINGS, WORKSPACE_FINDINGS_BY_SEVERITY, WORKSPACE_NEEDS_ATTENTION,
     };
 
     #[tokio::test(flavor = "current_thread")]
     async fn mock_returns_one_page_then_nothing_new() {
         let client = MockOrbitClient::example();
-        let page = client.desktop_alerts("", None).await.unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].severity, Severity::Medium);
-        assert_eq!(page.items[0].workspace_path, "/workspace/example");
+        let page = client.desktop_alerts("").await.unwrap();
+        assert_eq!(page.alerts.len(), 1);
+        assert_eq!(page.alerts[0].severity, Severity::Medium);
+        assert!(!page.alerts[0].immediate);
         assert_eq!(
-            workspace_url(DEFAULT_SERVER_BASE, &page.items[0].workspace_path).as_deref(),
-            Some("https://helloorbit.app/workspace/example")
+            page.alerts[0].workspace_path,
+            WORKSPACE_FINDINGS_BY_SEVERITY
         );
-        let next = page.next_cursor.clone();
-        let again = client.desktop_alerts("", next.as_deref()).await.unwrap();
-        assert!(again.items.is_empty());
+        assert_eq!(
+            workspace_url(DEFAULT_SERVER_BASE, &page.alerts[0].workspace_path).as_deref(),
+            Some("https://helloorbit.app/rust-preview/pqc/studio/app/findings/by-severity")
+        );
+        let again = client.desktop_alerts("").await.unwrap();
+        assert_eq!(again.alerts.len(), 1);
         let status = client.desktop_status("").await.unwrap();
-        assert_eq!(status.counts_by_severity.get(&Severity::Medium), Some(&1));
+        assert_eq!(status.schedule_owner, ScheduleOwner::Client);
+        assert_eq!(status.immediate_severity, ImmediateSeverity::High);
+        assert_eq!(status.workspace_path, WORKSPACE_FINDINGS);
+        assert_eq!(status.observation_count, 1);
     }
 
     #[test]
@@ -440,15 +469,18 @@ mod tests {
         assert_eq!(PATH_DESKTOP_STATUS, "/api/pqc/v1/desktop/status");
         assert_eq!(PATH_DESKTOP_ALERTS, "/api/pqc/v1/desktop/alerts");
         assert_eq!(ENV_SERVER_URL, "STARDUST_SERVER_URL");
+        assert_eq!(DEVICE_CODE_TTL_SECONDS, 600);
+        assert_eq!(ACCESS_TOKEN_LIFETIME_SECONDS, 300);
     }
 
     #[test]
     fn token_response_debug_redacts_secrets() {
         let response = DeviceTokenResponse {
+            token: "secret-access".to_string(),
             access_token: "secret-access".to_string(),
             token_type: "Bearer".to_string(),
-            expires_in: 900,
-            expires_at_epoch_ms: None,
+            expires_in: 300,
+            expires_at_epoch_ms: 1_700_000_000_000,
         };
         let rendered = format!("{response:?}");
         assert!(!rendered.contains("secret-access"));
@@ -464,9 +496,17 @@ mod tests {
         let rendered = format!("{code:?}");
         assert!(!rendered.contains("secret-device"));
         assert!(rendered.contains("ABCD-EFGH"));
-        assert!(!Severity::Medium.is_high_or_above());
-        assert!(Severity::High.is_high_or_above());
-        assert!(Severity::Critical.is_high_or_above());
+        let high = AlertItem {
+            id: "h".to_string(),
+            severity: Severity::High,
+            title: "high".to_string(),
+            created_at: chrono::Utc.with_ymd_and_hms(2026, 10, 26, 0, 0, 0).unwrap(),
+            workspace_path: WORKSPACE_NEEDS_ATTENTION.to_string(),
+            immediate: true,
+        };
+        assert!(high.shows_immediately());
+        assert_eq!(high.severity, Severity::High);
+        assert_ne!(Severity::Medium, Severity::High);
     }
 
     #[test]

@@ -97,7 +97,7 @@ Config is JSON. On Linux it is `$XDG_CONFIG_HOME/stardust/config.json` or `~/.co
 }
 ```
 
-An ORBIT access token is kept in the system keychain until it expires. Stardust will not store one that is already expired or that lasts longer than 24 hours. The token is not written into the config file.
+An ORBIT access token is kept in the system keychain until the server expiry, and never longer than 5 minutes. Stardust will not store one that is already expired. The token is not written into the config file. Sign in again after it expires. There is no refresh token.
 
 ## Integrations
 
@@ -127,13 +127,13 @@ Stardust does not send telemetry.
 
 Stored on this computer:
 
-- The config file holds the schedule, character position, skin, size, integration ids and public hosts, the alerts cursor, and an optional server address. It does not hold the access token.
+- The config file holds the schedule, character position, skin, size, integration ids and public hosts, the last checked time, and an optional server address. An older alerts cursor, if one is still in the file, is cleared and is not sent. The file does not hold the access token.
 - The OS keychain holds the ORBIT access token, and, only if you turn an integration on, that integration's destination URL, signing secret, or access token.
 
 Network calls, when you are not in `--demo`:
 
 - `POST /api/pqc/v1/account/device/code` and `POST /api/pqc/v1/account/device/token` during sign-in.
-- `GET /api/pqc/v1/desktop/status` and `GET /api/pqc/v1/desktop/alerts` on each check, with the keychain token as a bearer header.
+- `GET /api/pqc/v1/desktop/status` and `GET /api/pqc/v1/desktop/alerts` on each check, with the keychain token as a bearer header. A 404 with an empty body means those routes are turned off. The alerts response is the current list, with no cursor.
 - Optional Slack, Teams, JSON webhook, or MCP calls that you enable.
 - Opening your browser to an https page on the configured host when you click a bubble or start sign-in.
 

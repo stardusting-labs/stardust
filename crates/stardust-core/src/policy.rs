@@ -63,12 +63,10 @@ pub fn present(
     checked_local: DateTime<Tz>,
     force_bubble: bool,
     server_base: &str,
+    fallback_path: &str,
 ) -> Presentation {
-    let high = items
-        .iter()
-        .filter(|item| item.severity.is_high_or_above())
-        .count();
-    let summary = summarize(items, high, checked_local, server_base);
+    let high = items.iter().filter(|item| item.shows_immediately()).count();
+    let summary = summarize(items, high, checked_local, server_base, fallback_path);
     let mut show_bubble = !quiet || high > 0;
     let show_os_notification = high > 0;
     if force_bubble {
@@ -86,15 +84,16 @@ fn summarize(
     high: usize,
     checked_local: DateTime<Tz>,
     server_base: &str,
+    fallback_path: &str,
 ) -> Summary {
     let mut lines = vec![count_line(items.len(), high)];
-    if let Some(title) = items.iter().find(|item| item.severity.is_high_or_above()) {
+    if let Some(title) = items.iter().find(|item| item.shows_immediately()) {
         lines.push(clean_title(&title.title));
     }
     lines.push(format!("Last checked time {}", clock(checked_local)));
     Summary {
         lines,
-        details_url: details_url(items, server_base),
+        details_url: details_url(items, server_base, fallback_path),
     }
 }
 
@@ -128,16 +127,17 @@ fn clock(local: DateTime<Tz>) -> String {
     format!("{:02}:{:02}", local.hour(), local.minute())
 }
 
-pub fn details_url(items: &[AlertItem], server_base: &str) -> String {
+pub fn details_url(items: &[AlertItem], server_base: &str, fallback_path: &str) -> String {
     let preferred = items
         .iter()
-        .filter(|item| item.severity.is_high_or_above())
+        .filter(|item| item.shows_immediately())
         .find_map(|item| workspace_url(server_base, &item.workspace_path))
         .or_else(|| {
             items
                 .iter()
                 .find_map(|item| workspace_url(server_base, &item.workspace_path))
-        });
+        })
+        .or_else(|| workspace_url(server_base, fallback_path));
     preferred
         .or_else(|| https_origin(server_base))
         .unwrap_or_default()
@@ -157,8 +157,9 @@ mod tests {
             severity,
             title: "Example connection finding with a very long title that should be cut"
                 .to_string(),
-            first_seen: Utc.with_ymd_and_hms(2026, 10, 21, 14, 5, 0).unwrap(),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 21, 14, 5, 0).unwrap(),
             workspace_path: workspace_path.to_string(),
+            immediate: severity == Severity::High,
         }
     }
 
@@ -168,13 +169,18 @@ mod tests {
 
     #[test]
     fn high_severity_is_shown_immediately_including_quiet_hours() {
-        let high = item("h", Severity::High, "/workspace/high");
+        let high = item(
+            "h",
+            Severity::High,
+            "/rust-preview/pqc/studio/app/control-room/needs-attention",
+        );
         let shown = present(
             std::slice::from_ref(&high),
             true,
             at_local(),
             false,
             DEFAULT_SERVER_BASE,
+            "",
         );
         assert!(shown.show_bubble);
         assert!(shown.show_os_notification);
@@ -187,7 +193,7 @@ mod tests {
             .starts_with("Last checked time 14:05"));
         assert_eq!(
             shown.summary.details_url,
-            "https://helloorbit.app/workspace/high"
+            "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention"
         );
         assert!((3..=10).contains(&BUBBLE_VISIBLE_FOR.as_secs()));
     }
@@ -201,6 +207,7 @@ mod tests {
             at_local(),
             false,
             DEFAULT_SERVER_BASE,
+            "",
         );
         assert!(!quiet.show_bubble);
         assert!(!quiet.show_os_notification);
@@ -210,6 +217,7 @@ mod tests {
             at_local(),
             true,
             DEFAULT_SERVER_BASE,
+            "",
         );
         assert!(asked.show_bubble);
         assert!(!asked.show_os_notification);
@@ -219,6 +227,7 @@ mod tests {
             at_local(),
             false,
             DEFAULT_SERVER_BASE,
+            "",
         );
         assert!(open.show_bubble);
         assert!(!open.show_os_notification);
@@ -229,22 +238,39 @@ mod tests {
     fn summary_copy_and_links_stay_plain() {
         let items = vec![
             item("m", Severity::Medium, "notes/local"),
-            item("h", Severity::Critical, "/workspace/critical"),
+            item(
+                "h",
+                Severity::High,
+                "/rust-preview/pqc/studio/app/control-room/needs-attention",
+            ),
         ];
-        let shown = present(&items, false, at_local(), false, DEFAULT_SERVER_BASE);
+        let shown = present(&items, false, at_local(), false, DEFAULT_SERVER_BASE, "");
         assert_eq!(shown.summary.lines[0], "1 high-severity item");
         assert!(shown.summary.lines[1].ends_with("..."));
         assert_eq!(
             shown.summary.details_url,
-            "https://helloorbit.app/workspace/critical"
+            "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention"
         );
-        let empty = present(&[], false, at_local(), false, DEFAULT_SERVER_BASE);
+        let empty = present(&[], false, at_local(), false, DEFAULT_SERVER_BASE, "");
         assert_eq!(empty.summary.lines[0], "No new or changed items");
         assert_eq!(empty.summary.details_url, PLACEHOLDER_ORIGIN);
+        let findings = present(
+            &[],
+            false,
+            at_local(),
+            false,
+            DEFAULT_SERVER_BASE,
+            "/rust-preview/pqc/studio/app/findings",
+        );
+        assert_eq!(
+            findings.summary.details_url,
+            "https://helloorbit.app/rust-preview/pqc/studio/app/findings"
+        );
         assert_eq!(
             details_url(
                 &[item("x", Severity::Low, "javascript:open(1)")],
-                DEFAULT_SERVER_BASE
+                DEFAULT_SERVER_BASE,
+                ""
             ),
             PLACEHOLDER_ORIGIN
         );

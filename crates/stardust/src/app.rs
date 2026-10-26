@@ -9,7 +9,8 @@ use crate::tray::Tray;
 use crate::window::{self, Session};
 use chrono::{DateTime, Utc};
 use stardust_core::api::{
-    resolve_server_base, DesktopApi, DesktopStatus, MockOrbitClient, OrbitError, ENV_SERVER_URL,
+    resolve_server_base, AlertItem, DesktopApi, DesktopStatus, MockOrbitClient, OrbitError,
+    ENV_SERVER_URL,
 };
 use stardust_core::check::{note_anchor, note_success, perform_check, retry_delay, CheckKind};
 use stardust_core::config::{default_config_path, load_config, save_config, Config};
@@ -449,15 +450,11 @@ async fn run_check(
     require_token: bool,
 ) -> CheckSignal {
     let now = Utc::now();
-    let (cursor, schedule, server_base) = {
+    let (schedule, server_base) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
         let server_base = server_base_of(&loaded)
             .unwrap_or_else(|_| stardust_core::api::DEFAULT_SERVER_BASE.to_string());
-        (
-            loaded.state().alerts_cursor.clone(),
-            loaded.schedule().clone(),
-            server_base,
-        )
+        (loaded.schedule().clone(), server_base)
     };
     let token = match tokens.load(now) {
         Ok(token) => token,
@@ -481,27 +478,14 @@ async fn run_check(
         .as_ref()
         .map(|token| token.access_token())
         .unwrap_or("");
-    match perform_check(
-        client,
-        access_token,
-        cursor.as_deref(),
-        now,
-        &schedule,
-        kind,
-        &server_base,
-    )
-    .await
-    {
+    match perform_check(client, access_token, now, &schedule, kind, &server_base).await {
         Ok(outcome) => {
             let item_count = u32::try_from(outcome.items.len()).unwrap_or(u32::MAX);
-            let high_severity = outcome
-                .items
-                .iter()
-                .any(|item| item.severity.is_high_or_above());
+            let high_severity = outcome.items.iter().any(AlertItem::shows_immediately);
             let records = {
                 let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
                 note_anchor(loaded.state_mut(), kind);
-                note_success(loaded.state_mut(), now, outcome.next_cursor);
+                note_success(loaded.state_mut(), now, None);
                 if let Err(err) = save_config(path, &loaded) {
                     eprintln!("stardust: could not save config: {err}");
                 }
@@ -629,14 +613,13 @@ impl DesktopApi for Backend {
         }
     }
 
-    async fn desktop_alerts<'a>(
-        &'a self,
-        access_token: &'a str,
-        cursor: Option<&'a str>,
+    async fn desktop_alerts(
+        &self,
+        access_token: &str,
     ) -> Result<stardust_core::api::AlertsPage, OrbitError> {
         match self {
-            Self::Demo(client) => client.desktop_alerts(access_token, cursor).await,
-            Self::Live(client) => client.desktop_alerts(access_token, cursor).await,
+            Self::Demo(client) => client.desktop_alerts(access_token).await,
+            Self::Live(client) => client.desktop_alerts(access_token).await,
         }
     }
 }

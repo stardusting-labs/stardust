@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 pub struct CheckState {
     #[serde(default)]
     pub interval_anchor: Option<DateTime<Utc>>,
+    /// Older files may still have this field. Checks clear it and do not send it.
     #[serde(default)]
     pub alerts_cursor: Option<String>,
     #[serde(default)]

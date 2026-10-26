@@ -8,8 +8,9 @@
 
 use crate::api::{
     bumped_interval, AlertsPage, DesktopApi, DesktopStatus, DeviceCodeResponse, DevicePoll,
-    DeviceTokenRequest, DeviceTokenResponse, OrbitError, DEVICE_GRANT_TYPE, PATH_DESKTOP_ALERTS,
-    PATH_DESKTOP_STATUS, PATH_DEVICE_CODE, PATH_DEVICE_TOKEN,
+    DeviceTokenRequest, DeviceTokenResponse, OrbitError, DEVICE_CODE_TTL_SECONDS,
+    DEVICE_GRANT_TYPE, PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS, PATH_DEVICE_CODE,
+    PATH_DEVICE_TOKEN,
 };
 use serde::Deserialize;
 use std::io::Read;
@@ -47,7 +48,12 @@ impl HttpOrbitClient {
         if status != 200 {
             return Err(classify_sign_in(status, &body));
         }
-        serde_json::from_slice(&body).map_err(|_| OrbitError::Response)
+        let started: DeviceCodeResponse =
+            serde_json::from_slice(&body).map_err(|_| OrbitError::Response)?;
+        if !valid_device_code(&started.device_code) || !valid_user_code(&started.user_code) {
+            return Err(OrbitError::Response);
+        }
+        Ok(started)
     }
 
     pub fn poll_device_token(&self, device_code: &str) -> Result<DevicePoll, OrbitError> {
@@ -63,24 +69,21 @@ impl HttpOrbitClient {
         if status == 200 {
             let token: DeviceTokenResponse =
                 serde_json::from_slice(&bytes).map_err(|_| OrbitError::Response)?;
-            if token.access_token.is_empty()
-                || token
-                    .access_token
-                    .bytes()
-                    .any(|byte| !byte.is_ascii() || byte.is_ascii_whitespace())
-            {
+            if !accepted_token(&token) {
                 return Err(OrbitError::Response);
             }
             return Ok(DevicePoll::Approved(token));
         }
         match oauth_error(&bytes) {
-            Some("authorization_pending") => Ok(DevicePoll::Pending),
-            Some("slow_down") => Ok(DevicePoll::SlowDown),
-            Some("expired_token") => Err(OrbitError::Expired),
-            Some("access_denied") => Err(OrbitError::Denied),
-            Some(_) => Err(OrbitError::Refused),
-            None if status == 401 => Err(OrbitError::Unauthorized),
-            None => Err(classify_transport(status)),
+            Some(err) if err.code == "authorization_pending" => Ok(DevicePoll::Pending),
+            Some(err) if err.code == "slow_down" => Ok(DevicePoll::SlowDown {
+                interval: err
+                    .interval
+                    .unwrap_or_else(|| bumped_interval(5, true))
+                    .clamp(1, 30),
+            }),
+            Some(err) => Err(classify_code(status, err.code)),
+            None => Err(classify_status(status)),
         }
     }
 
@@ -93,7 +96,8 @@ impl HttpOrbitClient {
         expires_in: u64,
         interval: u64,
     ) -> Result<DeviceTokenResponse, OrbitError> {
-        let deadline = Instant::now() + Duration::from_secs(expires_in.clamp(1, 900));
+        let deadline =
+            Instant::now() + Duration::from_secs(expires_in.clamp(1, DEVICE_CODE_TTL_SECONDS));
         let mut interval = interval.clamp(1, 30);
         loop {
             if Instant::now() >= deadline {
@@ -102,7 +106,7 @@ impl HttpOrbitClient {
             match self.poll_device_token(device_code)? {
                 DevicePoll::Approved(token) => return Ok(token),
                 DevicePoll::Pending => {}
-                DevicePoll::SlowDown => interval = bumped_interval(interval, true),
+                DevicePoll::SlowDown { interval: next } => interval = next.clamp(1, 30),
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             let pause = Duration::from_secs(interval).min(remaining);
@@ -116,25 +120,26 @@ impl HttpOrbitClient {
     fn status_now(&self, access_token: &str) -> Result<DesktopStatus, OrbitError> {
         let (status, body) = self.desktop("GET", PATH_DESKTOP_STATUS, access_token)?;
         if status != 200 {
-            return Err(classify_desktop(status));
+            return Err(classify_desktop(status, &body));
         }
-        serde_json::from_slice(&body).map_err(|_| OrbitError::Response)
+        let parsed: DesktopStatus =
+            serde_json::from_slice(&body).map_err(|_| OrbitError::Response)?;
+        if !accepted_status(&parsed) {
+            return Err(OrbitError::Response);
+        }
+        Ok(parsed)
     }
 
-    fn alerts_now(
-        &self,
-        access_token: &str,
-        cursor: Option<&str>,
-    ) -> Result<AlertsPage, OrbitError> {
-        let path = match cursor {
-            Some(cursor) => format!("{PATH_DESKTOP_ALERTS}?cursor={}", query_encode(cursor)),
-            None => PATH_DESKTOP_ALERTS.to_string(),
-        };
-        let (status, body) = self.desktop("GET", &path, access_token)?;
+    fn alerts_now(&self, access_token: &str) -> Result<AlertsPage, OrbitError> {
+        let (status, body) = self.desktop("GET", PATH_DESKTOP_ALERTS, access_token)?;
         if status != 200 {
-            return Err(classify_desktop(status));
+            return Err(classify_desktop(status, &body));
         }
-        serde_json::from_slice(&body).map_err(|_| OrbitError::Response)
+        let parsed: AlertsPage = serde_json::from_slice(&body).map_err(|_| OrbitError::Response)?;
+        if !accepted_alerts(&parsed) {
+            return Err(OrbitError::Response);
+        }
+        Ok(parsed)
     }
 
     fn desktop(
@@ -192,12 +197,11 @@ impl DesktopApi for HttpOrbitClient {
         std::future::ready(self.status_now(access_token))
     }
 
-    fn desktop_alerts<'a>(
-        &'a self,
-        access_token: &'a str,
-        cursor: Option<&'a str>,
+    fn desktop_alerts(
+        &self,
+        access_token: &str,
     ) -> impl std::future::Future<Output = Result<AlertsPage, OrbitError>> + Send {
-        std::future::ready(self.alerts_now(access_token, cursor))
+        std::future::ready(self.alerts_now(access_token))
     }
 }
 
@@ -213,52 +217,123 @@ fn bearer(access_token: &str) -> Result<String, OrbitError> {
 }
 
 fn valid_device_code(value: &str) -> bool {
-    (1..=256).contains(&value.len())
+    value.len() == 64
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn classify_desktop(status: u16) -> OrbitError {
+fn valid_user_code(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let (Some(left), Some(right)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    left.len() == 4
+        && right.len() == 4
+        && left
+            .bytes()
+            .chain(right.bytes())
+            .all(|byte| ALPHABET.contains(&byte))
+}
+
+fn accepted_token(token: &DeviceTokenResponse) -> bool {
+    !token.access_token.is_empty()
+        && token.token == token.access_token
+        && token.token_type == "Bearer"
+        && token.expires_in > 0
+        && token.expires_at_epoch_ms > 0
+        && token
+            .access_token
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_whitespace())
+}
+
+fn accepted_status(status: &DesktopStatus) -> bool {
+    !status.organization_id.is_empty()
+        && status.organization_id.len() <= 80
+        && status
+            .organization_id
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_whitespace())
+        && status.as_of_unix >= 0
+        && crate::api::safe_workspace_path(&status.workspace_path).is_some()
+}
+
+fn accepted_alerts(page: &AlertsPage) -> bool {
+    page.alerts.iter().all(|alert| {
+        (1..=80).contains(&alert.id.len())
+            && (1..=120).contains(&alert.title.len())
+            && alert.immediate == (alert.severity == crate::api::Severity::High)
+            && crate::api::safe_workspace_path(&alert.workspace_path).is_some()
+    })
+}
+
+fn classify_desktop(status: u16, body: &[u8]) -> OrbitError {
+    match oauth_error(body) {
+        Some(err) => classify_code(status, err.code),
+        None => classify_status(status),
+    }
+}
+
+fn classify_sign_in(status: u16, body: &[u8]) -> OrbitError {
+    match oauth_error(body) {
+        Some(err) => classify_code(status, err.code),
+        None => classify_status(status),
+    }
+}
+
+fn classify_code(status: u16, code: &str) -> OrbitError {
+    match code {
+        "expired_token" => OrbitError::Expired,
+        "access_denied" | "origin_denied" => OrbitError::Denied,
+        "invalid_token" | "invalid_request" if status == 401 => OrbitError::Unauthorized,
+        "temporarily_unavailable" => OrbitError::Unreachable,
+        _ => classify_status(status),
+    }
+}
+
+fn classify_status(status: u16) -> OrbitError {
     match status {
         401 => OrbitError::Unauthorized,
+        403 => OrbitError::Denied,
         404 => OrbitError::FeatureOff,
         408 | 429 | 500..=599 => OrbitError::Unreachable,
         _ => OrbitError::Response,
     }
 }
 
-fn classify_transport(status: u16) -> OrbitError {
-    match status {
-        408 | 429 | 500..=599 => OrbitError::Unreachable,
-        _ => OrbitError::Response,
-    }
+struct OauthError {
+    code: &'static str,
+    interval: Option<u64>,
 }
 
-fn classify_sign_in(status: u16, body: &[u8]) -> OrbitError {
-    match oauth_error(body) {
-        Some("expired_token") => OrbitError::Expired,
-        Some("access_denied") => OrbitError::Denied,
-        Some(_) => OrbitError::Refused,
-        None if status == 401 => OrbitError::Unauthorized,
-        None => classify_transport(status),
-    }
-}
-
-fn oauth_error(body: &[u8]) -> Option<&str> {
+fn oauth_error(body: &[u8]) -> Option<OauthError> {
     #[derive(Deserialize)]
     struct Body<'a> {
         error: &'a str,
+        #[serde(default)]
+        interval: Option<u64>,
     }
-    let Body { error } = serde_json::from_slice(body).ok()?;
-    Some(match error {
+    let parsed: Body<'_> = serde_json::from_slice(body).ok()?;
+    let code = match parsed.error {
         "authorization_pending" => "authorization_pending",
         "slow_down" => "slow_down",
         "expired_token" => "expired_token",
         "access_denied" => "access_denied",
+        "origin_denied" => "origin_denied",
         "invalid_request" => "invalid_request",
+        "invalid_token" => "invalid_token",
         "unsupported_grant_type" => "unsupported_grant_type",
+        "temporarily_unavailable" => "temporarily_unavailable",
         _ => "other",
+    };
+    Some(OauthError {
+        code,
+        interval: parsed.interval,
     })
 }
 
@@ -272,25 +347,13 @@ fn read_limited(status: u16, response: ureq::Response) -> Result<(u16, Vec<u8>),
     Ok((status, body))
 }
 
-fn query_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::HttpOrbitClient;
     use crate::api::{
-        workspace_url, DesktopApi, DevicePoll, OrbitError, DEFAULT_SERVER_BASE,
-        PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS, PATH_DEVICE_CODE, PATH_DEVICE_TOKEN,
+        workspace_url, DesktopApi, DevicePoll, ImmediateSeverity, OrbitError, ScheduleOwner,
+        Severity, DEFAULT_SERVER_BASE, PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS, PATH_DEVICE_CODE,
+        PATH_DEVICE_TOKEN, WORKSPACE_FINDINGS, WORKSPACE_NEEDS_ATTENTION,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -300,18 +363,20 @@ mod tests {
     use std::time::Duration;
 
     const EXAMPLE_TOKEN: &str = "example-access";
+    const DEVICE_CODE: &str = "abababababababababababababababababababababababababababababababab";
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mode {
         On,
         Off,
         Expired,
+        Busy,
     }
 
     struct Fake {
         polls: u32,
         mode: Mode,
-        last_cursor: Option<String>,
+        saw_query: bool,
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -321,7 +386,7 @@ mod tests {
         let state = Arc::new(Mutex::new(Fake {
             polls: 0,
             mode: Mode::On,
-            last_cursor: None,
+            saw_query: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let server = {
@@ -334,42 +399,55 @@ mod tests {
                 .unwrap();
 
         let started = client.start_device_code().unwrap();
+        assert_eq!(started.device_code, DEVICE_CODE);
         assert_eq!(started.user_code, "ABCD-EFGH");
-        assert!(!format!("{started:?}").contains("abc123"));
+        assert_eq!(started.expires_in, 600);
+        assert_eq!(started.interval, 5);
+        assert_eq!(
+            started.verification_uri,
+            "https://helloorbit.app/rust-preview/pqc/account"
+        );
+        assert!(!format!("{started:?}").contains(DEVICE_CODE));
         assert!(matches!(
             client.poll_device_token(&started.device_code).unwrap(),
             DevicePoll::Pending
+        ));
+        assert!(matches!(
+            client.poll_device_token(&started.device_code).unwrap(),
+            DevicePoll::SlowDown { interval: 10 }
         ));
         let approved = match client.poll_device_token(&started.device_code).unwrap() {
             DevicePoll::Approved(token) => token,
             other => panic!("expected approval, got {other:?}"),
         };
+        assert_eq!(approved.token, EXAMPLE_TOKEN);
         assert_eq!(approved.access_token, EXAMPLE_TOKEN);
+        assert_eq!(approved.token_type, "Bearer");
+        assert_eq!(approved.expires_in, 300);
+        assert_eq!(approved.expires_at_epoch_ms, 1_893_456_000_000);
         assert!(!format!("{approved:?}").contains(EXAMPLE_TOKEN));
 
         let status = client.desktop_status(&approved.access_token).await.unwrap();
         assert_eq!(
-            status.counts_by_severity.get(&crate::api::Severity::High),
-            Some(&1)
+            status.organization_id,
+            "00000000-0000-4000-8000-000000000001"
         );
-        let page = client
-            .desktop_alerts(&approved.access_token, None)
-            .await
-            .unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].workspace_path, "/workspace/high");
+        assert_eq!(status.observation_count, 1);
+        assert_eq!(status.alert_count, 1);
+        assert_eq!(status.high_severity_count, 1);
+        assert_eq!(status.immediate_severity, ImmediateSeverity::High);
+        assert_eq!(status.schedule_owner, ScheduleOwner::Client);
+        assert_eq!(status.workspace_path, WORKSPACE_FINDINGS);
+        let page = client.desktop_alerts(&approved.access_token).await.unwrap();
+        assert_eq!(page.alerts.len(), 1);
+        assert_eq!(page.alerts[0].severity, Severity::High);
+        assert!(page.alerts[0].immediate);
+        assert_eq!(page.alerts[0].workspace_path, WORKSPACE_NEEDS_ATTENTION);
         assert_eq!(
-            workspace_url(DEFAULT_SERVER_BASE, &page.items[0].workspace_path).as_deref(),
-            Some("https://helloorbit.app/workspace/high")
+            workspace_url(DEFAULT_SERVER_BASE, &page.alerts[0].workspace_path).as_deref(),
+            Some("https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention")
         );
-        let _ = client
-            .desktop_alerts(&approved.access_token, page.next_cursor.as_deref())
-            .await
-            .unwrap();
-        assert_eq!(
-            state.lock().unwrap().last_cursor.as_deref(),
-            Some("cursor-2")
-        );
+        assert!(!state.lock().unwrap().saw_query);
 
         state.lock().unwrap().mode = Mode::Off;
         assert_eq!(
@@ -382,10 +460,18 @@ mod tests {
         state.lock().unwrap().mode = Mode::Expired;
         assert_eq!(
             client
-                .desktop_alerts(&approved.access_token, None)
+                .desktop_alerts(&approved.access_token)
                 .await
                 .unwrap_err(),
             OrbitError::Unauthorized
+        );
+        state.lock().unwrap().mode = Mode::Busy;
+        assert_eq!(
+            client
+                .desktop_status(&approved.access_token)
+                .await
+                .unwrap_err(),
+            OrbitError::Unreachable
         );
 
         let closed =
@@ -450,8 +536,13 @@ mod tests {
                 .then(|| value.trim().to_string())
         });
         let (status, reason, body) = route(method, path, query, authorization.as_deref(), state);
+        let content_type = if body.is_empty() {
+            ""
+        } else {
+            "Content-Type: application/json\r\n"
+        };
         let payload = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {reason}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(payload.as_bytes())
@@ -464,42 +555,52 @@ mod tests {
         authorization: Option<&str>,
         state: &Mutex<Fake>,
     ) -> (u16, &'static str, String) {
+        if query.is_some() {
+            state
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .saw_query = true;
+            return (
+                400,
+                "Bad Request",
+                r#"{"error":"invalid_request"}"#.to_string(),
+            );
+        }
         if method == "POST" && path == PATH_DEVICE_CODE {
             return (
                 200,
                 "OK",
-                r#"{"device_code":"abc123","user_code":"ABCD-EFGH","verification_uri":"https://helloorbit.app/account","verification_uri_complete":"https://helloorbit.app/account?user_code=ABCD-EFGH","expires_in":600,"interval":5}"#
-                    .to_string(),
+                format!(
+                    r#"{{"device_code":"{DEVICE_CODE}","user_code":"ABCD-EFGH","verification_uri":"https://helloorbit.app/rust-preview/pqc/account","verification_uri_complete":"https://helloorbit.app/rust-preview/pqc/account?user_code=ABCD-EFGH","expires_in":600,"interval":5}}"#
+                ),
             );
         }
         if method == "POST" && path == PATH_DEVICE_TOKEN {
             let mut fake = state.lock().unwrap_or_else(|err| err.into_inner());
-            if fake.polls == 0 {
-                fake.polls = 1;
-                return (
+            let polls = fake.polls;
+            fake.polls = fake.polls.saturating_add(1);
+            return match polls {
+                0 => (
                     400,
                     "Bad Request",
                     r#"{"error":"authorization_pending"}"#.to_string(),
-                );
-            }
-            return (
-                200,
-                "OK",
-                format!(
-                    r#"{{"token":"{EXAMPLE_TOKEN}","access_token":"{EXAMPLE_TOKEN}","token_type":"Bearer","expires_in":900}}"#
                 ),
-            );
+                1 => (
+                    400,
+                    "Bad Request",
+                    r#"{"error":"slow_down","interval":10}"#.to_string(),
+                ),
+                _ => (
+                    200,
+                    "OK",
+                    format!(
+                        r#"{{"token":"{EXAMPLE_TOKEN}","access_token":"{EXAMPLE_TOKEN}","token_type":"Bearer","expires_in":300,"expires_at_epoch_ms":1893456000000}}"#
+                    ),
+                ),
+            };
         }
         if method == "GET" && (path == PATH_DESKTOP_STATUS || path == PATH_DESKTOP_ALERTS) {
-            let mut fake = state.lock().unwrap_or_else(|err| err.into_inner());
-            if path == PATH_DESKTOP_ALERTS {
-                fake.last_cursor = query.and_then(|query| {
-                    query
-                        .split('&')
-                        .find_map(|pair| pair.strip_prefix("cursor="))
-                        .map(str::to_string)
-                });
-            }
+            let fake = state.lock().unwrap_or_else(|err| err.into_inner());
             let expected = format!("Bearer {EXAMPLE_TOKEN}");
             return match fake.mode {
                 Mode::Expired => (
@@ -507,7 +608,12 @@ mod tests {
                     "Unauthorized",
                     r#"{"error":"invalid_token"}"#.to_string(),
                 ),
-                Mode::Off => (404, "Not Found", r#"{"error":"not_found"}"#.to_string()),
+                Mode::Off => (404, "Not Found", String::new()),
+                Mode::Busy => (
+                    503,
+                    "Service Unavailable",
+                    r#"{"error":"temporarily_unavailable"}"#.to_string(),
+                ),
                 Mode::On if authorization != Some(expected.as_str()) => (
                     401,
                     "Unauthorized",
@@ -516,17 +622,17 @@ mod tests {
                 Mode::On if path == PATH_DESKTOP_STATUS => (
                     200,
                     "OK",
-                    r#"{"last_scan_time":"2026-10-21T14:00:00Z","counts_by_severity":{"high":1}}"#
+                    r#"{"organization_id":"00000000-0000-4000-8000-000000000001","observation_count":1,"alert_count":1,"high_severity_count":1,"immediate_severity":"high","schedule_owner":"client","workspace_path":"/rust-preview/pqc/studio/app/findings","as_of_unix":1761436800}"#
                         .to_string(),
                 ),
                 Mode::On => (
                     200,
                     "OK",
-                    r#"{"items":[{"id":"a1","severity":"high","title":"Example high connection","first_seen":"2026-10-21T14:00:00Z","workspace_path":"/workspace/high"}],"next_cursor":"cursor-2"}"#
+                    r#"{"alerts":[{"id":"mp-41-key-exchange-rule-id","severity":"high","title":"api.example:443 key-exchange x25519","created_at":"2026-10-26T00:00:00Z","workspace_path":"/rust-preview/pqc/studio/app/control-room/needs-attention","immediate":true}]}"#
                         .to_string(),
                 ),
             };
         }
-        (404, "Not Found", r#"{"error":"not_found"}"#.to_string())
+        (404, "Not Found", String::new())
     }
 }

@@ -57,7 +57,7 @@ pub fn sign_out() -> Result<(), String> {
 fn expiry(
     now: DateTime<Utc>,
     expires_in: u64,
-    expires_at_epoch_ms: Option<u64>,
+    expires_at_epoch_ms: u64,
 ) -> Result<DateTime<Utc>, String> {
     let cap = now + MAX_ACCESS_TOKEN_LIFETIME;
     let from_ttl = (expires_in > 0).then(|| {
@@ -65,11 +65,13 @@ fn expiry(
         now.checked_add_signed(TimeDelta::seconds(seconds))
             .unwrap_or(cap)
     });
-    let from_ms = expires_at_epoch_ms.and_then(|millis| {
-        i64::try_from(millis)
-            .ok()
-            .and_then(DateTime::from_timestamp_millis)
-    });
+    let from_ms = (expires_at_epoch_ms > 0)
+        .then(|| {
+            i64::try_from(expires_at_epoch_ms)
+                .ok()
+                .and_then(DateTime::from_timestamp_millis)
+        })
+        .flatten();
     let chosen = match (from_ttl, from_ms) {
         (Some(ttl), Some(stamp)) => ttl.min(stamp),
         (Some(ttl), None) => ttl,
