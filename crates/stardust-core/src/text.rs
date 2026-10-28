@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::integrations::integrations_label;
+use crate::pet::{PetScale, PetSkin};
 use crate::schedule::{format_interval, Schedule};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Tz;
@@ -14,6 +15,8 @@ pub struct MenuText {
     pub schedule: String,
     pub character: String,
     pub integrations: String,
+    pub pet_skin: PetSkin,
+    pub pet_scale: PetScale,
 }
 
 pub fn menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
@@ -48,6 +51,8 @@ pub fn menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
         } else {
             "Show character".to_string()
         },
+        pet_skin: config.pet_skin(),
+        pet_scale: config.pet_scale(),
     }
 }
 
@@ -118,6 +123,8 @@ mod tests {
         assert_eq!(text.next_check, "Next check 15:45");
         assert_eq!(text.character, "Show character");
         assert_eq!(text.integrations, "Integrations off");
+        assert_eq!(text.pet_skin, crate::pet::PetSkin::Astronaut);
+        assert_eq!(text.pet_scale, crate::pet::PetScale::X2);
         for value in [
             &text.tooltip,
             &text.next_check,

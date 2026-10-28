@@ -6,6 +6,7 @@ use crate::integrations::{
     parse_id, IntegrationError, IntegrationKind, IntegrationRecord, MAX_INTEGRATIONS,
 };
 use crate::outbound::public_https;
+use crate::pet::{PetScale, PetSkin};
 use crate::position::ScreenPoint;
 use crate::schedule::{
     day_token, parse_clock, parse_interval, parse_quiet, parse_timezone, parse_weekdays, Schedule,
@@ -81,6 +82,14 @@ struct ScheduleFile {
 struct ConfigFile {
     character_visible: bool,
     character_position: ScreenPoint,
+    #[serde(default)]
+    pet_skin: PetSkin,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_pet_scale",
+        serialize_with = "serialize_pet_scale"
+    )]
+    pet_scale: PetScale,
     schedule: ScheduleFile,
     #[serde(default)]
     state: CheckState,
@@ -99,6 +108,8 @@ impl Config {
         let file = ConfigFile {
             character_visible: false,
             character_position: ScreenPoint { x: 64, y: 64 },
+            pet_skin: PetSkin::Astronaut,
+            pet_scale: PetScale::X2,
             schedule: ScheduleFile {
                 interval_minutes: Some(60),
                 clock_times: Vec::new(),
@@ -129,6 +140,22 @@ impl Config {
 
     pub fn set_character_position(&mut self, position: ScreenPoint) {
         self.file.character_position = position;
+    }
+
+    pub fn pet_skin(&self) -> PetSkin {
+        self.file.pet_skin
+    }
+
+    pub fn set_pet_skin(&mut self, skin: PetSkin) {
+        self.file.pet_skin = skin;
+    }
+
+    pub fn pet_scale(&self) -> PetScale {
+        self.file.pet_scale
+    }
+
+    pub fn set_pet_scale(&mut self, scale: PetScale) {
+        self.file.pet_scale = scale;
     }
 
     pub fn schedule(&self) -> &Schedule {
@@ -306,6 +333,21 @@ fn validate_integrations(records: &[IntegrationRecord]) -> Result<(), Integratio
         }
     }
     Ok(())
+}
+
+fn deserialize_pet_scale<'de, D>(deserializer: D) -> Result<PetScale, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    PetScale::from_factor(value).ok_or_else(|| serde::de::Error::custom("pet scale must be 2 or 3"))
+}
+
+fn serialize_pet_scale<S>(scale: &PetScale, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u8(u8::try_from(scale.factor()).unwrap_or(2))
 }
 
 fn valid_host(host: &str) -> bool {
@@ -594,6 +636,50 @@ mod tests {
             .is_err());
         let with_secret = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"},"integrations":[{"id":"ops","kind":"slack_incoming","enabled":false,"url":"https://helloorbit.app/hook"}]}"#;
         assert!(parse_config(with_secret).is_err());
+    }
+
+    #[test]
+    fn pet_skin_and_scale_round_trip_and_old_files_stay_astronaut() {
+        let config = Config::default_for("UTC").unwrap();
+        assert_eq!(config.pet_skin(), crate::pet::PetSkin::Astronaut);
+        assert_eq!(config.pet_scale(), crate::pet::PetScale::X2);
+        let loaded = parse_config(&config.to_json().unwrap()).unwrap();
+        assert_eq!(loaded.pet_skin(), config.pet_skin());
+        assert_eq!(loaded.pet_scale(), config.pet_scale());
+
+        let minimal = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon","tue","wed","thu","fri","sat","sun"],"timezone":"UTC"}}"#;
+        let mut old = parse_config(minimal).unwrap();
+        assert_eq!(old.pet_skin(), crate::pet::PetSkin::Astronaut);
+        assert_eq!(old.pet_scale(), crate::pet::PetScale::X2);
+
+        old.set_pet_skin(crate::pet::PetSkin::Star);
+        old.set_pet_scale(crate::pet::PetScale::X3);
+        let text = old.to_json().unwrap();
+        assert!(text.contains("\"pet_skin\": \"star\""));
+        assert!(text.contains("\"pet_scale\": 3"));
+        let saved = parse_config(&text).unwrap();
+        assert_eq!(saved.pet_skin(), crate::pet::PetSkin::Star);
+        assert_eq!(saved.pet_scale(), crate::pet::PetScale::X3);
+
+        let dir = std::env::temp_dir().join(format!(
+            "stardust-pet-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        save_config(&path, &saved).unwrap();
+        let from_disk = load_config(&path).unwrap().unwrap();
+        assert_eq!(from_disk.pet_skin(), crate::pet::PetSkin::Star);
+        assert_eq!(from_disk.pet_scale(), crate::pet::PetScale::X3);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let bad_skin = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"pet_skin":"comet","schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
+        assert!(parse_config(bad_skin).is_err());
+        let bad_scale = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"pet_scale":4,"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
+        assert!(parse_config(bad_scale).is_err());
+        let one_x = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"pet_scale":1,"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
+        assert!(parse_config(one_x).is_err());
     }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);

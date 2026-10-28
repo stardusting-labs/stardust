@@ -1,9 +1,12 @@
 use crate::actions::{apply_menu, MenuEffect};
 use crate::font::{self, draw_lines};
 use crate::inbox::{Inbox, UiMsg, Wake};
+use crate::live::LivePet;
+use crate::sprites;
 use crate::tray::Tray;
 use chrono::Utc;
 use stardust_core::config::{save_config, Config};
+use stardust_core::pet::{pet_frame, pet_pose, tray_glyph, PetPose, PetScale, PetSkin};
 use stardust_core::policy::Presentation;
 use stardust_core::position::{layout_bubble, LayoutRequest, ScreenPoint, ScreenRect, WindowSize};
 use stardust_core::text::menu_text;
@@ -20,11 +23,8 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId, WindowLevel};
 
-const CHARACTER_SIZE: u32 = 96;
 const BUBBLE_COLOR: u32 = 0x001C_2430;
 const TEXT_COLOR: u32 = 0x00F4_F1EA;
-const CHARACTER_COLOR: u32 = 0x00F2_C14E;
-const EYE_COLOR: u32 = 0x001C_2430;
 
 type SbContext = softbuffer::Context<winit::event_loop::OwnedDisplayHandle>;
 type SbSurface = softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Window>;
@@ -37,6 +37,7 @@ pub struct Session {
     pub quit: Arc<AtomicBool>,
     pub wake: Arc<tokio::sync::Notify>,
     pub tray: Rc<RefCell<Option<Tray>>>,
+    pub live: LivePet,
 }
 
 struct Bubble {
@@ -97,9 +98,14 @@ impl PopupApp {
     }
 
     fn refresh_monitors(&mut self, event_loop: &ActiveEventLoop) {
+        let mut scale = 0.0f64;
         self.monitors = event_loop
             .available_monitors()
             .map(|monitor| {
+                let factor = monitor.scale_factor();
+                if factor.is_finite() {
+                    scale = scale.max(factor);
+                }
                 let position = monitor.position();
                 let size = monitor.size();
                 ScreenRect {
@@ -110,6 +116,9 @@ impl PopupApp {
                 }
             })
             .collect();
+        if scale > 0.0 {
+            self.session.live.set_scale_factor(scale);
+        }
     }
 
     fn open_window(
@@ -123,6 +132,7 @@ impl PopupApp {
             .with_title("Stardust")
             .with_decorations(false)
             .with_resizable(false)
+            .with_transparent(true)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_active(false)
             .with_position(PhysicalPosition::new(origin.x, origin.y))
@@ -134,6 +144,15 @@ impl PopupApp {
             softbuffer::Surface::new(&self.context, window).map_err(|err| err.to_string())?;
         resize_surface(&mut surface)?;
         Ok(surface)
+    }
+
+    fn pet_window_size(&self) -> WindowSize {
+        let config = self
+            .session
+            .config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        pet_frame(config.pet_skin(), config.pet_scale()).canvas
     }
 
     fn sync_character(&mut self, event_loop: &ActiveEventLoop) {
@@ -148,7 +167,15 @@ impl PopupApp {
             self.drag = None;
             return;
         }
-        if self.character.is_some() {
+        let size = self.pet_window_size();
+        if let Some(surface) = self.character.as_ref() {
+            let current = surface.window().inner_size();
+            if current.width != size.width || current.height != size.height {
+                let _ = surface
+                    .window()
+                    .request_inner_size(PhysicalSize::new(size.width, size.height));
+            }
+            surface.window().request_redraw();
             return;
         }
         let stored = self
@@ -161,10 +188,7 @@ impl PopupApp {
             character_visible: true,
             stored_position: stored,
             monitors: &self.monitors,
-            character_size: WindowSize {
-                width: CHARACTER_SIZE,
-                height: CHARACTER_SIZE,
-            },
+            character_size: size,
             bubble_size: WindowSize {
                 width: 1,
                 height: 1,
@@ -173,7 +197,7 @@ impl PopupApp {
         let Some(origin) = layout.character_origin else {
             return;
         };
-        match self.open_window(event_loop, origin, CHARACTER_SIZE, CHARACTER_SIZE) {
+        match self.open_window(event_loop, origin, size.width, size.height) {
             Ok(surface) => {
                 surface.window().request_redraw();
                 self.character = Some(surface);
@@ -200,10 +224,7 @@ impl PopupApp {
             character_visible: visible,
             stored_position: stored,
             monitors: &self.monitors,
-            character_size: WindowSize {
-                width: CHARACTER_SIZE,
-                height: CHARACTER_SIZE,
-            },
+            character_size: self.pet_window_size(),
             bubble_size: WindowSize { width, height },
         });
         match self.open_window(event_loop, layout.origin, width, height) {
@@ -240,6 +261,12 @@ impl PopupApp {
                     self.refresh_monitors(event_loop);
                     self.sync_character(event_loop);
                     self.show_bubble(event_loop, presentation);
+                    self.redraw_character();
+                    self.refresh_tray();
+                }
+                UiMsg::Pet => {
+                    self.sync_character(event_loop);
+                    self.redraw_character();
                     self.refresh_tray();
                 }
             }
@@ -289,19 +316,41 @@ impl PopupApp {
     }
 
     fn refresh_tray(&self) {
-        let text = {
+        let observed = self.session.live.observed();
+        let scale = self.session.live.scale_factor();
+        let (text, glyph) = {
             let config = self
                 .session
                 .config
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
-            menu_text(&config, Utc::now())
+            let local = Utc::now().with_timezone(&config.schedule().timezone());
+            let pose = pet_pose(observed, config.schedule().is_quiet_at(local));
+            (menu_text(&config, Utc::now()), tray_glyph(pose))
         };
         if let Some(tray) = self.session.tray.borrow().as_ref() {
-            if let Err(err) = tray.apply(&text) {
+            if let Err(err) = tray.apply(&text, glyph, scale) {
                 eprintln!("stardust: could not update the tray menu: {err}");
             }
         }
+    }
+
+    fn redraw_character(&self) {
+        if let Some(surface) = self.character.as_ref() {
+            surface.window().request_redraw();
+        }
+    }
+
+    fn pet_paint(&self) -> (PetSkin, PetPose, PetScale) {
+        let observed = self.session.live.observed();
+        let config = self
+            .session
+            .config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let local = Utc::now().with_timezone(&config.schedule().timezone());
+        let pose = pet_pose(observed, config.schedule().is_quiet_at(local));
+        (config.pet_skin(), pose, config.pet_scale())
     }
 
     fn save_character_position(&self, point: ScreenPoint) {
@@ -332,6 +381,7 @@ impl ApplicationHandler<Wake> for PopupApp {
         self.refresh_monitors(event_loop);
         self.sync_character(event_loop);
         self.drain(event_loop);
+        self.refresh_tray();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
@@ -361,8 +411,9 @@ impl ApplicationHandler<Wake> for PopupApp {
             }
             WindowEvent::RedrawRequested => {
                 if self.character_id() == Some(id) {
+                    let (skin, pose, scale) = self.pet_paint();
                     if let Some(surface) = self.character.as_mut() {
-                        paint_character(surface);
+                        paint_character(surface, skin, pose, scale);
                     }
                 }
                 if self.bubble_id() == Some(id) {
@@ -400,6 +451,18 @@ impl ApplicationHandler<Wake> for PopupApp {
                                 }
                             }
                             self.drag = None;
+                        }
+                    }
+                }
+            }
+            WindowEvent::Resized(_) => {
+                if self.character_id() == Some(id) || self.bubble_id() == Some(id) {
+                    if self.character_id() == Some(id) {
+                        self.redraw_character();
+                    }
+                    if self.bubble_id() == Some(id) {
+                        if let Some(bubble) = self.bubble.as_ref() {
+                            bubble.surface.window().request_redraw();
                         }
                     }
                 }
@@ -465,40 +528,91 @@ fn resize_surface(surface: &mut SbSurface) -> Result<(), String> {
     surface.resize(width, height).map_err(|err| err.to_string())
 }
 
-fn paint_character(surface: &mut SbSurface) {
+fn paint_character(surface: &mut SbSurface, skin: PetSkin, pose: PetPose, scale: PetScale) {
     if resize_surface(surface).is_err() {
         return;
     }
     let Ok(mut buffer) = surface.buffer_mut() else {
         return;
     };
+    let frame = sprites::render_pet(skin, pose, scale);
     let width = buffer.width().get();
     let height = buffer.height().get();
-    for y in 0..height {
-        for x in 0..width {
-            let dx = x as f32 - width as f32 / 2.0;
-            let dy = y as f32 - height as f32 / 2.0;
-            let inside =
-                dx.abs() / (width as f32 * 0.42) + dy.abs() / (height as f32 * 0.42) <= 1.0;
-            let eye = (x > width / 3
-                && x < width / 3 + width / 10
-                && y > height / 3
-                && y < height / 3 + height / 8)
-                || (x > width * 3 / 5
-                    && x < width * 3 / 5 + width / 10
-                    && y > height / 3
-                    && y < height / 3 + height / 8);
-            let color = if eye && inside {
-                EYE_COLOR
-            } else if inside {
-                CHARACTER_COLOR
-            } else {
-                0
-            };
-            buffer[(y * width + x) as usize] = color;
+    for pixel in buffer.iter_mut() {
+        *pixel = 0;
+    }
+    let copy_w = frame.width.min(width);
+    let copy_h = frame.height.min(height);
+    for y in 0..copy_h {
+        for x in 0..copy_w {
+            let index = ((y * frame.width + x) * 4) as usize;
+            buffer[(y * width + x) as usize] = pack_xrgb([
+                frame.pixels[index],
+                frame.pixels[index + 1],
+                frame.pixels[index + 2],
+                frame.pixels[index + 3],
+            ]);
         }
     }
     let _ = buffer.present();
+}
+
+fn pack_xrgb(px: [u8; 4]) -> u32 {
+    if px[3] < 128 {
+        0
+    } else {
+        (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2])
+    }
+}
+
+pub fn detect_scale_factor() -> f64 {
+    struct Probe {
+        scale: f64,
+    }
+    impl Probe {
+        fn capture(&mut self, event_loop: &ActiveEventLoop) {
+            let mut scale = 0.0f64;
+            for monitor in event_loop.available_monitors() {
+                let factor = monitor.scale_factor();
+                if factor.is_finite() {
+                    scale = scale.max(factor);
+                }
+            }
+            if scale > 0.0 {
+                self.scale = scale;
+            }
+            event_loop.exit();
+        }
+    }
+    impl ApplicationHandler for Probe {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            self.capture(event_loop);
+        }
+
+        fn window_event(
+            &mut self,
+            _event_loop: &ActiveEventLoop,
+            _id: WindowId,
+            _event: WindowEvent,
+        ) {
+        }
+
+        fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            self.capture(event_loop);
+        }
+    }
+    let Ok(event_loop) = EventLoop::new() else {
+        return 1.0;
+    };
+    let mut probe = Probe { scale: 1.0 };
+    if event_loop.run_app(&mut probe).is_err() {
+        return 1.0;
+    }
+    if probe.scale.is_finite() && probe.scale > 0.0 {
+        probe.scale
+    } else {
+        1.0
+    }
 }
 
 fn paint_bubble(surface: &mut SbSurface, presentation: &Presentation) {

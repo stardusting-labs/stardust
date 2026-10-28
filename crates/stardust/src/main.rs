@@ -15,8 +15,10 @@ mod icon;
 mod inbox;
 mod integrations_cmd;
 mod keychain;
+mod live;
 mod notify;
 mod oauth;
+mod sprites;
 mod tray;
 mod window;
 

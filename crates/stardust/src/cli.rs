@@ -97,6 +97,7 @@ Schedule options:
 The tray lists 1, 30, and 60 minute suggestions. A typed interval is set with schedule set.
 Checks run at the next interval step or clock time, whichever comes first.
 A high-severity item is shown from the check that observed it.
+The tray pet is an astronaut or a star. Choose the skin and a 2x or 3x size from the tray menu.
 
 KIND is slack, teams, json, orbit-mcp, or slack-mcp.
 Every integration stays off until enable. A destination URL, signing secret, and access token stay in the system keychain.
