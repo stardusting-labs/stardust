@@ -2,13 +2,13 @@
 
 Stardust is an early-preview desktop companion for [ORBIT](https://github.com/stardusting-labs/rust-orbit). It checks ORBIT on a schedule you choose and shows the result in a small speech bubble. A high-severity item also raises an OS notification from that same check.
 
-This is not a chat product. There is no message composer, no conversational assistant, and no language-model call. Choosing a bubble opens the ORBIT workspace page in your browser.
+This is not a chat product. There is no message composer, no conversational assistant, and no language-model call. Choosing a bubble opens the matching ORBIT workspace page in your browser.
 
-The desktop API used here is proposed and is not served yet. With every integration off, the app talks to a built-in mock and does not open a network connection. Placeholder links use `https://helloorbit.app`.
+The default server is `https://helloorbit.app`. `--demo` uses sample items and does not open a network connection.
 
 ## What a check shows
 
-Each check asks the alerts endpoint once. The summary has a count, an optional short title, and the last checked time. The bubble stays up for about six seconds, or until you click it. Clicking opens the first high-severity http(s) link, otherwise the first http(s) link, otherwise `https://helloorbit.app`.
+Each check asks ORBIT for desktop status, then alerts, once each. The summary has a count, an optional short title, and the last checked time. The bubble stays up for about six seconds, or until you click it. Clicking opens `https://helloorbit.app` plus the item's workspace path. A path that is not on that https host is not opened. If ORBIT is turned off or cannot be reached, the pet stays calm and the next try waits longer. Stardust does not crash and does not retry in a tight loop.
 
 The character can be shown or hidden. The exact screen position is stored either way. While the character is hidden, only the bubble appears, at that stored position. While the character is shown, the bubble sits just above it. A position that falls outside every monitor is clamped for display and left unchanged in the config file. The bubble window exists only while a result is on screen.
 
@@ -37,16 +37,40 @@ Timing is yours:
 - Weekdays limit both kinds of slot. The default is every day.
 - Quiet hours hide ordinary results. A high-severity item from a scheduled check is still shown. Quiet hours do not add or remove checks.
 
-The next check is the earlier of the next interval step and the next clock time. The tray menu shows that time. A clock time does not move the interval anchor. A missed slot is not replayed. If a check fails, the following poll is still the next slot.
+The next check is the earlier of the next interval step and the next clock time. The tray menu shows that time. A clock time does not move the interval anchor. A missed slot is not replayed. If ORBIT is off or cannot be reached, the next try waits at least 30 seconds, then doubles up to 32 minutes, and never comes sooner than the next slot.
 
 An interval counts absolute elapsed time, including across a daylight-saving change. A clock time that does not exist on a spring-forward day is skipped. A clock time that occurs twice on a fall-back day is used once, at the earlier offset.
 
 The first check waits until the next slot. Check now, in the tray menu, runs one extra check and does not move the interval anchor.
 
+## Install
+
+Release archives are unsigned. They are built by the `release-build` GitHub Actions workflow, which runs only when someone starts it by hand. The workflow uploads the archives and a `SHA256SUMS` file as workflow artifacts. It does not create a GitHub release.
+
+- Linux: `stardust-linux-x86_64.tar.gz`. Unpack it and run `stardust`. The machine needs the usual Wayland or X11 libraries (`libxkbcommon`, `libwayland-client`, `libx11`).
+- macOS: `stardust-macos-universal.zip`, an unsigned universal `.app`. The first open can be blocked. Use the Finder shortcut to open it, or allow it under Privacy & Security.
+- Windows: `stardust-windows-x86_64.zip`. Unpack it and run `stardust.exe`. SmartScreen can warn because the file is unsigned.
+
+Compare the archive checksum with `SHA256SUMS` before you run it.
+
+## Sign-in
+
+```text
+stardust sign-in
+stardust sign-out
+```
+
+`sign-in` asks ORBIT for a device code, prints a short user code, and opens the ORBIT account page when that page is https on the configured host. Approve the code in the browser. Stardust polls until the code is approved or it expires, then stores the access token in the OS keychain. The token is not printed, and it is not written into the config file. `sign-out` deletes that keychain item.
+
+The server is `https://helloorbit.app` unless `server_base_url` is set in the config file or `STARDUST_SERVER_URL` is set in the environment. The environment value wins. A 401 clears the saved token and asks you to sign in again. A 404, or a server that cannot be reached, shows a calm note and retries with backoff.
+
+`--demo` skips sign-in and shows sample items.
+
 ## Run
 
 ```text
 stardust
+stardust --demo
 stardust --check-once
 stardust schedule show
 stardust schedule set --interval 45m --time 09:00 --time 13:00 --time 18:00 --weekdays mon-fri --quiet 22:00-07:00
@@ -73,7 +97,7 @@ Config is JSON. On Linux it is `$XDG_CONFIG_HOME/stardust/config.json` or `~/.co
 }
 ```
 
-A short-lived ORBIT access token can be kept in the system keychain. This preview does not sign in, and the token lifetime is capped at 15 minutes. The token is not written into the config file.
+An ORBIT access token is kept in the system keychain until the server expiry, and never longer than 5 minutes. Stardust will not store one that is already expired. The token is not written into the config file. Sign in again after it expires. There is no refresh token.
 
 ## Integrations
 
@@ -97,6 +121,22 @@ stardust integration oauth slack --client-id CLIENT_ID
 stardust integration connect slack
 ```
 
+## Privacy
+
+Stardust does not send telemetry.
+
+Stored on this computer:
+
+- The config file holds the schedule, character position, skin, size, integration ids and public hosts, the last checked time, and an optional server address. An older alerts cursor, if one is still in the file, is cleared and is not sent. The file does not hold the access token.
+- The OS keychain holds the ORBIT access token, and, only if you turn an integration on, that integration's destination URL, signing secret, or access token.
+
+Network calls, when you are not in `--demo`:
+
+- `POST /api/pqc/v1/account/device/code` and `POST /api/pqc/v1/account/device/token` during sign-in.
+- `GET /api/pqc/v1/desktop/status` and `GET /api/pqc/v1/desktop/alerts` on each check, with the keychain token as a bearer header. A 404 with an empty body means those routes are turned off. The alerts response is the current list, with no cursor.
+- Optional Slack, Teams, JSON webhook, or MCP calls that you enable.
+- Opening your browser to an https page on the configured host when you click a bubble or start sign-in.
+
 ## Dependencies
 
 No font file is bundled. The on-screen letters are an original bitmap, so no OFL font is included. No government dataset is bundled. Check results still come from ORBIT. Pet and tray pictures are bundled. Credits and the MIT license texts are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
@@ -110,7 +150,7 @@ Direct crates:
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
 | png | 0.18.1 | MIT OR Apache-2.0 |
 
-`uuid` was already in the tree. `sha2` 0.11.1 was already in the tree; 0.10.9 is the version this crate calls. `png` 0.18.1 was already in the tree through the tray icon. This crate calls it, with default features off, to decode the pet sprites. No new transitive crates were added. The HTTPS client adds these crates:
+`uuid` was already in the tree. `sha2` 0.11.1 was already in the tree; 0.10.9 is the version this crate calls. `png` 0.18.1 was already in the tree through the tray icon. This crate calls it, with default features off, to decode the pet sprites. No new transitive crates were added. No new crate was added for the ORBIT client. It uses `ureq` 2.12.1, which was already the HTTPS client. The HTTPS client adds these crates:
 
 | Crate | Version | License |
 | --- | --- | --- |

@@ -5,11 +5,12 @@ use crate::live::LivePet;
 use crate::sprites;
 use crate::tray::Tray;
 use chrono::Utc;
+use stardust_core::api::{is_allowed_https_url, resolve_server_base, ENV_SERVER_URL};
 use stardust_core::config::{save_config, Config};
 use stardust_core::pet::{pet_frame, pet_pose, tray_glyph, PetPose, PetScale, PetSkin};
 use stardust_core::policy::Presentation;
 use stardust_core::position::{layout_bubble, LayoutRequest, ScreenPoint, ScreenRect, WindowSize};
-use stardust_core::text::menu_text;
+use stardust_core::text::{menu_text, with_connection_note};
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -326,7 +327,10 @@ impl PopupApp {
                 .unwrap_or_else(|err| err.into_inner());
             let local = Utc::now().with_timezone(&config.schedule().timezone());
             let pose = pet_pose(observed, config.schedule().is_quiet_at(local));
-            (menu_text(&config, Utc::now()), tray_glyph(pose))
+            (
+                with_connection_note(menu_text(&config, Utc::now()), observed),
+                tray_glyph(pose),
+            )
         };
         if let Some(tray) = self.session.tray.borrow().as_ref() {
             if let Err(err) = tray.apply(&text, glyph, scale) {
@@ -429,7 +433,12 @@ impl ApplicationHandler<Wake> for PopupApp {
             } => {
                 if self.bubble_id() == Some(id) && state == ElementState::Pressed {
                     if let Some(bubble) = self.bubble.as_ref() {
-                        open_details(&bubble.presentation.summary.details_url);
+                        let config = self
+                            .session
+                            .config
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner());
+                        open_details(&config, &bubble.presentation.summary.details_url);
                     }
                     self.bubble = None;
                 }
@@ -656,10 +665,16 @@ fn corner_outside(x: u32, y: u32, width: u32, height: u32, radius: u32) -> bool 
     dx * dx + dy * dy > (radius as i32) * (radius as i32)
 }
 
-fn open_details(url: &str) {
-    if url.starts_with("https://") || url.starts_with("http://") {
+fn open_details(config: &stardust_core::config::Config, url: &str) {
+    let Ok(base) = resolve_server_base(
+        config.server_base_url(),
+        std::env::var(ENV_SERVER_URL).ok().as_deref(),
+    ) else {
+        return;
+    };
+    if is_allowed_https_url(&base, url) {
         if let Err(err) = open::that(url) {
-            eprintln!("stardust: could not open details: {err}");
+            eprintln!("stardust: could not open the workspace: {err}");
         }
     }
 }

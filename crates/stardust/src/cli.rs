@@ -37,10 +37,16 @@ pub enum Command {
     Run {
         config: Option<PathBuf>,
         headless: bool,
+        demo: bool,
     },
     CheckOnce {
         config: Option<PathBuf>,
+        demo: bool,
     },
+    SignIn {
+        config: Option<PathBuf>,
+    },
+    SignOut,
     ScheduleShow {
         config: Option<PathBuf>,
     },
@@ -69,8 +75,10 @@ pub fn usage() -> String {
 Stardust shows ORBIT check results on a schedule you set.
 
 Usage:
-  stardust [--config PATH] [--headless]
-  stardust [--config PATH] --check-once
+  stardust [--config PATH] [--headless] [--demo]
+  stardust [--config PATH] [--demo] --check-once
+  stardust [--config PATH] sign-in
+  stardust [--config PATH] sign-out
   stardust [--config PATH] schedule show
   stardust [--config PATH] schedule set [options]
   stardust [--config PATH] character show|hide
@@ -98,6 +106,9 @@ The tray lists 1, 30, and 60 minute suggestions. A typed interval is set with sc
 Checks run at the next interval step or clock time, whichever comes first.
 A high-severity item is shown from the check that observed it.
 The tray pet is an astronaut or a star. Choose the skin and a 2x or 3x size from the tray menu.
+sign-in stores an ORBIT access token in the system keychain. The default server is https://helloorbit.app.
+Set server_base_url in the config file, or STARDUST_SERVER_URL, to use another server.
+--demo uses sample items and does not contact ORBIT.
 
 KIND is slack, teams, json, orbit-mcp, or slack-mcp.
 Every integration stays off until enable. A destination URL, signing secret, and access token stay in the system keychain.
@@ -117,6 +128,7 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
     let mut config = None;
     let mut headless = false;
     let mut check_once = false;
+    let mut demo = false;
     while index < args.len() {
         let arg = args[index].as_str();
         if arg == "--config" {
@@ -138,6 +150,11 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
             index += 1;
             continue;
         }
+        if arg == "--demo" {
+            demo = true;
+            index += 1;
+            continue;
+        }
         break;
     }
     if index >= args.len() {
@@ -145,9 +162,13 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
             return Err("choose --check-once or --headless".to_string());
         }
         if check_once {
-            return Ok(Command::CheckOnce { config });
+            return Ok(Command::CheckOnce { config, demo });
         }
-        return Ok(Command::Run { config, headless });
+        return Ok(Command::Run {
+            config,
+            headless,
+            demo,
+        });
     }
     if headless || check_once {
         return Err(
@@ -159,6 +180,21 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
         "schedule" => parse_schedule(&args, index + 1, config),
         "character" => parse_character(&args, index + 1, config),
         "integration" => parse_integration(&args, index + 1, config),
+        "sign-in" => {
+            if demo {
+                return Err("demo mode does not sign in".to_string());
+            }
+            if index + 1 != args.len() {
+                return Err("sign-in takes no further arguments".to_string());
+            }
+            Ok(Command::SignIn { config })
+        }
+        "sign-out" => {
+            if index + 1 != args.len() {
+                return Err("sign-out takes no further arguments".to_string());
+            }
+            Ok(Command::SignOut)
+        }
         other => Err(format!("unknown command {other}")),
     }
 }
@@ -488,6 +524,9 @@ mod tests {
         assert!(parse(["integration", "enable", "ops"]).is_ok());
         assert!(parse(["integration", "oauth", "slack", "--client-id", "123.456"]).is_ok());
         assert!(parse(["integration", "url"]).is_err());
+        assert!(parse(["sign-in"]).is_ok());
+        assert!(parse(["--demo", "sign-in"]).is_err());
+        assert!(parse(["--demo", "--check-once"]).is_ok());
         assert!(!usage().to_ascii_lowercase().contains("chat"));
     }
 }

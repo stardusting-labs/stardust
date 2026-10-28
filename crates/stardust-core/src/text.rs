@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::integrations::integrations_label;
-use crate::pet::{PetScale, PetSkin};
+use crate::pet::{ObservedCheck, PetScale, PetSkin};
 use crate::schedule::{format_interval, Schedule};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Tz;
@@ -17,6 +17,22 @@ pub struct MenuText {
     pub integrations: String,
     pub pet_skin: PetSkin,
     pub pet_scale: PetScale,
+}
+
+pub fn connection_note(observed: ObservedCheck) -> Option<&'static str> {
+    match observed {
+        ObservedCheck::Unavailable => Some("ORBIT is not available right now"),
+        ObservedCheck::SignedOut => Some("Sign in to see ORBIT items"),
+        ObservedCheck::Waiting | ObservedCheck::Failed | ObservedCheck::Succeeded { .. } => None,
+    }
+}
+
+pub fn with_connection_note(mut text: MenuText, observed: ObservedCheck) -> MenuText {
+    if let Some(note) = connection_note(observed) {
+        text.tooltip = format!("{} · {note}", text.tooltip);
+        text.last_checked = format!("{} · {note}", text.last_checked);
+    }
+    text
 }
 
 pub fn menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {

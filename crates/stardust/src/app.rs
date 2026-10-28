@@ -8,14 +8,19 @@ use crate::notify;
 use crate::tray::Tray;
 use crate::window::{self, Session};
 use chrono::{DateTime, Utc};
-use stardust_core::api::{MockOrbitClient, OrbitClient};
-use stardust_core::check::{note_anchor, note_success, perform_check, CheckKind};
+use stardust_core::api::{
+    resolve_server_base, AlertItem, DesktopApi, DesktopStatus, MockOrbitClient, OrbitError,
+    ENV_SERVER_URL,
+};
+use stardust_core::check::{note_anchor, note_success, perform_check, retry_delay, CheckKind};
 use stardust_core::config::{default_config_path, load_config, save_config, Config};
-use stardust_core::outbound::prepare_posts;
+use stardust_core::http::HttpOrbitClient;
+use stardust_core::outbound::{prepare_posts, DeliveryWindow};
 use stardust_core::pet::{pet_pose, tray_glyph, ObservedCheck};
+use stardust_core::policy::{calm_notice, Notice};
 use stardust_core::position::ScreenPoint;
 use stardust_core::schedule::{parse_timezone, FireSource};
-use stardust_core::text::menu_text;
+use stardust_core::text::{menu_text, with_connection_note};
 use stardust_core::token::TokenStore;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -31,8 +36,18 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             print!("{}", cli::usage());
             Ok(())
         }
-        Command::Run { config, headless } => run_loop(config_path(config), headless),
-        Command::CheckOnce { config } => check_once(&config_path(config)),
+        Command::Run {
+            config,
+            headless,
+            demo,
+        } => run_loop(config_path(config), headless, demo),
+        Command::CheckOnce { config, demo } => check_once(&config_path(config), demo),
+        Command::SignIn { config } => {
+            let path = config_path(config);
+            let loaded = load_or_create(&path)?;
+            crate::signin::sign_in(&loaded)
+        }
+        Command::SignOut => crate::signin::sign_out(),
         Command::ScheduleShow { config } => {
             let path = config_path(config);
             let loaded = load_or_create(&path)?;
@@ -115,32 +130,37 @@ fn show_schedule(path: &Path, config: &Config) {
     println!("{}", text.next_check);
 }
 
-fn check_once(path: &Path) -> Result<(), String> {
-    let config = Arc::new(Mutex::new(load_or_create(path)?));
+fn check_once(path: &Path, demo: bool) -> Result<(), String> {
+    let loaded = load_or_create(path)?;
+    let base = server_base_of(&loaded)?;
+    let backend = open_backend(demo, &base)?;
+    let config = Arc::new(Mutex::new(loaded));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .map_err(|err| err.to_string())?;
-    let client = MockOrbitClient::example();
-    let presentation = runtime.block_on(run_check(
-        &client,
+    let signal = runtime.block_on(run_check(
+        &backend,
         &config,
         path,
         &KeychainTokenStore::new(),
         &LivePet::new(1.0),
         &CheckKind::Manual,
-    ))?;
-    for line in &presentation.summary.lines {
+        !demo,
+    ));
+    for line in &signal.presentation.summary.lines {
         println!("{line}");
     }
-    println!("{}", presentation.summary.details_url);
-    if presentation.show_os_notification {
-        notify::show(&presentation);
+    if !signal.presentation.summary.details_url.is_empty() {
+        println!("{}", signal.presentation.summary.details_url);
+    }
+    if signal.presentation.show_os_notification {
+        notify::show(&signal.presentation);
     }
     Ok(())
 }
 
-fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
+fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
     let config = Arc::new(Mutex::new(load_or_create(&path)?));
     let inbox = Inbox::new();
     let manual = Arc::new(AtomicBool::new(false));
@@ -155,7 +175,7 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
     if !headless {
         let (text, glyph) = {
             let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-            let text = menu_text(&loaded, Utc::now());
+            let text = with_connection_note(menu_text(&loaded, Utc::now()), live.observed());
             let glyph = glyph_for(&loaded, live.observed());
             (text, glyph)
         };
@@ -170,9 +190,25 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
         let inbox = inbox.clone();
         let path = path.clone();
         let live = live.clone();
+        let base = {
+            let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+            server_base_of(&loaded)?
+        };
+        let backend = open_backend(demo, &base)?;
         thread::Builder::new()
             .name("stardust-schedule".to_string())
-            .spawn(move || scheduler_thread(config, path, manual, quit, wake, inbox, live))
+            .spawn(move || {
+                scheduler_thread(ScheduleJob {
+                    config,
+                    path,
+                    manual,
+                    quit,
+                    wake,
+                    inbox,
+                    live,
+                    backend,
+                })
+            })
             .map_err(|err| err.to_string())?
     };
     let mut windows_unavailable = false;
@@ -258,7 +294,7 @@ fn run_loop(path: PathBuf, headless: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn scheduler_thread(
+struct ScheduleJob {
     config: Arc<Mutex<Config>>,
     path: PathBuf,
     manual: Arc<AtomicBool>,
@@ -266,7 +302,20 @@ fn scheduler_thread(
     wake: Arc<tokio::sync::Notify>,
     inbox: Inbox,
     live: LivePet,
-) {
+    backend: Backend,
+}
+
+fn scheduler_thread(job: ScheduleJob) {
+    let ScheduleJob {
+        config,
+        path,
+        manual,
+        quit,
+        wake,
+        inbox,
+        live,
+        backend,
+    } = job;
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -277,28 +326,36 @@ fn scheduler_thread(
             return;
         }
     };
-    let client = MockOrbitClient::example();
     let tokens = KeychainTokenStore::new();
+    let require_token = matches!(backend, Backend::Live(_));
     runtime.block_on(async move {
+        let mut failures = 0_u32;
         loop {
             if quit.load(Ordering::SeqCst) {
                 break;
             }
             if manual.swap(false, Ordering::SeqCst) {
-                match run_check(&client, &config, &path, &tokens, &live, &CheckKind::Manual).await {
-                    Ok(presentation) => {
-                        inbox.push(UiMsg::Pet);
-                        inbox.push(UiMsg::Checked(presentation));
-                    }
-                    Err(_) => inbox.push(UiMsg::Pet),
+                let signal = run_check(
+                    &backend,
+                    &config,
+                    &path,
+                    &tokens,
+                    &live,
+                    &CheckKind::Manual,
+                    require_token,
+                )
+                .await;
+                failures = next_failures(failures, signal.soften);
+                inbox.push(UiMsg::Pet);
+                if signal.publish {
+                    inbox.push(UiMsg::Checked(signal.presentation));
                 }
                 continue;
             }
-            let planned = plan_next(&config);
-            if !planned.delay.is_zero()
-                && tokio::time::timeout(planned.delay, wake.notified())
-                    .await
-                    .is_ok()
+            let planned = plan_next(&config, failures);
+            if tokio::time::timeout(planned.delay, wake.notified())
+                .await
+                .is_ok()
             {
                 continue;
             }
@@ -309,15 +366,31 @@ fn scheduler_thread(
                 slot: slot.at,
                 source: slot.source,
             };
-            match run_check(&client, &config, &path, &tokens, &live, &kind).await {
-                Ok(presentation) => {
-                    inbox.push(UiMsg::Pet);
-                    inbox.push(UiMsg::Checked(presentation));
-                }
-                Err(_) => inbox.push(UiMsg::Pet),
+            let signal = run_check(
+                &backend,
+                &config,
+                &path,
+                &tokens,
+                &live,
+                &kind,
+                require_token,
+            )
+            .await;
+            failures = next_failures(failures, signal.soften);
+            inbox.push(UiMsg::Pet);
+            if signal.publish {
+                inbox.push(UiMsg::Checked(signal.presentation));
             }
         }
     });
+}
+
+fn next_failures(current: u32, soften: bool) -> u32 {
+    if soften {
+        current.saturating_add(1)
+    } else {
+        0
+    }
 }
 
 struct Planned {
@@ -330,7 +403,7 @@ struct PlannedSlot {
     source: FireSource,
 }
 
-fn plan_next(config: &Mutex<Config>) -> Planned {
+fn plan_next(config: &Mutex<Config>, failures: u32) -> Planned {
     let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
     let now = Utc::now();
     let timezone = loaded.schedule().timezone();
@@ -341,15 +414,17 @@ fn plan_next(config: &Mutex<Config>) -> Planned {
         .map(|instant| instant.with_timezone(&timezone));
     let Some(fire) = loaded.schedule().next_fire(local_now, anchor) else {
         return Planned {
-            delay: Duration::from_secs(60),
+            delay: retry_delay(Duration::from_secs(60), failures),
             slot: None,
         };
     };
     let at = fire.at.with_timezone(&Utc);
-    let delay = at
-        .signed_duration_since(now)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
+    let delay = retry_delay(
+        at.signed_duration_since(now)
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+        failures,
+    );
     Planned {
         delay,
         slot: Some(PlannedSlot {
@@ -359,37 +434,58 @@ fn plan_next(config: &Mutex<Config>) -> Planned {
     }
 }
 
-async fn run_check<C: OrbitClient>(
-    client: &C,
+struct CheckSignal {
+    presentation: stardust_core::policy::Presentation,
+    publish: bool,
+    soften: bool,
+}
+
+async fn run_check(
+    client: &Backend,
     config: &Mutex<Config>,
     path: &Path,
     tokens: &KeychainTokenStore,
     live: &LivePet,
     kind: &CheckKind,
-) -> Result<stardust_core::policy::Presentation, String> {
+    require_token: bool,
+) -> CheckSignal {
     let now = Utc::now();
-    match tokens.load(now) {
-        Ok(token) => drop(token),
-        Err(err) => eprintln!("stardust: keychain: {err}"),
-    }
-    let (cursor, schedule) = {
+    let (schedule, server_base) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-        (
-            loaded.state().alerts_cursor.clone(),
-            loaded.schedule().clone(),
-        )
+        let server_base = server_base_of(&loaded)
+            .unwrap_or_else(|_| stardust_core::api::DEFAULT_SERVER_BASE.to_string());
+        (loaded.schedule().clone(), server_base)
     };
-    match perform_check(client, cursor.as_deref(), now, &schedule, kind).await {
+    let token = match tokens.load(now) {
+        Ok(token) => token,
+        Err(err) => {
+            eprintln!("stardust: keychain: {err}");
+            None
+        }
+    };
+    if require_token && token.is_none() {
+        return soft_signal(
+            config,
+            path,
+            live,
+            kind,
+            &server_base,
+            Notice::SignedOut,
+            false,
+        );
+    }
+    let access_token = token
+        .as_ref()
+        .map(|token| token.access_token())
+        .unwrap_or("");
+    match perform_check(client, access_token, now, &schedule, kind, &server_base).await {
         Ok(outcome) => {
             let item_count = u32::try_from(outcome.items.len()).unwrap_or(u32::MAX);
-            let high_severity = outcome
-                .items
-                .iter()
-                .any(|item| item.severity.is_high_or_above());
+            let high_severity = outcome.items.iter().any(AlertItem::shows_immediately);
             let records = {
                 let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
                 note_anchor(loaded.state_mut(), kind);
-                note_success(loaded.state_mut(), now, outcome.next_cursor);
+                note_success(loaded.state_mut(), now, None);
                 if let Err(err) = save_config(path, &loaded) {
                     eprintln!("stardust: could not save config: {err}");
                 }
@@ -404,27 +500,126 @@ async fn run_check<C: OrbitClient>(
                 &records,
                 tokens,
                 &outcome.items,
-                schedule.is_quiet_at(local),
-                matches!(kind, CheckKind::Manual),
-                now,
-                schedule.interval_minutes().unwrap_or(1440),
+                &DeliveryWindow {
+                    quiet: schedule.is_quiet_at(local),
+                    manual: matches!(kind, CheckKind::Manual),
+                    now,
+                    interval_minutes: schedule.interval_minutes().unwrap_or(1440),
+                    server_base: &server_base,
+                },
             );
             deliver::deliver(&notes);
             if outcome.presentation.show_os_notification {
                 notify::show(&outcome.presentation);
             }
-            Ok(outcome.presentation)
-        }
-        Err(err) => {
-            eprintln!("stardust: check failed: {err}");
-            let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-            note_anchor(loaded.state_mut(), kind);
-            if let Err(save_err) = save_config(path, &loaded) {
-                eprintln!("stardust: could not save config: {save_err}");
+            CheckSignal {
+                presentation: outcome.presentation,
+                publish: true,
+                soften: false,
             }
-            drop(loaded);
-            live.set_observed(ObservedCheck::Failed);
-            Err(err.to_string())
+        }
+        Err(err) => match err {
+            OrbitError::Unauthorized | OrbitError::Expired => {
+                let _ = tokens.clear();
+                soft_signal(
+                    config,
+                    path,
+                    live,
+                    kind,
+                    &server_base,
+                    Notice::SignedOut,
+                    false,
+                )
+            }
+            OrbitError::FeatureOff
+            | OrbitError::Unreachable
+            | OrbitError::Response
+            | OrbitError::Refused
+            | OrbitError::Denied
+            | OrbitError::ServerBase => {
+                eprintln!("stardust: {err}");
+                soft_signal(
+                    config,
+                    path,
+                    live,
+                    kind,
+                    &server_base,
+                    Notice::Unavailable,
+                    true,
+                )
+            }
+        },
+    }
+}
+
+fn soft_signal(
+    config: &Mutex<Config>,
+    path: &Path,
+    live: &LivePet,
+    kind: &CheckKind,
+    server_base: &str,
+    notice: Notice,
+    soften: bool,
+) -> CheckSignal {
+    let observed = match notice {
+        Notice::Unavailable => ObservedCheck::Unavailable,
+        Notice::SignedOut => ObservedCheck::SignedOut,
+    };
+    let previous = live.observed();
+    {
+        let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+        note_anchor(loaded.state_mut(), kind);
+        if let Err(err) = save_config(path, &loaded) {
+            eprintln!("stardust: could not save config: {err}");
+        }
+    }
+    live.set_observed(observed);
+    let manual = matches!(kind, CheckKind::Manual);
+    CheckSignal {
+        presentation: calm_notice(notice, server_base),
+        publish: manual || previous != observed,
+        soften,
+    }
+}
+
+fn server_base_of(config: &Config) -> Result<String, String> {
+    resolve_server_base(
+        config.server_base_url(),
+        std::env::var(ENV_SERVER_URL).ok().as_deref(),
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn open_backend(demo: bool, base: &str) -> Result<Backend, String> {
+    if demo {
+        Ok(Backend::Demo(MockOrbitClient::example()))
+    } else {
+        Ok(Backend::Live(
+            HttpOrbitClient::new(base).map_err(|err| err.to_string())?,
+        ))
+    }
+}
+
+enum Backend {
+    Demo(MockOrbitClient),
+    Live(HttpOrbitClient),
+}
+
+impl DesktopApi for Backend {
+    async fn desktop_status(&self, access_token: &str) -> Result<DesktopStatus, OrbitError> {
+        match self {
+            Self::Demo(client) => client.desktop_status(access_token).await,
+            Self::Live(client) => client.desktop_status(access_token).await,
+        }
+    }
+
+    async fn desktop_alerts(
+        &self,
+        access_token: &str,
+    ) -> Result<stardust_core::api::AlertsPage, OrbitError> {
+        match self {
+            Self::Demo(client) => client.desktop_alerts(access_token).await,
+            Self::Live(client) => client.desktop_alerts(access_token).await,
         }
     }
 }
@@ -439,7 +634,10 @@ fn refresh_tray(config: &Mutex<Config>, live: &LivePet, tray: &RefCell<Option<Tr
     let scale = live.scale_factor();
     let (text, glyph) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-        (menu_text(&loaded, Utc::now()), glyph_for(&loaded, observed))
+        (
+            with_connection_note(menu_text(&loaded, Utc::now()), observed),
+            glyph_for(&loaded, observed),
+        )
     };
     if let Some(tray) = tray.borrow().as_ref() {
         if let Err(err) = tray.apply(&text, glyph, scale) {

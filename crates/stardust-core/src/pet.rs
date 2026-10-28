@@ -119,6 +119,10 @@ pub enum ObservedCheck {
     #[default]
     Waiting,
     Failed,
+    /// The server is off or could not be reached. The face stays calm.
+    Unavailable,
+    /// There is no usable access token.
+    SignedOut,
     Succeeded {
         item_count: u32,
         high_severity: bool,
@@ -178,7 +182,7 @@ pub fn pet_pose(observed: ObservedCheck, quiet: bool) -> PetPose {
             high_severity: true,
             ..
         } => PetPose::Alert,
-        ObservedCheck::Waiting => {
+        ObservedCheck::Waiting | ObservedCheck::Unavailable | ObservedCheck::SignedOut => {
             if quiet {
                 PetPose::Sleep
             } else {
@@ -317,6 +321,13 @@ mod tests {
             (ObservedCheck::Waiting, false, PetPose::Normal, None),
             (
                 ObservedCheck::Waiting,
+                true,
+                PetPose::Sleep,
+                Some("pets/bubbles/sleep.png"),
+            ),
+            (ObservedCheck::Unavailable, false, PetPose::Normal, None),
+            (
+                ObservedCheck::SignedOut,
                 true,
                 PetPose::Sleep,
                 Some("pets/bubbles/sleep.png"),

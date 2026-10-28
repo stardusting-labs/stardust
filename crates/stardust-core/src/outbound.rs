@@ -4,7 +4,9 @@
 //! during quiet hours. Other results wait for a check outside quiet hours.
 //! This module does not open a socket.
 
-use crate::api::{AlertItem, Severity, PLACEHOLDER_ORIGIN};
+use crate::api::{
+    https_origin, workspace_url, AlertItem, Severity, DEFAULT_SERVER_BASE, PLACEHOLDER_ORIGIN,
+};
 use crate::integrations::{
     secret_account, IntegrationKind, IntegrationRecord, SecretSlot, SecretStore,
 };
@@ -125,21 +127,26 @@ pub enum DeliveryNote {
     Refused { id: String },
 }
 
+pub struct DeliveryWindow<'a> {
+    pub quiet: bool,
+    pub manual: bool,
+    pub now: DateTime<Utc>,
+    pub interval_minutes: u32,
+    pub server_base: &'a str,
+}
+
 pub fn prepare_posts(
     records: &[IntegrationRecord],
     secrets: &dyn SecretStore,
     items: &[AlertItem],
-    quiet: bool,
-    manual: bool,
-    now: DateTime<Utc>,
-    interval_minutes: u32,
+    window: &DeliveryWindow<'_>,
 ) -> Vec<DeliveryNote> {
     let mut notes = Vec::new();
     for record in records {
         if !record.enabled || !record.kind.posts_webhook() {
             continue;
         }
-        match one_destination(record, secrets, items, quiet, manual, now, interval_minutes) {
+        match one_destination(record, secrets, items, window) {
             Ok(posts) => notes.extend(posts.into_iter().map(DeliveryNote::Ready)),
             Err(note) => notes.push(note),
         }
@@ -151,10 +158,7 @@ fn one_destination(
     record: &IntegrationRecord,
     secrets: &dyn SecretStore,
     items: &[AlertItem],
-    quiet: bool,
-    manual: bool,
-    now: DateTime<Utc>,
-    interval_minutes: u32,
+    window: &DeliveryWindow<'_>,
 ) -> Result<Vec<PreparedPost>, DeliveryNote> {
     let url_secret = secrets
         .get(&secret_account(&record.id, SecretSlot::Url))
@@ -169,16 +173,16 @@ fn one_destination(
     if record.kind == IntegrationKind::GenericJson && signing.as_deref().unwrap_or("").is_empty() {
         return Err(missing(&record.id, "signing secret"));
     }
-    let high = items.iter().any(|item| item.severity.is_high_or_above());
-    let plan = send_plan(true, quiet, high, manual);
+    let high = items.iter().any(AlertItem::shows_immediately);
+    let plan = send_plan(true, window.quiet, high, window.manual);
     let mut posts = Vec::new();
     if matches!(plan, SendPlan::Immediate | SendPlan::Both) {
-        for item in items.iter().filter(|item| item.severity.is_high_or_above()) {
+        for item in items.iter().filter(|item| item.shows_immediately()) {
             posts.push(render_post(
                 record,
                 &checked,
                 signing.as_deref(),
-                &immediate_body(item, now, interval_minutes),
+                &immediate_body(item, window),
                 "finding.created",
             )?);
         }
@@ -188,7 +192,7 @@ fn one_destination(
             record,
             &checked,
             signing.as_deref(),
-            &summary_body(items, now, interval_minutes),
+            &summary_body(items, window),
             "status.summary",
         )?);
     }
@@ -231,29 +235,26 @@ fn missing(id: &str, what: &'static str) -> DeliveryNote {
     }
 }
 
-fn immediate_body(item: &AlertItem, now: DateTime<Utc>, interval_minutes: u32) -> Value {
-    let link = https_or_placeholder(&item.link);
+fn immediate_body(item: &AlertItem, window: &DeliveryWindow<'_>) -> Value {
+    let link = workspace_link(window.server_base, &item.workspace_path);
     json!({
         "schema_version": "1",
         "event_id": Uuid::new_v4().to_string(),
         "event_type": "finding.created",
-        "occurred_at": stamp(now),
+        "occurred_at": stamp(window.now),
         "tenant_id": PREVIEW_TENANT,
         "workspace_id": PREVIEW_WORKSPACE,
         "severity": "high",
         "subject_id": clip_id(&item.id),
         "summary": clip_text(&item.title),
-        "last_checked_at": stamp(now),
-        "check_interval_minutes": interval_minutes.clamp(1, 10_080),
+        "last_checked_at": stamp(window.now),
+        "check_interval_minutes": window.interval_minutes.clamp(1, 10_080),
         "workspace_url": link,
     })
 }
 
-fn summary_body(items: &[AlertItem], now: DateTime<Utc>, interval_minutes: u32) -> Value {
-    let high = items
-        .iter()
-        .filter(|item| item.severity.is_high_or_above())
-        .count();
+fn summary_body(items: &[AlertItem], window: &DeliveryWindow<'_>) -> Value {
+    let high = items.iter().filter(|item| item.shows_immediately()).count();
     let summary = if items.is_empty() {
         "No new or changed items".to_string()
     } else if high > 0 {
@@ -269,8 +270,8 @@ fn summary_body(items: &[AlertItem], now: DateTime<Utc>, interval_minutes: u32) 
                 "id": clip_id(&item.id),
                 "severity": wire_severity(item.severity),
                 "summary": clip_text(&item.title),
-                "last_checked_at": stamp(item.first_seen),
-                "workspace_url": https_or_placeholder(&item.link),
+                "last_checked_at": stamp(item.created_at),
+                "workspace_url": workspace_link(window.server_base, &item.workspace_path),
             })
         })
         .collect();
@@ -278,13 +279,13 @@ fn summary_body(items: &[AlertItem], now: DateTime<Utc>, interval_minutes: u32) 
         "schema_version": "1",
         "event_id": Uuid::new_v4().to_string(),
         "event_type": "status.summary",
-        "occurred_at": stamp(now),
+        "occurred_at": stamp(window.now),
         "tenant_id": PREVIEW_TENANT,
         "workspace_id": PREVIEW_WORKSPACE,
         "summary": summary,
-        "last_checked_at": stamp(now),
-        "check_interval_minutes": interval_minutes.clamp(1, 10_080),
-        "workspace_url": details_url(items),
+        "last_checked_at": stamp(window.now),
+        "check_interval_minutes": window.interval_minutes.clamp(1, 10_080),
+        "workspace_url": details_url(items, window.server_base, ""),
         "attention_count": high,
         "finding_count": items.len(),
         "check_count": 1,
@@ -499,9 +500,9 @@ fn host_blocked(host: &str) -> bool {
 
 fn wire_severity(severity: Severity) -> &'static str {
     match severity {
-        Severity::Info | Severity::Low => "low",
+        Severity::Low => "low",
         Severity::Medium => "medium",
-        Severity::High | Severity::Critical => "high",
+        Severity::High => "high",
     }
 }
 
@@ -535,10 +536,10 @@ fn clip_id(value: &str) -> String {
     }
 }
 
-fn https_or_placeholder(value: &str) -> String {
-    public_https(value)
-        .map(|checked| checked.url)
-        .unwrap_or_else(|_| PLACEHOLDER_ORIGIN.to_string())
+fn workspace_link(server_base: &str, path: &str) -> String {
+    workspace_url(server_base, path).unwrap_or_else(|| {
+        https_origin(server_base).unwrap_or_else(|| DEFAULT_SERVER_BASE.to_string())
+    })
 }
 
 fn slack_escape(value: &str) -> String {
@@ -552,7 +553,7 @@ fn slack_escape(value: &str) -> String {
 mod tests {
     use super::{
         ip_is_blocked, prepare_posts, public_https, render_destination, send_plan, sign, verify,
-        DeliveryNote, SendPlan,
+        DeliveryNote, DeliveryWindow, SendPlan,
     };
     use crate::api::{AlertItem, Severity};
     use crate::copy::find_disallowed_copy;
@@ -569,8 +570,9 @@ mod tests {
             id: "finding-1".to_string(),
             severity,
             title: "Example connection finding".to_string(),
-            first_seen: Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap(),
-            link: "https://helloorbit.app/workspace/example".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap(),
+            workspace_path: "/workspace/example".to_string(),
+            immediate: severity == Severity::High,
         }
     }
 
@@ -610,24 +612,25 @@ mod tests {
             )
             .unwrap();
         let now = Utc.with_ymd_and_hms(2026, 10, 22, 23, 0, 0).unwrap();
+        let window = DeliveryWindow {
+            quiet: true,
+            manual: false,
+            now,
+            interval_minutes: 45,
+            server_base: crate::api::DEFAULT_SERVER_BASE,
+        };
         let held = prepare_posts(
             std::slice::from_ref(&record),
             &secrets,
             &[item(Severity::Medium)],
-            true,
-            false,
-            now,
-            45,
+            &window,
         );
         assert!(held.is_empty());
         let sent = prepare_posts(
             std::slice::from_ref(&record),
             &secrets,
             &[item(Severity::High)],
-            true,
-            false,
-            now,
-            45,
+            &window,
         );
         assert_eq!(sent.len(), 1);
         let DeliveryNote::Ready(post) = &sent[0] else {
