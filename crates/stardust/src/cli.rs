@@ -2,6 +2,36 @@ use stardust_core::config::{FieldUpdate, ScheduleUpdate};
 use stardust_core::schedule::parse_interval;
 use std::path::PathBuf;
 
+pub enum IntegrationAction {
+    List,
+    Add {
+        kind: String,
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Url {
+        id: String,
+        url: String,
+        signing_secret: Option<String>,
+    },
+    Token {
+        id: String,
+        token: String,
+    },
+    Oauth {
+        id: String,
+        client_id: String,
+    },
+    Connect {
+        id: String,
+    },
+}
+
 pub enum Command {
     Help,
     Run {
@@ -22,6 +52,10 @@ pub enum Command {
         config: Option<PathBuf>,
         action: CharacterAction,
     },
+    Integration {
+        config: Option<PathBuf>,
+        action: IntegrationAction,
+    },
 }
 
 pub enum CharacterAction {
@@ -41,6 +75,14 @@ Usage:
   stardust [--config PATH] schedule set [options]
   stardust [--config PATH] character show|hide
   stardust [--config PATH] character position X Y
+  stardust [--config PATH] integration list
+  stardust [--config PATH] integration add KIND ID
+  stardust [--config PATH] integration enable ID
+  stardust [--config PATH] integration disable ID
+  stardust [--config PATH] integration url ID URL [SIGNING_SECRET]
+  stardust [--config PATH] integration token ID TOKEN
+  stardust [--config PATH] integration oauth ID --client-id CLIENT_ID
+  stardust [--config PATH] integration connect ID
 
 Schedule options:
   --interval DURATION    1 minute through 24 hours, such as 45m or 2h
@@ -55,6 +97,9 @@ Schedule options:
 The tray lists 1, 30, and 60 minute suggestions. A typed interval is set with schedule set.
 Checks run at the next interval step or clock time, whichever comes first.
 A high-severity item is shown from the check that observed it.
+
+KIND is slack, teams, json, orbit-mcp, or slack-mcp.
+Every integration stays off until enable. A destination URL, signing secret, and access token stay in the system keychain.
 "
     .to_string()
 }
@@ -112,6 +157,7 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
     match args[index].as_str() {
         "schedule" => parse_schedule(&args, index + 1, config),
         "character" => parse_character(&args, index + 1, config),
+        "integration" => parse_integration(&args, index + 1, config),
         other => Err(format!("unknown command {other}")),
     }
 }
@@ -258,6 +304,99 @@ fn parse_character(
     Ok(Command::Character { config, action })
 }
 
+fn parse_integration(
+    args: &[String],
+    mut index: usize,
+    config: Option<PathBuf>,
+) -> Result<Command, String> {
+    let sub = args
+        .get(index)
+        .ok_or_else(|| "missing integration command".to_string())?;
+    index += 1;
+    let action = match sub.as_str() {
+        "list" => {
+            if index != args.len() {
+                return Err("integration list takes no further arguments".to_string());
+            }
+            IntegrationAction::List
+        }
+        "add" => {
+            let kind = required(args, index, "kind")?;
+            let id = required(args, index + 1, "id")?;
+            index += 2;
+            finish(index, args.len())?;
+            IntegrationAction::Add { kind, id }
+        }
+        "enable" => IntegrationAction::Enable {
+            id: one_id(args, index)?,
+        },
+        "disable" => IntegrationAction::Disable {
+            id: one_id(args, index)?,
+        },
+        "url" => {
+            let id = required(args, index, "id")?;
+            let url = required(args, index + 1, "url")?;
+            index += 2;
+            let signing_secret = if index < args.len() {
+                let secret = required(args, index, "signing secret")?;
+                index += 1;
+                Some(secret)
+            } else {
+                None
+            };
+            finish(index, args.len())?;
+            IntegrationAction::Url {
+                id,
+                url,
+                signing_secret,
+            }
+        }
+        "token" => {
+            let id = required(args, index, "id")?;
+            let token = required(args, index + 1, "token")?;
+            index += 2;
+            finish(index, args.len())?;
+            IntegrationAction::Token { id, token }
+        }
+        "oauth" => {
+            let id = required(args, index, "id")?;
+            index += 1;
+            if args.get(index).map(String::as_str) != Some("--client-id") {
+                return Err("oauth needs --client-id".to_string());
+            }
+            let client_id = required(args, index + 1, "client id")?;
+            index += 2;
+            finish(index, args.len())?;
+            IntegrationAction::Oauth { id, client_id }
+        }
+        "connect" => IntegrationAction::Connect {
+            id: one_id(args, index)?,
+        },
+        other => return Err(format!("unknown integration command {other}")),
+    };
+    Ok(Command::Integration { config, action })
+}
+
+fn required(args: &[String], index: usize, name: &str) -> Result<String, String> {
+    args.get(index)
+        .filter(|item| !item.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| format!("missing {name}"))
+}
+
+fn one_id(args: &[String], index: usize) -> Result<String, String> {
+    let id = required(args, index, "id")?;
+    finish(index + 1, args.len())?;
+    Ok(id)
+}
+
+fn finish(index: usize, len: usize) -> Result<(), String> {
+    if index != len {
+        return Err("unexpected arguments after the integration command".to_string());
+    }
+    Ok(())
+}
+
 fn parse_coord(value: Option<&String>, name: &str) -> Result<i32, String> {
     let text = value.ok_or_else(|| format!("missing {name} position"))?;
     if text.starts_with('-')
@@ -332,5 +471,22 @@ mod tests {
         assert!(parse(["schedule", "set", "--interval", "45m", "--clear-interval"]).is_err());
         assert!(parse(["schedule", "set", "--time", "09:00", "--clear-times"]).is_err());
         assert!(parse(["schedule", "set", "--quiet", "22:00-07:00", "--clear-quiet"]).is_err());
+    }
+
+    #[test]
+    fn integration_commands_parse_without_printing_a_secret() {
+        let command = parse(["integration", "add", "json", "ops"]).unwrap();
+        let Command::Integration {
+            action: super::IntegrationAction::Add { kind, id },
+            ..
+        } = command
+        else {
+            panic!("expected add");
+        };
+        assert_eq!((kind, id), ("json".to_string(), "ops".to_string()));
+        assert!(parse(["integration", "enable", "ops"]).is_ok());
+        assert!(parse(["integration", "oauth", "slack", "--client-id", "123.456"]).is_ok());
+        assert!(parse(["integration", "url"]).is_err());
+        assert!(!usage().to_ascii_lowercase().contains("chat"));
     }
 }

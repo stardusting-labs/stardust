@@ -16,6 +16,8 @@ ln -sfn ../../scripts/pre-commit .git/hooks/pre-commit
 
 User-facing wording is checked by the copy test in `crates/stardust-core`. Keep the README, this file, and `SECURITY.md` consistent with that test.
 
-Dependencies must use a license listed in `deny.toml`. The allow list rejects unlicensed crates and AGPL licenses. Do not add a crate outside that list without updating the file and the reason.
+Dependencies must use a license listed in `deny.toml`. The allow list rejects unlicensed crates and AGPL licenses. Do not add a crate outside that list without updating the file and the reason. `CDLA-Permissive-2.0` is there for the CA bundle used by the HTTPS client.
+
+Integration URLs, signing secrets, and access tokens belong in the OS keychain. Do not put them in config, docs, or tests.
 
 The only host that belongs in product text and examples is `https://helloorbit.app`. Do not commit secrets, tokens, or private host names.

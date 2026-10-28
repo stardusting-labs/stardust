@@ -22,6 +22,7 @@ pub enum CheckKind {
 pub struct CheckOutcome {
     pub presentation: Presentation,
     pub next_cursor: Option<String>,
+    pub items: Vec<AlertItem>,
 }
 
 pub async fn perform_check<C: OrbitClient + Sync>(
@@ -37,9 +38,11 @@ pub async fn perform_check<C: OrbitClient + Sync>(
     let local = now_utc.with_timezone(&schedule.timezone());
     let quiet = schedule.is_quiet_at(local);
     let force_bubble = matches!(kind, CheckKind::Manual);
+    let presentation = present(&items, quiet, local, force_bubble);
     Ok(CheckOutcome {
-        presentation: present(&items, quiet, local, force_bubble),
+        presentation,
         next_cursor,
+        items,
     })
 }
 
@@ -170,6 +173,7 @@ mod tests {
         assert_eq!(client.alerts_calls.load(Ordering::SeqCst), 1);
         assert!(outcome.presentation.show_bubble);
         assert!(outcome.presentation.show_os_notification);
+        assert_eq!(outcome.items.len(), 1);
         assert_eq!(outcome.next_cursor.as_deref(), Some("cursor-2"));
     }
 

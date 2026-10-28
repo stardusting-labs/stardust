@@ -1,6 +1,7 @@
 //! Tray and bubble wording.
 
 use crate::config::Config;
+use crate::integrations::integrations_label;
 use crate::schedule::{format_interval, Schedule};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Tz;
@@ -12,6 +13,7 @@ pub struct MenuText {
     pub last_checked: String,
     pub schedule: String,
     pub character: String,
+    pub integrations: String,
 }
 
 pub fn menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
@@ -40,6 +42,7 @@ pub fn menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
         },
         last_checked: format!("Last checked time {last_clock}"),
         schedule: schedule.describe(),
+        integrations: integrations_label(config.integrations()),
         character: if config.character_visible() {
             "Hide character".to_string()
         } else {
@@ -114,12 +117,14 @@ mod tests {
         assert_eq!(text.last_checked, "Last checked time —");
         assert_eq!(text.next_check, "Next check 15:45");
         assert_eq!(text.character, "Show character");
+        assert_eq!(text.integrations, "Integrations off");
         for value in [
             &text.tooltip,
             &text.next_check,
             &text.last_checked,
             &text.schedule,
             &text.character,
+            &text.integrations,
         ] {
             assert_eq!(find_disallowed_copy(value), None, "{value}");
             assert!(!value.to_ascii_lowercase().contains("chat"));
