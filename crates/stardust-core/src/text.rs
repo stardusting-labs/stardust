@@ -1,0 +1,128 @@
+//! Tray and bubble wording.
+
+use crate::config::Config;
+use crate::schedule::{format_interval, Schedule};
+use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono_tz::Tz;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuText {
+    pub tooltip: String,
+    pub next_check: String,
+    pub last_checked: String,
+    pub schedule: String,
+    pub character: String,
+}
+
+pub fn menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
+    let schedule = config.schedule();
+    let timezone = schedule.timezone();
+    let now = now_utc.with_timezone(&timezone);
+    let last = config
+        .state()
+        .last_checked
+        .map(|instant| instant.with_timezone(&timezone));
+    let anchor = config
+        .state()
+        .interval_anchor
+        .map(|instant| instant.with_timezone(&timezone));
+    let next = schedule.next_fire(now, anchor);
+    let last_clock = match last {
+        Some(time) => format_stamp(now, time),
+        None => "—".to_string(),
+    };
+    let cadence = cadence_phrase(schedule);
+    MenuText {
+        tooltip: format!("{cadence} · last checked {last_clock}"),
+        next_check: match next {
+            Some(fire) => format!("Next check {}", format_stamp(now, fire.at)),
+            None => "Next check —".to_string(),
+        },
+        last_checked: format!("Last checked time {last_clock}"),
+        schedule: schedule.describe(),
+        character: if config.character_visible() {
+            "Hide character".to_string()
+        } else {
+            "Show character".to_string()
+        },
+    }
+}
+
+fn cadence_phrase(schedule: &Schedule) -> String {
+    match (
+        schedule.interval_minutes(),
+        schedule.clock_times().is_empty(),
+    ) {
+        (Some(minutes), true) => format!("Checked every {}", format_interval(minutes)),
+        (Some(minutes), false) => format!(
+            "Checked every {} and at set times",
+            format_interval(minutes)
+        ),
+        (None, false) => "Checked at set times".to_string(),
+        (None, true) => "Checked on a schedule".to_string(),
+    }
+}
+
+fn format_stamp(now: DateTime<Tz>, time: DateTime<Tz>) -> String {
+    if time.date_naive() == now.date_naive() {
+        format!("{:02}:{:02}", time.hour(), time.minute())
+    } else {
+        format!(
+            "{} {:02}:{:02}",
+            weekday_name(time),
+            time.hour(),
+            time.minute()
+        )
+    }
+}
+
+fn weekday_name(time: DateTime<Tz>) -> &'static str {
+    match time.weekday() {
+        chrono::Weekday::Mon => "Mon",
+        chrono::Weekday::Tue => "Tue",
+        chrono::Weekday::Wed => "Wed",
+        chrono::Weekday::Thu => "Thu",
+        chrono::Weekday::Fri => "Fri",
+        chrono::Weekday::Sat => "Sat",
+        chrono::Weekday::Sun => "Sun",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::menu_text;
+    use crate::config::{Config, FieldUpdate, ScheduleUpdate};
+    use crate::copy::find_disallowed_copy;
+    use chrono::TimeZone;
+    use chrono::Utc;
+
+    #[test]
+    fn tray_text_names_the_interval_and_the_last_checked_time() {
+        let mut config = Config::default_for("UTC").unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 21, 15, 0, 0).unwrap();
+        let update = ScheduleUpdate {
+            interval: Some(FieldUpdate::Set(45)),
+            clock_times: Some(vec!["18:00".to_string()]),
+            ..ScheduleUpdate::default()
+        };
+        config.apply_schedule_update(&update, now).unwrap();
+        let text = menu_text(&config, now);
+        assert_eq!(
+            text.tooltip,
+            "Checked every 45 minutes and at set times · last checked —"
+        );
+        assert_eq!(text.last_checked, "Last checked time —");
+        assert_eq!(text.next_check, "Next check 15:45");
+        assert_eq!(text.character, "Show character");
+        for value in [
+            &text.tooltip,
+            &text.next_check,
+            &text.last_checked,
+            &text.schedule,
+            &text.character,
+        ] {
+            assert_eq!(find_disallowed_copy(value), None, "{value}");
+            assert!(!value.to_ascii_lowercase().contains("chat"));
+        }
+    }
+}

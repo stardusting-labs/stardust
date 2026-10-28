@@ -1,0 +1,19 @@
+[package]
+name = "stardust-core"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Schedule, check policy, and proposed ORBIT types for the Stardust tray app"
+
+[dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.54.0", default-features = false, features = ["macros", "rt"] }

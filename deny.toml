@@ -1,0 +1,54 @@
+# Licenses outside `allow` are rejected. That includes crates with no license
+# and AGPL-1.0, AGPL-3.0, AGPL-3.0-only, and AGPL-3.0-or-later.
+# `Unlicense` is the public-domain dedication used by ksni, the tray backend.
+
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+ignore = [
+  # ttf-parser is pulled in by winit's Wayland decorations. No upgrade exists.
+  "RUSTSEC-2026-0192",
+  # zvariant, zbus_names, and zvariant_derive were folded into zbus 6.
+  # The tray, keychain, and notification crates still depend on zbus 5.
+  "RUSTSEC-2026-0370",
+  "RUSTSEC-2026-0371",
+  "RUSTSEC-2026-0372",
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "Zlib",
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
