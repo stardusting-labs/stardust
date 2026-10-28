@@ -1,12 +1,12 @@
 use crate::actions::{apply_menu, MenuEffect};
-use crate::cli::{self, CharacterAction, Command};
+use crate::cli::{self, AutostartAction, CharacterAction, Command};
 use crate::deliver;
 use crate::inbox::{Inbox, UiMsg};
 use crate::keychain::KeychainTokenStore;
 use crate::live::LivePet;
 use crate::notify;
 use crate::tray::Tray;
-use crate::window::{self, Session};
+use crate::window::{self, RunError, Session};
 use chrono::{DateTime, Utc};
 use stardust_core::api::{
     resolve_server_base, AlertItem, DesktopApi, DesktopStatus, MockOrbitClient, OrbitError,
@@ -17,11 +17,11 @@ use stardust_core::config::{default_config_path, load_config, save_config, Confi
 use stardust_core::http::HttpOrbitClient;
 use stardust_core::outbound::{prepare_posts, DeliveryWindow};
 use stardust_core::pet::{pet_pose, tray_glyph, ObservedCheck};
-use stardust_core::policy::{calm_notice, Notice};
+use stardust_core::policy::{calm_notice_in, Notice};
 use stardust_core::position::ScreenPoint;
 use stardust_core::schedule::{parse_timezone, FireSource};
-use stardust_core::text::{menu_text, with_connection_note};
-use stardust_core::token::TokenStore;
+use stardust_core::session::{current_access, Access, Refresher};
+use stardust_core::text::{menu_text, menu_text_in, with_connection_note_in};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -48,6 +48,38 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             crate::signin::sign_in(&loaded)
         }
         Command::SignOut => crate::signin::sign_out(),
+        Command::Autostart(action) => {
+            match action {
+                AutostartAction::On => {
+                    crate::autostart::set_enabled(true).map_err(|err| err.to_string())?
+                }
+                AutostartAction::Off => {
+                    crate::autostart::set_enabled(false).map_err(|err| err.to_string())?
+                }
+                AutostartAction::Status => {}
+            }
+            let state = if crate::autostart::is_enabled() {
+                "on"
+            } else {
+                "off"
+            };
+            println!("start at login {state}");
+            Ok(())
+        }
+        Command::Language { config, language } => {
+            let path = config_path(config);
+            let mut loaded = load_or_create(&path)?;
+            loaded.set_language(language);
+            save_config(&path, &loaded).map_err(|err| err.to_string())?;
+            println!(
+                "language {}",
+                match language {
+                    Some(language) => language.code(),
+                    None => "auto",
+                }
+            );
+            Ok(())
+        }
         Command::ScheduleShow { config } => {
             let path = config_path(config);
             let loaded = load_or_create(&path)?;
@@ -167,21 +199,7 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
     let quit = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(tokio::sync::Notify::new());
     let tray = Rc::new(RefCell::new(None));
-    let live = LivePet::new(if headless {
-        1.0
-    } else {
-        window::detect_scale_factor()
-    });
-    if !headless {
-        let (text, glyph) = {
-            let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-            let text = with_connection_note(menu_text(&loaded, Utc::now()), live.observed());
-            let glyph = glyph_for(&loaded, live.observed());
-            (text, glyph)
-        };
-        let installed = Tray::install(&inbox, &text, glyph, live.scale_factor())?;
-        *tray.borrow_mut() = Some(installed);
-    }
+    let live = LivePet::new(1.0);
     let scheduler = {
         let config = Arc::clone(&config);
         let manual = Arc::clone(&manual);
@@ -211,38 +229,54 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
             })
             .map_err(|err| err.to_string())?
     };
-    let mut windows_unavailable = false;
-    loop {
-        if quit.load(Ordering::SeqCst) {
-            break;
-        }
-        let character_visible = config
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .character_visible();
-        if !headless && !windows_unavailable && (character_visible || inbox.has_bubble()) {
-            let session = Session {
-                config_path: path.clone(),
-                config: Arc::clone(&config),
-                inbox: inbox.clone(),
-                manual: Arc::clone(&manual),
-                quit: Arc::clone(&quit),
-                wake: Arc::clone(&wake),
-                tray: Rc::clone(&tray),
-                live: live.clone(),
-            };
-            if let Err(err) = window::run_session(session) {
+    let mut windows_unavailable = headless;
+    if !headless {
+        let session = Session {
+            config_path: path.clone(),
+            config: Arc::clone(&config),
+            inbox: inbox.clone(),
+            manual: Arc::clone(&manual),
+            quit: Arc::clone(&quit),
+            wake: Arc::clone(&wake),
+            tray: Rc::clone(&tray),
+            live: live.clone(),
+            demo,
+        };
+        match window::run(session) {
+            Ok(()) => {}
+            Err(RunError::Unavailable(err) | RunError::Failed(err)) => {
                 windows_unavailable = true;
                 eprintln!("stardust: windows are unavailable: {err}");
+                inbox.clear_proxy();
+                if tray.borrow().is_none() {
+                    let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+                    let language = loaded.effective_language();
+                    let text = with_connection_note_in(
+                        menu_text_in(&loaded, Utc::now(), language),
+                        live.observed(),
+                        language,
+                    );
+                    let glyph = glyph_for(&loaded, live.observed());
+                    drop(loaded);
+                    match Tray::install(&inbox, &text, glyph, live.scale_factor(), language) {
+                        Ok(installed) => *tray.borrow_mut() = Some(installed),
+                        Err(err) => {
+                            quit.store(true, Ordering::SeqCst);
+                            wake.notify_one();
+                            let _ = scheduler.join();
+                            return Err(err);
+                        }
+                    }
+                }
                 while let Some(message) = inbox.try_pop() {
                     if let UiMsg::Checked(presentation) = message {
                         print_lines(&presentation.summary.lines);
                     }
                 }
             }
-            refresh_tray(&config, &live, &tray);
-            continue;
         }
+    }
+    while windows_unavailable && !quit.load(Ordering::SeqCst) {
         match inbox.wait_timeout(Duration::from_secs(45)) {
             Some(UiMsg::Menu(id)) => {
                 let effect = {
@@ -276,16 +310,11 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
                 refresh_tray(&config, &live, &tray);
             }
             Some(UiMsg::Checked(presentation)) => {
-                if headless || windows_unavailable {
-                    print_lines(&presentation.summary.lines);
-                } else if presentation.show_bubble {
-                    inbox.push(UiMsg::Checked(presentation));
-                    continue;
-                }
+                print_lines(&presentation.summary.lines);
                 refresh_tray(&config, &live, &tray);
             }
-            Some(UiMsg::Pet) => refresh_tray(&config, &live, &tray),
-            None => refresh_tray(&config, &live, &tray),
+            Some(UiMsg::SignIn(_)) => {}
+            Some(UiMsg::Pet) | None => refresh_tray(&config, &live, &tray),
         }
     }
     quit.store(true, Ordering::SeqCst);
@@ -456,29 +485,56 @@ async fn run_check(
             .unwrap_or_else(|_| stardust_core::api::DEFAULT_SERVER_BASE.to_string());
         (loaded.schedule().clone(), server_base)
     };
-    let token = match tokens.load(now) {
-        Ok(token) => token,
-        Err(err) => {
-            eprintln!("stardust: keychain: {err}");
-            None
+    let refresher = client.refresher();
+    let token = if require_token {
+        match current_access(tokens, refresher, now, false) {
+            Access::Ready { token, .. } => Some(token),
+            Access::SignedOut => {
+                return soft_signal(
+                    config,
+                    path,
+                    live,
+                    kind,
+                    &server_base,
+                    Notice::SignedOut,
+                    false,
+                );
+            }
+            Access::Unavailable(err) => {
+                eprintln!("stardust: {err}");
+                return soft_signal(
+                    config,
+                    path,
+                    live,
+                    kind,
+                    &server_base,
+                    Notice::Unavailable,
+                    true,
+                );
+            }
         }
+    } else {
+        None
     };
-    if require_token && token.is_none() {
-        return soft_signal(
-            config,
-            path,
-            live,
-            kind,
-            &server_base,
-            Notice::SignedOut,
-            false,
-        );
-    }
     let access_token = token
         .as_ref()
         .map(|token| token.access_token())
         .unwrap_or("");
-    match perform_check(client, access_token, now, &schedule, kind, &server_base).await {
+    let mut result = perform_check(client, access_token, now, &schedule, kind, &server_base).await;
+    if require_token && matches!(result, Err(OrbitError::Unauthorized)) {
+        if let Access::Ready { token, .. } = current_access(tokens, refresher, Utc::now(), true) {
+            result = perform_check(
+                client,
+                token.access_token(),
+                now,
+                &schedule,
+                kind,
+                &server_base,
+            )
+            .await;
+        }
+    }
+    match result {
         Ok(outcome) => {
             let item_count = u32::try_from(outcome.items.len()).unwrap_or(u32::MAX);
             let high_severity = outcome.items.iter().any(AlertItem::shows_immediately);
@@ -520,7 +576,7 @@ async fn run_check(
         }
         Err(err) => match err {
             OrbitError::Unauthorized | OrbitError::Expired => {
-                let _ = tokens.clear();
+                let _ = stardust_core::token::TokenStore::clear(tokens);
                 soft_signal(
                     config,
                     path,
@@ -566,17 +622,18 @@ fn soft_signal(
         Notice::SignedOut => ObservedCheck::SignedOut,
     };
     let previous = live.observed();
-    {
+    let language = {
         let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
         note_anchor(loaded.state_mut(), kind);
         if let Err(err) = save_config(path, &loaded) {
             eprintln!("stardust: could not save config: {err}");
         }
-    }
+        loaded.effective_language()
+    };
     live.set_observed(observed);
     let manual = matches!(kind, CheckKind::Manual);
     CheckSignal {
-        presentation: calm_notice(notice, server_base),
+        presentation: calm_notice_in(notice, server_base, language),
         publish: manual || previous != observed,
         soften,
     }
@@ -603,6 +660,15 @@ fn open_backend(demo: bool, base: &str) -> Result<Backend, String> {
 enum Backend {
     Demo(MockOrbitClient),
     Live(HttpOrbitClient),
+}
+
+impl Backend {
+    fn refresher(&self) -> Option<&dyn Refresher> {
+        match self {
+            Self::Demo(_) => None,
+            Self::Live(client) => Some(client),
+        }
+    }
 }
 
 impl DesktopApi for Backend {
@@ -632,15 +698,21 @@ fn glyph_for(config: &Config, observed: ObservedCheck) -> stardust_core::pet::Tr
 fn refresh_tray(config: &Mutex<Config>, live: &LivePet, tray: &RefCell<Option<Tray>>) {
     let observed = live.observed();
     let scale = live.scale_factor();
-    let (text, glyph) = {
+    let (text, glyph, language) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+        let language = loaded.effective_language();
         (
-            with_connection_note(menu_text(&loaded, Utc::now()), observed),
+            with_connection_note_in(
+                menu_text_in(&loaded, Utc::now(), language),
+                observed,
+                language,
+            ),
             glyph_for(&loaded, observed),
+            language,
         )
     };
     if let Some(tray) = tray.borrow().as_ref() {
-        if let Err(err) = tray.apply(&text, glyph, scale) {
+        if let Err(err) = tray.apply(&text, glyph, scale, language) {
             eprintln!("stardust: could not update the tray menu: {err}");
         }
     }

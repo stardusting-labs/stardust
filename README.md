@@ -48,10 +48,24 @@ The first check waits until the next slot. Check now, in the tray menu, runs one
 Release archives are unsigned. They are built by the `release-build` GitHub Actions workflow, which runs only when someone starts it by hand. The workflow uploads the archives and a `SHA256SUMS` file as workflow artifacts. It does not create a GitHub release.
 
 - Linux: `stardust-linux-x86_64.tar.gz`. Unpack it and run `stardust`. The machine needs the usual Wayland or X11 libraries (`libxkbcommon`, `libwayland-client`, `libx11`).
-- macOS: `stardust-macos-universal.zip`, an unsigned universal `.app`. The first open can be blocked. Use the Finder shortcut to open it, or allow it under Privacy & Security.
+- macOS: `stardust-macos-universal.zip`, an unsigned universal `.app`. The first open can be blocked. Allow it under System Settings, Privacy & Security. Move it to the Applications folder before you turn on start at login.
 - Windows: `stardust-windows-x86_64.zip`. Unpack it and run `stardust.exe`. SmartScreen can warn because the file is unsigned.
 
 Compare the archive checksum with `SHA256SUMS` before you run it.
+
+## Settings and first start
+
+The first start opens a small settings window. It is also under Settings in the tray menu. It has:
+
+- Sign in to ORBIT, or Sign out. Sign-in shows the short user code in the window and opens the ORBIT account page in your browser.
+- Check every 1, 30, or 60 minutes. Other schedules are set with `stardust schedule set`.
+- Start at login, off until you turn it on.
+- Show character, pet, and size.
+- Language: English or Korean. The picker shows each language by its own name.
+
+Every row works from the keyboard. Up and Down, or Tab and Shift+Tab, move between rows. Enter or Space changes a row. Left and Right step through a choice. Esc closes the window. The focused row is marked with `>` and a dark band, so focus does not depend on colour alone. The window title names the focused row. Text in the window and in the bubble meets a 4.5:1 contrast ratio, and the letters grow with the monitor scale.
+
+The window and the bubble draw their own letters. A screen reader can read the window title and the tray menu, but not the rows inside the window.
 
 ## Sign-in
 
@@ -60,11 +74,39 @@ stardust sign-in
 stardust sign-out
 ```
 
-`sign-in` asks ORBIT for a device code, prints a short user code, and opens the ORBIT account page when that page is https on the configured host. Approve the code in the browser. Stardust polls until the code is approved or it expires, then stores the access token in the OS keychain. The token is not printed, and it is not written into the config file. `sign-out` deletes that keychain item.
+Sign in from the settings window, from Sign in in the tray menu, or with `stardust sign-in` in a terminal. Stardust asks ORBIT for a device code, shows a short user code, and opens the ORBIT account page when that page is https on the configured host. Approve the code in the browser. Stardust polls until the code is approved or it expires, then stores the access token in the OS keychain. The token is not printed, and it is not written into the config file. `sign-out` deletes that keychain item.
 
 The server is `https://helloorbit.app` unless `server_base_url` is set in the config file or `STARDUST_SERVER_URL` is set in the environment. The environment value wins. A 401 clears the saved token and asks you to sign in again. A 404, or a server that cannot be reached, shows a calm note and retries with backoff.
 
 `--demo` skips sign-in and shows sample items.
+
+## Start at login
+
+```text
+stardust autostart on
+stardust autostart off
+stardust autostart status
+```
+
+Start at login is off until you turn it on, here or in the settings window. Turning it on adds one entry for your user account that starts `stardust`:
+
+- Linux: `~/.config/autostart/stardust.desktop`.
+- macOS: `~/Library/LaunchAgents/app.helloorbit.stardust.plist`. Move Stardust to the Applications folder first. An app opened straight from a downloaded zip runs from a temporary path, and Stardust refuses to point a login entry at it.
+- Windows: the `Stardust` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+Turning it off removes that entry.
+
+## Language
+
+```text
+stardust language ko
+stardust language en
+stardust language auto
+```
+
+The tray menu, the settings window, notices, and notifications have English and Korean text. `auto` follows `LC_ALL`, `LC_MESSAGES`, or `LANG`. Windows and macOS usually do not set those for desktop apps, so choose the language in the settings window there.
+
+The tray menu and OS notifications use the system font, so Hangul shows there. The settings window and the bubble draw their own letters. Their built-in letters cover English only. A build with the `system-font` feature draws Hangul from a font that is already on the computer (Malgun Gothic on Windows, Apple SD Gothic Neo on macOS, Noto Sans CJK or Nanum Gothic on Linux, or the file named by `STARDUST_FONT`). Without that feature, or without such a font, those two windows stay in English. The schedule line, the integrations line, and item summaries are still English in both languages.
 
 ## Run
 
@@ -93,11 +135,17 @@ Config is JSON. On Linux it is `$XDG_CONFIG_HOME/stardust/config.json` or `~/.co
     "quiet_hours": "22:00-07:00",
     "timezone": "America/New_York"
   },
-  "integrations": []
+  "integrations": [],
+  "language": "ko",
+  "onboarded": true
 }
 ```
 
-An ORBIT access token is kept in the system keychain until the server expiry, and never longer than 5 minutes. Stardust will not store one that is already expired. The token is not written into the config file. Sign in again after it expires. There is no refresh token.
+`language` is optional. Leave it out to follow the system locale. `onboarded` is set after the first settings window is closed.
+
+An ORBIT access token is kept in the system keychain until the server expiry, and never longer than 5 minutes. Stardust will not store one that is already expired. The token is not written into the config file.
+
+When ORBIT also returns a refresh token, Stardust keeps it in the same keychain item and trades it for a new access token when the old one has expired, or once after a 401. ORBIT decides how long a refresh token lasts. If ORBIT refuses the refresh token, the keychain item is removed and Stardust asks you to sign in again. If ORBIT cannot be reached, the item is kept and the next check tries again. When ORBIT does not return a refresh token, sign in again after the access token expires.
 
 ## Integrations
 
@@ -127,12 +175,13 @@ Stardust does not send telemetry.
 
 Stored on this computer:
 
-- The config file holds the schedule, character position, skin, size, integration ids and public hosts, the last checked time, and an optional server address. An older alerts cursor, if one is still in the file, is cleared and is not sent. The file does not hold the access token.
-- The OS keychain holds the ORBIT access token, and, only if you turn an integration on, that integration's destination URL, signing secret, or access token.
+- The config file holds the schedule, character position, skin, size, language, whether the first settings window was closed, integration ids and public hosts, the last checked time, and an optional server address. An older alerts cursor, if one is still in the file, is cleared and is not sent. The file does not hold the access token.
+- The OS keychain holds the ORBIT access token and any refresh token, and, only if you turn an integration on, that integration's destination URL, signing secret, or access token.
 
 Network calls, when you are not in `--demo`:
 
 - `POST /api/pqc/v1/account/device/code` and `POST /api/pqc/v1/account/device/token` during sign-in.
+- `POST /api/pqc/v1/account/device/token` with the `refresh_token` grant, only when a saved refresh token is used.
 - `GET /api/pqc/v1/desktop/status` and `GET /api/pqc/v1/desktop/alerts` on each check, with the keychain token as a bearer header. A 404 with an empty body means those routes are turned off. The alerts response is the current list, with no cursor.
 - Optional Slack, Teams, JSON webhook, or MCP calls that you enable.
 - Opening your browser to an https page on the configured host when you click a bubble or start sign-in.
@@ -149,6 +198,9 @@ Direct crates:
 | uuid | 1.28.0 | Apache-2.0 OR MIT |
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
 | png | 0.18.1 | MIT OR Apache-2.0 |
+| ab_glyph | 0.2.32 | Apache-2.0 |
+
+`ab_glyph` is used only with the `system-font` feature, which is off by default. It was already in the Linux tree through the window toolkit. It reads a font file that is already on the computer; no font file is bundled.
 
 `uuid` was already in the tree. `sha2` 0.11.1 was already in the tree; 0.10.9 is the version this crate calls. `png` 0.18.1 was already in the tree through the tray icon. This crate calls it, with default features off, to decode the pet sprites. No new transitive crates were added. No new crate was added for the ORBIT client. It uses `ureq` 2.12.1, which was already the HTTPS client. The HTTPS client adds these crates:
 

@@ -1,7 +1,8 @@
 use crate::icon::tray_rgba;
 use crate::inbox::{Inbox, UiMsg};
+use stardust_core::i18n::{every, interval_label, tr, Language, Msg};
 use stardust_core::pet::{tray_edge_px, PetScale, PetSkin, TrayGlyph};
-use stardust_core::schedule::{format_interval, QUICK_PICK_MINUTES};
+use stardust_core::schedule::QUICK_PICK_MINUTES;
 use stardust_core::text::MenuText;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -16,8 +17,9 @@ impl Tray {
         text: &MenuText,
         glyph: TrayGlyph,
         scale_factor: f64,
+        language: Language,
     ) -> Result<Self, String> {
-        let menu = build_menu(text)?;
+        let menu = build_menu(text, language)?;
         let icon = TrayIconBuilder::new()
             .with_tooltip(&text.tooltip)
             .with_icon(tray_icon(glyph, scale_factor)?)
@@ -37,8 +39,10 @@ impl Tray {
         text: &MenuText,
         glyph: TrayGlyph,
         scale_factor: f64,
+        language: Language,
     ) -> Result<(), String> {
-        self.icon.set_menu(Some(Box::new(build_menu(text)?)));
+        self.icon
+            .set_menu(Some(Box::new(build_menu(text, language)?)));
         self.icon
             .set_icon(Some(tray_icon(glyph, scale_factor)?))
             .map_err(|err| err.to_string())?;
@@ -53,38 +57,57 @@ fn tray_icon(glyph: TrayGlyph, scale_factor: f64) -> Result<Icon, String> {
     Icon::from_rgba(rgba, width, height).map_err(|err| err.to_string())
 }
 
-fn build_menu(text: &MenuText) -> Result<Menu, String> {
+fn skin_label(skin: PetSkin, language: Language) -> &'static str {
+    match skin {
+        PetSkin::Astronaut => tr(language, Msg::SkinAstronaut),
+        PetSkin::Star => tr(language, Msg::SkinStar),
+    }
+}
+
+fn scale_label(scale: PetScale, language: Language) -> String {
+    format!("{} {}x", tr(language, Msg::RowPetSize), scale.factor())
+}
+
+fn build_menu(text: &MenuText, language: Language) -> Result<Menu, String> {
     let menu = Menu::new();
+    append_item(&menu, "settings", tr(language, Msg::MenuSettings), true)?;
+    append_item(&menu, "sign-in", tr(language, Msg::MenuSignIn), true)?;
+    append_separator(&menu)?;
     append_item(&menu, "next", &text.next_check, false)?;
     append_item(&menu, "last", &text.last_checked, false)?;
     append_item(&menu, "schedule", &text.schedule, false)?;
     append_item(&menu, "integrations", &text.integrations, false)?;
     append_separator(&menu)?;
     append_item(&menu, "character", &text.character, true)?;
-    append_item(&menu, "pet", "Pet", false)?;
+    append_item(&menu, "pet", tr(language, Msg::MenuPet), false)?;
     for skin in PetSkin::ALL {
-        append_check(&menu, skin.menu_id(), skin.label(), text.pet_skin == skin)?;
+        append_check(
+            &menu,
+            skin.menu_id(),
+            skin_label(skin, language),
+            text.pet_skin == skin,
+        )?;
     }
     for scale in PetScale::ALL {
         append_check(
             &menu,
             scale.menu_id(),
-            scale.label(),
+            &scale_label(scale, language),
             text.pet_scale == scale,
         )?;
     }
-    append_item(&menu, "check-now", "Check now", true)?;
+    append_item(&menu, "check-now", tr(language, Msg::MenuCheckNow), true)?;
     append_separator(&menu)?;
     for minutes in QUICK_PICK_MINUTES {
         append_item(
             &menu,
             &format!("interval-{minutes}"),
-            &format!("Every {}", format_interval(minutes)),
+            &every(language, &interval_label(language, minutes)),
             true,
         )?;
     }
     append_separator(&menu)?;
-    append_item(&menu, "quit", "Quit", true)?;
+    append_item(&menu, "quit", tr(language, Msg::MenuQuit), true)?;
     Ok(menu)
 }
 

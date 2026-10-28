@@ -8,6 +8,7 @@
 
 mod actions;
 mod app;
+mod autostart;
 mod cli;
 mod deliver;
 mod font;

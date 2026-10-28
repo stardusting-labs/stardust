@@ -5,6 +5,7 @@
 //! speech bubble is a short summary, not a conversation.
 
 use crate::api::{https_origin, workspace_url, AlertItem};
+use crate::i18n::{tr, Language, Msg};
 use chrono::{DateTime, Timelike};
 use chrono_tz::Tz;
 use std::time::Duration;
@@ -37,14 +38,18 @@ pub enum Notice {
 }
 
 pub fn calm_notice(kind: Notice, server_base: &str) -> Presentation {
+    calm_notice_in(kind, server_base, Language::English)
+}
+
+pub fn calm_notice_in(kind: Notice, server_base: &str, language: Language) -> Presentation {
     let lines = match kind {
         Notice::Unavailable => vec![
-            "ORBIT is not available right now".to_string(),
-            "Stardust will try again later".to_string(),
+            tr(language, Msg::NoteUnavailable).to_string(),
+            tr(language, Msg::RetryLater).to_string(),
         ],
         Notice::SignedOut => vec![
-            "Sign in to see ORBIT items".to_string(),
-            "Use stardust sign-in in a terminal".to_string(),
+            tr(language, Msg::NoteSignedOut).to_string(),
+            tr(language, Msg::SignInHint).to_string(),
         ],
     };
     Presentation {
@@ -283,6 +288,18 @@ mod tests {
                 .summary
                 .details_url,
             ""
+        );
+        let korean = super::calm_notice_in(
+            Notice::SignedOut,
+            DEFAULT_SERVER_BASE,
+            crate::i18n::Language::Korean,
+        );
+        assert_eq!(korean.summary.lines[0], "ORBIT 항목을 보려면 로그인하세요");
+        assert_eq!(
+            calm_notice(Notice::SignedOut, DEFAULT_SERVER_BASE)
+                .summary
+                .lines[1],
+            "Choose Sign in from the tray menu"
         );
         for line in &shown.summary.lines {
             assert_eq!(find_disallowed_copy(line), None, "{line}");

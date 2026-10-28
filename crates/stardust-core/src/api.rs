@@ -21,6 +21,14 @@ pub const PATH_DEVICE_APPROVE: &str = "/api/pqc/v1/account/device/approve";
 pub const PATH_DESKTOP_STATUS: &str = "/api/pqc/v1/desktop/status";
 pub const PATH_DESKTOP_ALERTS: &str = "/api/pqc/v1/desktop/alerts";
 pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// RFC 6749 section 6 refresh grant.
+///
+/// TODO(Unsu): `docs/contracts/stardust-desktop-api-v1.md` (rust-orbit #782)
+/// has no refresh grant yet. This client sends it to the device token route
+/// only when the server already returned a `refresh_token`. Confirm the route
+/// and field names with the contract owners before release.
+pub const REFRESH_GRANT_TYPE: &str = "refresh_token";
+pub const PATH_TOKEN_REFRESH: &str = PATH_DEVICE_TOKEN;
 pub const DEVICE_CODE_TTL_SECONDS: u64 = 600;
 pub const ACCESS_TOKEN_LIFETIME_SECONDS: u64 = 300;
 pub const WORKSPACE_FINDINGS: &str = "/rust-preview/pqc/studio/app/findings";
@@ -143,6 +151,27 @@ pub struct DeviceTokenRequest {
     pub device_code: String,
 }
 
+/// `POST /api/pqc/v1/account/device/token` refresh body.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct RefreshTokenRequest {
+    pub grant_type: String,
+    pub refresh_token: String,
+}
+
+impl fmt::Debug for RefreshTokenRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefreshTokenRequest")
+            .field("grant_type", &self.grant_type)
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Device token and refresh response.
+///
+/// `refresh_token` and `refresh_expires_in` are optional so a server that
+/// starts sending them is still accepted. Other unknown fields are refused.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceTokenResponse {
@@ -151,6 +180,10 @@ pub struct DeviceTokenResponse {
     pub token_type: String,
     pub expires_in: u64,
     pub expires_at_epoch_ms: u64,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub refresh_expires_in: Option<u64>,
 }
 
 impl fmt::Debug for DeviceTokenResponse {
@@ -162,6 +195,11 @@ impl fmt::Debug for DeviceTokenResponse {
             .field("token_type", &self.token_type)
             .field("expires_in", &self.expires_in)
             .field("expires_at_epoch_ms", &self.expires_at_epoch_ms)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("refresh_expires_in", &self.refresh_expires_in)
             .finish()
     }
 }
@@ -268,12 +306,20 @@ pub fn parse_server_base(value: &str) -> Result<String, OrbitError> {
         Some((host, path)) => (host, path),
         None => (rest, ""),
     };
-    if !path.is_empty() || split_host_port(host_port).is_none() {
+    let Some((host, _)) = split_host_port(host_port) else {
+        return Err(OrbitError::ServerBase);
+    };
+    if !path.is_empty() {
         return Err(OrbitError::ServerBase);
     }
     let scheme = if trimmed.starts_with("https://") {
         "https"
     } else {
+        // The bearer token rides on every request, so plain http is only
+        // accepted for a loopback host (local development and tests).
+        if !is_loopback_host(host) {
+            return Err(OrbitError::ServerBase);
+        }
         "http"
     };
     Ok(format!("{scheme}://{host_port}"))
@@ -391,6 +437,13 @@ fn port_or_https(port: Option<u16>) -> u16 {
     port.unwrap_or(443)
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn split_host_port(host_port: &str) -> Option<(&str, Option<u16>)> {
     if host_port.is_empty() {
         return None;
@@ -481,9 +534,32 @@ mod tests {
             token_type: "Bearer".to_string(),
             expires_in: 300,
             expires_at_epoch_ms: 1_700_000_000_000,
+            refresh_token: Some("secret-refresh".to_string()),
+            refresh_expires_in: Some(86_400),
         };
         let rendered = format!("{response:?}");
         assert!(!rendered.contains("secret-access"));
+        assert!(!rendered.contains("secret-refresh"));
+        let request = super::RefreshTokenRequest {
+            grant_type: super::REFRESH_GRANT_TYPE.to_string(),
+            refresh_token: "secret-refresh".to_string(),
+        };
+        assert!(!format!("{request:?}").contains("secret-refresh"));
+        let without: DeviceTokenResponse = serde_json::from_str(
+            r#"{"token":"a","access_token":"a","token_type":"Bearer","expires_in":300,"expires_at_epoch_ms":1}"#,
+        )
+        .unwrap();
+        assert_eq!(without.refresh_token, None);
+        let with: DeviceTokenResponse = serde_json::from_str(
+            r#"{"token":"a","access_token":"a","token_type":"Bearer","expires_in":300,"expires_at_epoch_ms":1,"refresh_token":"r","refresh_expires_in":60}"#,
+        )
+        .unwrap();
+        assert_eq!(with.refresh_token.as_deref(), Some("r"));
+        assert_eq!(with.refresh_expires_in, Some(60));
+        assert!(serde_json::from_str::<DeviceTokenResponse>(
+            r#"{"token":"a","access_token":"a","token_type":"Bearer","expires_in":300,"expires_at_epoch_ms":1,"scope":"x"}"#,
+        )
+        .is_err());
         let code = DeviceCodeResponse {
             device_code: "secret-device".to_string(),
             user_code: "ABCD-EFGH".to_string(),
@@ -574,5 +650,15 @@ mod tests {
         assert_eq!(bumped_interval(5, true), 10);
         assert_eq!(bumped_interval(28, true), 30);
         assert_eq!(bumped_interval(0, false), 1);
+    }
+
+    #[test]
+    fn plain_http_server_base_is_loopback_only() {
+        assert!(parse_server_base("http://127.0.0.1:9").is_ok());
+        assert!(parse_server_base("http://localhost:8080").is_ok());
+        assert!(parse_server_base("http://[::1]:8080").is_ok());
+        assert!(parse_server_base("http://helloorbit.app").is_err());
+        assert!(parse_server_base("http://10.0.0.5:8080").is_err());
+        assert!(parse_server_base("https://helloorbit.app").is_ok());
     }
 }

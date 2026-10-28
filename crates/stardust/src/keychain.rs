@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use keyring::Entry;
 use stardust_core::integrations::{SecretError, SecretStore};
 use stardust_core::token::{StoredToken, TokenError, TokenStore};
-use std::fmt::Display;
 
 pub struct KeychainTokenStore;
 
@@ -95,11 +94,31 @@ impl SecretStore for KeychainTokenStore {
     }
 }
 
-fn missing(err: &impl Display) -> bool {
-    let text = err.to_string().to_ascii_lowercase();
-    text.contains("no entry")
-        || text.contains("not found")
-        || text.contains("no such")
-        || text.contains("no matching credential")
-        || text.contains("no default store")
+/// No saved item, or no keychain service on this machine.
+///
+/// Matched on the error variant, not the message, because the message text
+/// differs between the macOS, Windows, and Secret Service stores.
+fn missing(err: &keyring::Error) -> bool {
+    matches!(
+        err,
+        keyring::Error::NoEntry | keyring::Error::NoDefaultStore
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing;
+
+    #[test]
+    fn only_the_no_entry_and_no_store_variants_count_as_missing() {
+        assert!(missing(&keyring::Error::NoEntry));
+        assert!(missing(&keyring::Error::NoDefaultStore));
+        let platform = keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+            "element not found in the vault",
+        )));
+        assert!(!missing(&platform));
+        assert!(!missing(&keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("no such keychain")
+        ))));
+    }
 }
