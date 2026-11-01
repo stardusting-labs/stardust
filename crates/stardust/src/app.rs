@@ -1,34 +1,42 @@
 use crate::actions::{apply_menu, MenuEffect};
-use crate::cli::{self, AutostartAction, CharacterAction, Command};
+use crate::cli::{self, AutostartAction, CharacterAction, Command, FeatureAction};
 use crate::deliver;
-use crate::inbox::{Inbox, UiMsg};
+use crate::inbox::{Inbox, SignInUpdate, UiMsg};
 use crate::keychain::KeychainTokenStore;
 use crate::live::LivePet;
 use crate::notify;
-use crate::tray::Tray;
+use crate::routing::{self, CheckRouting, HttpsTransport};
+use crate::tray::{tray_text, Tray};
 use crate::window::{self, RunError, Session};
 use chrono::{DateTime, Utc};
 use stardust_core::api::{
     resolve_server_base, AlertItem, DesktopApi, DesktopStatus, MockOrbitClient, OrbitError,
-    ENV_SERVER_URL,
+    DEFAULT_SERVER_BASE, ENV_SERVER_URL,
 };
-use stardust_core::check::{note_anchor, note_success, perform_check, retry_delay, CheckKind};
-use stardust_core::config::{default_config_path, load_config, save_config, Config};
-use stardust_core::http::HttpOrbitClient;
-use stardust_core::outbound::{prepare_posts, DeliveryWindow};
+use stardust_core::check::{
+    jittered_retry_delay, note_anchor, note_success, perform_check, retry_delay, CheckKind,
+};
+use stardust_core::config::{default_config_path, load_config, save_config, Config, Feature};
+use stardust_core::connect::{DeviceFlow, FlowPhase, FlowStep};
+use stardust_core::http::{HttpOrbitClient, Revoke};
+use stardust_core::integrations::{IntegrationRecord, SecretStore};
+use stardust_core::outbound::{prepare_posts, DeliveryNote, DeliveryWindow};
 use stardust_core::pet::{pet_pose, tray_glyph, ObservedCheck};
-use stardust_core::policy::{calm_notice_in, Notice};
+use stardust_core::policy::{calm_notice_in, present, Notice};
 use stardust_core::position::ScreenPoint;
+use stardust_core::route::Router;
 use stardust_core::schedule::{parse_timezone, FireSource};
-use stardust_core::session::{current_access, Access, Refresher};
-use stardust_core::text::{menu_text, menu_text_in, with_connection_note_in};
+use stardust_core::session::{current_access, stored_from_response, Access, Refresher};
+use stardust_core::text::{menu_text, test_send_target};
+use stardust_core::token::TokenStore;
 use std::cell::RefCell;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String> {
     match cli::parse(args)? {
@@ -47,7 +55,24 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             let loaded = load_or_create(&path)?;
             crate::signin::sign_in(&loaded)
         }
-        Command::SignOut => crate::signin::sign_out(),
+        Command::SignOut { config } => {
+            // An unreadable or missing config file signs out as before.
+            let loaded = load_config(&config_path(config)).ok().flatten();
+            crate::signin::sign_out(loaded.as_ref())
+        }
+        Command::Feature { config, action } => {
+            let path = config_path(config);
+            let mut loaded = load_or_create(&path)?;
+            if let FeatureAction::Set { feature, on } = action {
+                loaded.set_feature(feature, on);
+                save_config(&path, &loaded).map_err(|err| err.to_string())?;
+            }
+            for feature in Feature::ALL {
+                let state = if loaded.feature(feature) { "on" } else { "off" };
+                println!("{} {state}", feature.name());
+            }
+            Ok(())
+        }
         Command::Autostart(action) => {
             match action {
                 AutostartAction::On => {
@@ -177,6 +202,7 @@ fn check_once(path: &Path, demo: bool) -> Result<(), String> {
         path,
         &KeychainTokenStore::new(),
         &LivePet::new(1.0),
+        &mut Router::new(),
         &CheckKind::Manual,
         !demo,
     ));
@@ -188,6 +214,14 @@ fn check_once(path: &Path, demo: bool) -> Result<(), String> {
     }
     if signal.presentation.show_os_notification {
         notify::show(&signal.presentation);
+    }
+    if let Some(posts) = signal.posts {
+        deliver::deliver(&posts.notes);
+        if !posts.items.is_empty() {
+            // The alerts already sent are remembered only by a running app,
+            // so a one-off check would post every listed alert again.
+            eprintln!("stardust: per-alert posts are made by the running app, not by --check-once");
+        }
     }
     Ok(())
 }
@@ -225,6 +259,7 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
                     inbox,
                     live,
                     backend,
+                    headless,
                 })
             })
             .map_err(|err| err.to_string())?
@@ -245,17 +280,25 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
         match window::run(session) {
             Ok(()) => {}
             Err(RunError::Unavailable(err) | RunError::Failed(err)) => {
+                let auto_sign_in = config
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .features()
+                    .auto_sign_in;
                 windows_unavailable = true;
                 eprintln!("stardust: windows are unavailable: {err}");
                 inbox.clear_proxy();
                 if tray.borrow().is_none() {
                     let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
                     let language = loaded.effective_language();
-                    let text = with_connection_note_in(
-                        menu_text_in(&loaded, Utc::now(), language),
-                        live.observed(),
-                        language,
-                    );
+                    // The window did not get far enough to read the keychain.
+                    // Demo mode needs no look; otherwise the connection line
+                    // waits for the first check rather than open a keychain
+                    // session just for it.
+                    if auto_sign_in && demo {
+                        live.set_signed_in(true);
+                    }
+                    let text = tray_text(&loaded, &live, language);
                     let glyph = glyph_for(&loaded, live.observed());
                     drop(loaded);
                     match Tray::install(&inbox, &text, glyph, live.scale_factor(), language) {
@@ -269,8 +312,10 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
                     }
                 }
                 while let Some(message) = inbox.try_pop() {
-                    if let UiMsg::Checked(presentation) = message {
-                        print_lines(&presentation.summary.lines);
+                    match message {
+                        UiMsg::Checked(presentation) => print_lines(&presentation.summary.lines),
+                        UiMsg::SignIn(update) if auto_sign_in => print_sign_in(&update),
+                        UiMsg::SignIn(_) | UiMsg::Menu(_) | UiMsg::Pet => {}
                     }
                 }
             }
@@ -279,6 +324,12 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
     while windows_unavailable && !quit.load(Ordering::SeqCst) {
         match inbox.wait_timeout(Duration::from_secs(45)) {
             Some(UiMsg::Menu(id)) => {
+                if let Some(request) = timer_request(&config, &live, &id) {
+                    request.queue(&live);
+                    wake.notify_one();
+                    refresh_tray(&config, &live, &tray);
+                    continue;
+                }
                 let effect = {
                     let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
                     match apply_menu(&mut loaded, &id, Utc::now()) {
@@ -313,7 +364,23 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
                 print_lines(&presentation.summary.lines);
                 refresh_tray(&config, &live, &tray);
             }
-            Some(UiMsg::SignIn(_)) => {}
+            Some(UiMsg::SignIn(update)) => {
+                // Only the check-timer sign-in reaches this loop; the
+                // settings window, which starts the other one, is not open.
+                let auto = config
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .features()
+                    .auto_sign_in;
+                if auto {
+                    print_sign_in(&update);
+                    if matches!(update, SignInUpdate::Done) {
+                        manual.store(true, Ordering::SeqCst);
+                        wake.notify_one();
+                    }
+                    refresh_tray(&config, &live, &tray);
+                }
+            }
             Some(UiMsg::Pet) | None => refresh_tray(&config, &live, &tray),
         }
     }
@@ -332,6 +399,8 @@ struct ScheduleJob {
     inbox: Inbox,
     live: LivePet,
     backend: Backend,
+    /// `--headless`: no tray and no window, so nothing could show a sign-in.
+    headless: bool,
 }
 
 fn scheduler_thread(job: ScheduleJob) {
@@ -344,6 +413,7 @@ fn scheduler_thread(job: ScheduleJob) {
         inbox,
         live,
         backend,
+        headless,
     } = job;
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -357,12 +427,25 @@ fn scheduler_thread(job: ScheduleJob) {
     };
     let tokens = KeychainTokenStore::new();
     let require_token = matches!(backend, Backend::Live(_));
+    let mut router = Router::new();
+    let mut flow: Option<DeviceFlow> = None;
+    if require_token
+        && !headless
+        && first_run_connect(&config)
+        && matches!(tokens.load(Utc::now()), Ok(None))
+    {
+        live.request_connect();
+    }
     runtime.block_on(async move {
         let mut failures = 0_u32;
+        // Kept while a device sign-in wakes the loop between checks, so its
+        // polls do not push the next check back.
+        let mut planned: Option<(Instant, Planned)> = None;
         loop {
             if quit.load(Ordering::SeqCst) {
                 break;
             }
+            run_requests(&backend, &config, &tokens, &live, &inbox, &mut flow);
             if manual.swap(false, Ordering::SeqCst) {
                 let signal = run_check(
                     &backend,
@@ -370,25 +453,44 @@ fn scheduler_thread(job: ScheduleJob) {
                     &path,
                     &tokens,
                     &live,
+                    &mut router,
                     &CheckKind::Manual,
                     require_token,
                 )
                 .await;
                 failures = next_failures(failures, signal.soften);
-                inbox.push(UiMsg::Pet);
-                if signal.publish {
-                    inbox.push(UiMsg::Checked(signal.presentation));
+                publish(&inbox, &tokens, &mut router, signal);
+                planned = None;
+                continue;
+            }
+            let now = Instant::now();
+            let due = match &planned {
+                Some((due, _)) => *due,
+                None => {
+                    let next = plan_next(&config, failures);
+                    let due = now + next.delay;
+                    planned = Some((due, next));
+                    due
                 }
+            };
+            let mut wait = due.saturating_duration_since(now);
+            if let Some(flow) = &flow {
+                wait = wait.min(flow.wait(now));
+            }
+            if tokio::time::timeout(wait, wake.notified()).await.is_ok() {
+                planned = None;
                 continue;
             }
-            let planned = plan_next(&config, failures);
-            if tokio::time::timeout(planned.delay, wake.notified())
-                .await
-                .is_ok()
-            {
-                continue;
+            if flow.is_some() {
+                step_flow(&backend, &tokens, &live, &inbox, &mut flow);
+                if Instant::now() < due {
+                    continue;
+                }
             }
-            let Some(slot) = planned.slot else {
+            let Some((_, next)) = planned.take() else {
+                continue;
+            };
+            let Some(slot) = next.slot else {
                 continue;
             };
             let kind = CheckKind::Scheduled {
@@ -401,17 +503,28 @@ fn scheduler_thread(job: ScheduleJob) {
                 &path,
                 &tokens,
                 &live,
+                &mut router,
                 &kind,
                 require_token,
             )
             .await;
             failures = next_failures(failures, signal.soften);
-            inbox.push(UiMsg::Pet);
-            if signal.publish {
-                inbox.push(UiMsg::Checked(signal.presentation));
-            }
+            publish(&inbox, &tokens, &mut router, signal);
         }
     });
+}
+
+/// Hand a check to the tray and the windows, then make its sink posts, so
+/// the bubble does not wait for the network.
+fn publish(inbox: &Inbox, tokens: &KeychainTokenStore, router: &mut Router, signal: CheckSignal) {
+    inbox.push(UiMsg::Pet);
+    if signal.publish {
+        inbox.push(UiMsg::Checked(signal.presentation));
+    }
+    if let Some(posts) = signal.posts {
+        deliver::deliver(&posts.notes);
+        routing::route_remote(router, &posts.routing(tokens), &HttpsTransport::new());
+    }
 }
 
 fn next_failures(current: u32, soften: bool) -> u32 {
@@ -420,6 +533,245 @@ fn next_failures(current: u32, soften: bool) -> u32 {
     } else {
         0
     }
+}
+
+/// Auto sign-in starts by itself only on a first run: the welcome window
+/// was never closed. After that it starts from a click on "Sign in".
+fn first_run_connect(config: &Mutex<Config>) -> bool {
+    let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+    loaded.features().auto_sign_in && !loaded.onboarded()
+}
+
+/// A tray click the check timer carries out with the newer features on.
+enum TimerRequest {
+    Connect,
+    Test(String),
+}
+
+impl TimerRequest {
+    fn queue(self, live: &LivePet) {
+        match self {
+            Self::Connect => live.request_connect(),
+            Self::Test(id) => live.request_test(&id),
+        }
+    }
+}
+
+fn timer_request(config: &Mutex<Config>, live: &LivePet, id: &str) -> Option<TimerRequest> {
+    let features = config
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .features();
+    if features.routing {
+        if let Some(target) = test_send_target(id) {
+            return Some(TimerRequest::Test(target.to_string()));
+        }
+    }
+    if features.auto_sign_in && id == "sign-in" {
+        // Not known yet: look now, on the click, rather than at start.
+        let signed_in = live.signed_in().unwrap_or_else(|| {
+            let found = crate::signin::signed_in();
+            live.set_signed_in(found);
+            found
+        });
+        if !signed_in {
+            return Some(TimerRequest::Connect);
+        }
+    }
+    None
+}
+
+/// Requests from the tray and the settings window, carried out on the check
+/// timer so no other thread does network work.
+fn run_requests(
+    backend: &Backend,
+    config: &Mutex<Config>,
+    tokens: &KeychainTokenStore,
+    live: &LivePet,
+    inbox: &Inbox,
+    flow: &mut Option<DeviceFlow>,
+) {
+    if let Some(ticket) = live.take_sign_out() {
+        if let Backend::Live(client) = backend {
+            finish_sign_out(client, tokens, ticket.refresh_token());
+        }
+        // A check that was running at sign-out may have marked this
+        // computer signed in again.
+        live.set_signed_in(false);
+        live.set_observed(ObservedCheck::SignedOut);
+        inbox.push(UiMsg::Pet);
+    }
+    if live.take_connect() && flow.is_none() {
+        if let Backend::Live(client) = backend {
+            start_flow(client, config, live, inbox, flow);
+        }
+    }
+    let tests = live.take_tests();
+    if !tests.is_empty() {
+        send_tests(config, tokens, inbox, &tests);
+    }
+}
+
+/// The settings window already deleted the keychain record. A check that was
+/// running then may have saved a rotated one, so delete again and revoke
+/// every refresh token seen. A server without the revoke route answers 404,
+/// which is fine.
+fn finish_sign_out(client: &HttpOrbitClient, tokens: &KeychainTokenStore, refresh: Option<&str>) {
+    let rotated = tokens
+        .load(Utc::now())
+        .ok()
+        .flatten()
+        .and_then(|token| token.refresh_token().map(str::to_string));
+    if let Err(err) = tokens.clear() {
+        eprintln!("stardust: could not sign out: {err}");
+    }
+    let mut presented: Vec<&str> = refresh.into_iter().collect();
+    if let Some(rotated) = rotated.as_deref() {
+        if !presented.contains(&rotated) {
+            presented.push(rotated);
+        }
+    }
+    for token in presented {
+        match client.revoke_refresh_token(token) {
+            Revoke::Revoked => eprintln!("stardust: ORBIT revoked the refresh token"),
+            Revoke::Unsupported => {}
+            Revoke::Unreachable => {
+                eprintln!("stardust: ORBIT could not be reached to revoke the refresh token");
+            }
+        }
+    }
+}
+
+fn start_flow(
+    client: &HttpOrbitClient,
+    config: &Mutex<Config>,
+    live: &LivePet,
+    inbox: &Inbox,
+    flow: &mut Option<DeviceFlow>,
+) {
+    let server_base = {
+        let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+        server_base_of(&loaded).unwrap_or_else(|_| DEFAULT_SERVER_BASE.to_string())
+    };
+    match DeviceFlow::start(client, &server_base, Instant::now) {
+        Ok(started) => {
+            let user_code = started.user_code().to_string();
+            live.set_phase(FlowPhase::Waiting {
+                user_code: user_code.clone(),
+            });
+            inbox.push(UiMsg::Pet);
+            inbox.push(UiMsg::SignIn(SignInUpdate::Code(user_code)));
+            // https on the configured host only. Detached, so a browser that
+            // stays in the foreground does not hold up the check timer.
+            if let Some(url) = started.verification_url() {
+                if let Err(err) = open::that_detached(url) {
+                    eprintln!("stardust: could not open the browser: {err}");
+                }
+            }
+            *flow = Some(started);
+        }
+        Err(err) => {
+            eprintln!("stardust: sign-in: {err}");
+            live.set_phase(FlowPhase::Idle);
+            inbox.push(UiMsg::Pet);
+            inbox.push(UiMsg::SignIn(SignInUpdate::Failed));
+        }
+    }
+}
+
+/// One device-token poll, when it is due.
+fn step_flow(
+    backend: &Backend,
+    tokens: &KeychainTokenStore,
+    live: &LivePet,
+    inbox: &Inbox,
+    flow: &mut Option<DeviceFlow>,
+) {
+    let Backend::Live(client) = backend else {
+        *flow = None;
+        return;
+    };
+    let Some(current) = flow.as_mut() else {
+        return;
+    };
+    let user_code = current.user_code().to_string();
+    let step = current.step(client, Instant::now(), entropy());
+    let phase = match step {
+        FlowStep::Wait(_) => return,
+        FlowStep::Pending(_) => FlowPhase::Waiting { user_code },
+        FlowStep::Offline(_) => FlowPhase::Offline { user_code },
+        FlowStep::Approved(token) => {
+            *flow = None;
+            live.set_phase(FlowPhase::Idle);
+            let saved = stored_from_response(token, Utc::now())
+                .map_err(|err| err.to_string())
+                .and_then(|stored| tokens.store(&stored).map_err(|err| err.to_string()));
+            match saved {
+                Ok(()) => {
+                    live.set_signed_in(true);
+                    live.set_observed(ObservedCheck::Waiting);
+                    inbox.push(UiMsg::Pet);
+                    inbox.push(UiMsg::SignIn(SignInUpdate::Done));
+                }
+                Err(err) => {
+                    eprintln!("stardust: sign-in: {err}");
+                    inbox.push(UiMsg::Pet);
+                    inbox.push(UiMsg::SignIn(SignInUpdate::Failed));
+                }
+            }
+            return;
+        }
+        FlowStep::Ended(err) => {
+            *flow = None;
+            eprintln!("stardust: sign-in: {err}");
+            live.set_phase(FlowPhase::Idle);
+            inbox.push(UiMsg::Pet);
+            inbox.push(UiMsg::SignIn(SignInUpdate::Failed));
+            return;
+        }
+    };
+    if live.phase() != phase {
+        live.set_phase(phase);
+        inbox.push(UiMsg::Pet);
+    }
+}
+
+fn send_tests(config: &Mutex<Config>, tokens: &KeychainTokenStore, inbox: &Inbox, ids: &[String]) {
+    let (records, server_base, language, routing_on) = {
+        let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+        (
+            loaded.integrations().to_vec(),
+            server_base_of(&loaded).unwrap_or_else(|_| DEFAULT_SERVER_BASE.to_string()),
+            loaded.effective_language(),
+            loaded.features().routing,
+        )
+    };
+    if !routing_on {
+        return;
+    }
+    for id in ids {
+        let result = routing::send_test(
+            &records,
+            tokens,
+            id,
+            &server_base,
+            Utc::now(),
+            &HttpsTransport::new(),
+        );
+        match &result {
+            Ok(host) => eprintln!("stardust: test sent to {id} ({host})"),
+            Err(err) => eprintln!("stardust: test to {id} did not go through: {err}"),
+        }
+        inbox.push(UiMsg::Checked(routing::test_presentation(
+            id, &result, language,
+        )));
+    }
+}
+
+/// Random bits for backoff jitter. std only: every `RandomState` is keyed
+/// differently, from a per-thread random seed.
+fn entropy() -> u64 {
+    std::collections::hash_map::RandomState::new().hash_one(0_u8)
 }
 
 struct Planned {
@@ -434,6 +786,14 @@ struct PlannedSlot {
 
 fn plan_next(config: &Mutex<Config>, failures: u32) -> Planned {
     let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+    let jittered = loaded.features().jittered_backoff;
+    let backoff = |delay: Duration| {
+        if jittered {
+            jittered_retry_delay(delay, failures, entropy())
+        } else {
+            retry_delay(delay, failures)
+        }
+    };
     let now = Utc::now();
     let timezone = loaded.schedule().timezone();
     let local_now = now.with_timezone(&timezone);
@@ -443,16 +803,15 @@ fn plan_next(config: &Mutex<Config>, failures: u32) -> Planned {
         .map(|instant| instant.with_timezone(&timezone));
     let Some(fire) = loaded.schedule().next_fire(local_now, anchor) else {
         return Planned {
-            delay: retry_delay(Duration::from_secs(60), failures),
+            delay: backoff(Duration::from_secs(60)),
             slot: None,
         };
     };
     let at = fire.at.with_timezone(&Utc);
-    let delay = retry_delay(
+    let delay = backoff(
         at.signed_duration_since(now)
             .to_std()
             .unwrap_or(Duration::ZERO),
-        failures,
     );
     Planned {
         delay,
@@ -467,14 +826,42 @@ struct CheckSignal {
     presentation: stardust_core::policy::Presentation,
     publish: bool,
     soften: bool,
+    /// With routing on, the sink posts to make once the check is shown.
+    posts: Option<PendingPosts>,
 }
 
+/// One check's posts, made after the bubble: the summary posts that still
+/// apply with routing on, then one message per new alert.
+struct PendingPosts {
+    notes: Vec<DeliveryNote>,
+    records: Vec<IntegrationRecord>,
+    items: Vec<AlertItem>,
+    server_base: String,
+    quiet: bool,
+    now: Instant,
+}
+
+impl PendingPosts {
+    fn routing<'a>(&'a self, secrets: &'a dyn SecretStore) -> CheckRouting<'a> {
+        CheckRouting {
+            records: &self.records,
+            secrets,
+            items: &self.items,
+            server_base: &self.server_base,
+            quiet: self.quiet,
+            now: self.now,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_check(
     client: &Backend,
     config: &Mutex<Config>,
     path: &Path,
     tokens: &KeychainTokenStore,
     live: &LivePet,
+    router: &mut Router,
     kind: &CheckKind,
     require_token: bool,
 ) -> CheckSignal {
@@ -488,7 +875,10 @@ async fn run_check(
     let refresher = client.refresher();
     let token = if require_token {
         match current_access(tokens, refresher, now, false) {
-            Access::Ready { token, .. } => Some(token),
+            Access::Ready { token, unsaved, .. } => {
+                note_unsaved(unsaved);
+                Some(token)
+            }
             Access::SignedOut => {
                 return soft_signal(
                     config,
@@ -522,7 +912,10 @@ async fn run_check(
         .unwrap_or("");
     let mut result = perform_check(client, access_token, now, &schedule, kind, &server_base).await;
     if require_token && matches!(result, Err(OrbitError::Unauthorized)) {
-        if let Access::Ready { token, .. } = current_access(tokens, refresher, Utc::now(), true) {
+        if let Access::Ready { token, unsaved, .. } =
+            current_access(tokens, refresher, Utc::now(), true)
+        {
+            note_unsaved(unsaved);
             result = perform_check(
                 client,
                 token.access_token(),
@@ -538,40 +931,97 @@ async fn run_check(
         Ok(outcome) => {
             let item_count = u32::try_from(outcome.items.len()).unwrap_or(u32::MAX);
             let high_severity = outcome.items.iter().any(AlertItem::shows_immediately);
-            let records = {
+            let (records, routing_on) = {
                 let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
                 note_anchor(loaded.state_mut(), kind);
                 note_success(loaded.state_mut(), now, None);
                 if let Err(err) = save_config(path, &loaded) {
                     eprintln!("stardust: could not save config: {err}");
                 }
-                loaded.integrations().to_vec()
+                (loaded.integrations().to_vec(), loaded.features().routing)
             };
             live.set_observed(ObservedCheck::Succeeded {
                 item_count,
                 high_severity,
             });
+            live.set_signed_in(true);
             let local = now.with_timezone(&schedule.timezone());
+            let quiet = schedule.is_quiet_at(local);
+            let manual = matches!(kind, CheckKind::Manual);
+            let summary_only: Vec<IntegrationRecord>;
+            let summary_records: &[IntegrationRecord] = if routing_on {
+                summary_only = routing::summary_records(&records, true);
+                &summary_only
+            } else {
+                &records
+            };
             let notes = prepare_posts(
-                &records,
+                summary_records,
                 tokens,
                 &outcome.items,
                 &DeliveryWindow {
-                    quiet: schedule.is_quiet_at(local),
-                    manual: matches!(kind, CheckKind::Manual),
+                    quiet,
+                    manual,
                     now,
                     interval_minutes: schedule.interval_minutes().unwrap_or(1440),
                     server_base: &server_base,
                 },
             );
-            deliver::deliver(&notes);
-            if outcome.presentation.show_os_notification {
-                notify::show(&outcome.presentation);
+            let mut presentation = outcome.presentation;
+            let mut posts = None;
+            if !routing_on {
+                deliver::deliver(&notes);
+            } else {
+                let routed_at = Instant::now();
+                let reached = routing::route_local(
+                    router,
+                    &CheckRouting {
+                        records: &records,
+                        secrets: tokens,
+                        items: &outcome.items,
+                        server_base: &server_base,
+                        quiet,
+                        now: routed_at,
+                    },
+                    &crate::dnd::active,
+                );
+                if !manual {
+                    // Only what this computer has not shown yet, outside
+                    // quiet hours and do-not-disturb, and summed up again.
+                    let fresh: Vec<AlertItem> = reached
+                        .shown
+                        .iter()
+                        .map(|&at| outcome.items[at].clone())
+                        .collect();
+                    presentation = present(
+                        &fresh,
+                        quiet,
+                        local,
+                        false,
+                        &server_base,
+                        &outcome.workspace_path,
+                    );
+                    presentation.show_bubble &= !fresh.is_empty();
+                }
+                // A check the user asked for still answers in the bubble.
+                presentation.show_os_notification &= reached.notification;
+                posts = Some(PendingPosts {
+                    notes,
+                    records,
+                    items: outcome.items,
+                    server_base: server_base.clone(),
+                    quiet,
+                    now: routed_at,
+                });
+            }
+            if presentation.show_os_notification {
+                notify::show(&presentation);
             }
             CheckSignal {
-                presentation: outcome.presentation,
+                presentation,
                 publish: true,
                 soften: false,
+                posts,
             }
         }
         Err(err) => match err {
@@ -608,6 +1058,14 @@ async fn run_check(
     }
 }
 
+fn note_unsaved(unsaved: bool) {
+    if unsaved {
+        eprintln!(
+            "stardust: the keychain did not take the renewed sign-in; the next renewal will ask to sign in again"
+        );
+    }
+}
+
 fn soft_signal(
     config: &Mutex<Config>,
     path: &Path,
@@ -631,11 +1089,15 @@ fn soft_signal(
         loaded.effective_language()
     };
     live.set_observed(observed);
+    if notice == Notice::SignedOut {
+        live.set_signed_in(false);
+    }
     let manual = matches!(kind, CheckKind::Manual);
     CheckSignal {
         presentation: calm_notice_in(notice, server_base, language),
         publish: manual || previous != observed,
         soften,
+        posts: None,
     }
 }
 
@@ -702,11 +1164,7 @@ fn refresh_tray(config: &Mutex<Config>, live: &LivePet, tray: &RefCell<Option<Tr
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
         let language = loaded.effective_language();
         (
-            with_connection_note_in(
-                menu_text_in(&loaded, Utc::now(), language),
-                observed,
-                language,
-            ),
+            tray_text(&loaded, live, language),
             glyph_for(&loaded, observed),
             language,
         )
@@ -718,8 +1176,95 @@ fn refresh_tray(config: &Mutex<Config>, live: &LivePet, tray: &RefCell<Option<Tr
     }
 }
 
+/// With no window, the user code goes to the terminal as well as the tray.
+fn print_sign_in(update: &SignInUpdate) {
+    match update {
+        SignInUpdate::Code(user_code) => {
+            println!("Enter this code on the ORBIT account page: {user_code}");
+        }
+        SignInUpdate::Done => println!("Signed in. The access token is in the system keychain."),
+        SignInUpdate::Failed => println!("Sign-in did not finish. Choose Sign in to try again."),
+    }
+}
+
 fn print_lines(lines: &[String]) {
     for line in lines {
         println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_run_connect, plan_next, timer_request, TimerRequest};
+    use crate::live::LivePet;
+    use stardust_core::check::BACKOFF_CAP;
+    use stardust_core::config::{Config, Feature};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[test]
+    fn tray_clicks_reach_the_check_timer_only_with_their_features_on() {
+        let config = Mutex::new(Config::default_for("UTC").unwrap());
+        let live = LivePet::new(1.0);
+        assert!(timer_request(&config, &live, "test-send:ops").is_none());
+        assert!(timer_request(&config, &live, "sign-in").is_none());
+        config.lock().unwrap().set_feature(Feature::Routing, true);
+        assert!(matches!(
+            timer_request(&config, &live, "test-send:ops"),
+            Some(TimerRequest::Test(id)) if id == "ops"
+        ));
+        assert!(timer_request(&config, &live, "test-send:../x").is_none());
+        assert!(timer_request(&config, &live, "sign-in").is_none());
+        config
+            .lock()
+            .unwrap()
+            .set_feature(Feature::AutoSignIn, true);
+        // Known, so the test never reads the real keychain.
+        live.set_signed_in(false);
+        assert!(matches!(
+            timer_request(&config, &live, "sign-in"),
+            Some(TimerRequest::Connect)
+        ));
+        live.set_signed_in(true);
+        assert!(timer_request(&config, &live, "sign-in").is_none());
+        assert!(timer_request(&config, &live, "check-now").is_none());
+    }
+
+    #[test]
+    fn auto_sign_in_starts_by_itself_only_before_the_welcome_window_closes() {
+        let config = Mutex::new(Config::default_for("UTC").unwrap());
+        assert!(!first_run_connect(&config), "off by default");
+        config
+            .lock()
+            .unwrap()
+            .set_feature(Feature::AutoSignIn, true);
+        assert!(first_run_connect(&config));
+        config.lock().unwrap().set_onboarded(true);
+        assert!(!first_run_connect(&config));
+    }
+
+    #[test]
+    fn jitter_changes_only_the_wait_after_failures_and_stays_capped() {
+        let config = Mutex::new(Config::default_for("UTC").unwrap());
+        let calm = plan_next(&config, 0);
+        assert!(calm.delay <= Duration::from_secs(3_600));
+        let fixed = plan_next(&config, 4);
+        assert!(
+            fixed.delay >= Duration::from_secs(240),
+            "the old doubling waits 30 s * 2^3 at least"
+        );
+        config
+            .lock()
+            .unwrap()
+            .set_feature(Feature::JitteredBackoff, true);
+        for failures in [1, 4, 12] {
+            let jittered = plan_next(&config, failures);
+            assert!(jittered.delay >= Duration::from_secs(1));
+            assert!(
+                jittered.delay <= BACKOFF_CAP.max(calm.delay + Duration::from_secs(1)),
+                "{failures}: {:?}",
+                jittered.delay
+            );
+        }
     }
 }

@@ -1,0 +1,15 @@
+{
+  "username": "Stardust",
+  "allowed_mentions": { "parse": [] },
+  "embeds": [
+    {
+      "title": "ORBIT high-severity item",
+      "description": "api.example:443 key-exchange x25519 \\<!channel\\> & \\[docs\\](https://evil.example)",
+      "url": "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention",
+      "color": 12986408,
+      "timestamp": "2026-10-26T00:00:00Z",
+      "fields": [{ "name": "Severity", "value": "High", "inline": true }],
+      "footer": { "text": "Stardust" }
+    }
+  ]
+}

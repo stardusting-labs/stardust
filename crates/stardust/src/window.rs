@@ -11,7 +11,7 @@ use crate::font::{self, Painter, Pen};
 use crate::inbox::{Inbox, SignInUpdate, UiMsg, Wake};
 use crate::live::LivePet;
 use crate::sprites;
-use crate::tray::Tray;
+use crate::tray::{tray_text, Tray};
 use chrono::Utc;
 use stardust_core::a11y::{
     text_scale, BUBBLE_BACKGROUND, BUBBLE_TEXT, SETTINGS_BACKGROUND, SETTINGS_FOCUS_FILL,
@@ -19,6 +19,7 @@ use stardust_core::a11y::{
 };
 use stardust_core::api::{https_origin, is_allowed_https_url, resolve_server_base, ENV_SERVER_URL};
 use stardust_core::config::{save_config, Config};
+use stardust_core::connect::FlowPhase;
 use stardust_core::i18n::{drawn_language, Language};
 use stardust_core::pet::{
     pet_frame, pet_pose, tray_glyph, ObservedCheck, PetPose, PetScale, PetSkin,
@@ -28,7 +29,7 @@ use stardust_core::position::{layout_bubble, LayoutRequest, ScreenPoint, ScreenR
 use stardust_core::settings::{
     Key, Line, LineKind, SettingsAction, SettingsModel, SettingsView, SignInStage,
 };
-use stardust_core::text::{menu_text_in, with_connection_note_in};
+use stardust_core::text::test_send_target;
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -126,6 +127,7 @@ pub fn run(session: Session) -> Result<(), RunError> {
         .map_err(|err| RunError::Unavailable(err.to_string()))?;
     session.inbox.set_proxy(event_loop.create_proxy());
     let signed_in = session.demo || crate::signin::signed_in();
+    session.live.set_signed_in(signed_in);
     let mut app = PopupApp {
         session,
         context,
@@ -237,11 +239,7 @@ impl PopupApp {
             let observed = self.session.live.observed();
             let local = Utc::now().with_timezone(&config.schedule().timezone());
             (
-                with_connection_note_in(
-                    menu_text_in(&config, Utc::now(), language),
-                    observed,
-                    language,
-                ),
+                tray_text(&config, &self.session.live, language),
                 tray_glyph(pet_pose(observed, config.schedule().is_quiet_at(local))),
             )
         };
@@ -420,11 +418,23 @@ impl PopupApp {
             }
             SettingsAction::StartSignIn => self.start_sign_in(),
             SettingsAction::SignOut => {
+                let finish_on_timer = self.auto_sign_in() && !self.session.demo;
+                // With auto sign-in the check timer finishes the sign-out on
+                // its next tick and revokes the refresh token. The keychain
+                // copy goes now either way.
+                let refresh = finish_on_timer
+                    .then(crate::signin::saved_refresh_token)
+                    .flatten();
                 if let Err(err) = crate::signin::clear_keychain_token() {
                     eprintln!("stardust: could not sign out: {err}");
                 }
+                if finish_on_timer {
+                    self.session.live.queue_sign_out(refresh.as_deref());
+                    self.session.wake.notify_one();
+                }
                 self.signed_in = self.session.demo;
                 self.sign_in = SignInStage::Idle;
+                self.session.live.set_signed_in(self.session.demo);
                 if !self.session.demo {
                     self.session.live.set_observed(ObservedCheck::SignedOut);
                 }
@@ -471,8 +481,30 @@ impl PopupApp {
         }
     }
 
+    fn auto_sign_in(&self) -> bool {
+        self.session
+            .config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .features()
+            .auto_sign_in
+    }
+
     fn start_sign_in(&mut self) {
         if self.session.demo || self.sign_in_running {
+            return;
+        }
+        if self.auto_sign_in() {
+            // The check timer runs the device flow; no sign-in thread.
+            if let FlowPhase::Waiting { user_code } | FlowPhase::Offline { user_code } =
+                self.session.live.phase()
+            {
+                self.sign_in = SignInStage::Waiting { user_code };
+                return;
+            }
+            self.sign_in = SignInStage::Idle;
+            self.session.live.request_connect();
+            self.session.wake.notify_one();
             return;
         }
         self.sign_in_running = true;
@@ -518,6 +550,9 @@ impl PopupApp {
                 self.sign_in_running = false;
                 self.sign_in = SignInStage::Failed;
             }
+        }
+        if self.auto_sign_in() {
+            self.refresh_tray();
         }
         self.redraw_settings();
     }
@@ -667,7 +702,23 @@ impl PopupApp {
                 self.redraw_settings();
                 return;
             }
-            _ => {}
+            other => {
+                if let Some(target) = test_send_target(other) {
+                    let routing = self
+                        .session
+                        .config
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .features()
+                        .routing;
+                    if routing {
+                        // Posted from the check timer, like every alert.
+                        self.session.live.request_test(target);
+                        self.session.wake.notify_one();
+                    }
+                    return;
+                }
+            }
         }
         let now = Utc::now();
         let effect = {
@@ -724,11 +775,7 @@ impl PopupApp {
             let local = Utc::now().with_timezone(&config.schedule().timezone());
             let pose = pet_pose(observed, config.schedule().is_quiet_at(local));
             (
-                with_connection_note_in(
-                    menu_text_in(&config, Utc::now(), language),
-                    observed,
-                    language,
-                ),
+                tray_text(&config, &self.session.live, language),
                 tray_glyph(pose),
             )
         };

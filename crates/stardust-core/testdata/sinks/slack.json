@@ -1,0 +1,32 @@
+{
+  "text": "ORBIT high-severity item: api.example:443 key-exchange x25519 &lt;!channel&gt; &amp; [docs](https://evil.example)",
+  "blocks": [
+    {
+      "type": "header",
+      "text": { "type": "plain_text", "text": "ORBIT high-severity item", "emoji": false }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "api.example:443 key-exchange x25519 &lt;!channel&gt; &amp; [docs](https://evil.example)"
+      }
+    },
+    {
+      "type": "context",
+      "elements": [
+        { "type": "mrkdwn", "text": "Severity High · seen 2026-10-26T00:00:00Z" }
+      ]
+    },
+    {
+      "type": "actions",
+      "elements": [
+        {
+          "type": "button",
+          "text": { "type": "plain_text", "text": "Open in ORBIT", "emoji": false },
+          "url": "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention"
+        }
+      ]
+    }
+  ]
+}

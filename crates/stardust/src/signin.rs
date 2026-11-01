@@ -8,7 +8,7 @@ use crate::keychain::KeychainTokenStore;
 use chrono::Utc;
 use stardust_core::api::{https_origin, resolve_server_base, verification_url, ENV_SERVER_URL};
 use stardust_core::config::Config;
-use stardust_core::http::HttpOrbitClient;
+use stardust_core::http::{HttpOrbitClient, Revoke};
 use stardust_core::session::stored_from_response;
 use stardust_core::token::TokenStore;
 
@@ -58,10 +58,36 @@ pub fn sign_in_with(config: &Config, on_code: &mut OnCode<'_>) -> Result<(), Str
     Ok(())
 }
 
-pub fn sign_out() -> Result<(), String> {
+/// `stardust sign-out`. With auto sign-in on, a saved refresh token is also
+/// revoked on ORBIT after the keychain copy is deleted. A server without the
+/// revoke route is fine; the local copy is gone either way.
+pub fn sign_out(config: Option<&Config>) -> Result<(), String> {
+    let revoke = config.filter(|config| config.features().auto_sign_in);
+    let refresh = revoke.and_then(|_| saved_refresh_token());
     clear_keychain_token()?;
     println!("Signed out. The access token was removed from the system keychain.");
+    if let (Some(config), Some(refresh)) = (revoke, refresh) {
+        let revoked = resolve_server_base(
+            config.server_base_url(),
+            std::env::var(ENV_SERVER_URL).ok().as_deref(),
+        )
+        .ok()
+        .and_then(|base| HttpOrbitClient::new(&base).ok())
+        .map(|client| client.revoke_refresh_token(&refresh));
+        if revoked == Some(Revoke::Revoked) {
+            println!("ORBIT revoked the refresh token.");
+        }
+    }
     Ok(())
+}
+
+/// The refresh token in the saved record, if there is one.
+pub fn saved_refresh_token() -> Option<String> {
+    KeychainTokenStore::new()
+        .load(Utc::now())
+        .ok()
+        .flatten()
+        .and_then(|token| token.refresh_token().map(str::to_string))
 }
 
 pub fn clear_keychain_token() -> Result<(), String> {

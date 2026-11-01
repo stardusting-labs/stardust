@@ -1,0 +1,22 @@
+{
+  "routing_key": "exampleroutingkey000000000000000",
+  "event_action": "trigger",
+  "dedup_key": "orbit-mp-41-key-exchange",
+  "payload": {
+    "summary": "api.example:443 key-exchange x25519 <!channel> & [docs](https://evil.example)",
+    "source": "helloorbit.app",
+    "severity": "critical",
+    "timestamp": "2026-10-26T00:00:00Z",
+    "component": "ORBIT",
+    "class": "finding",
+    "custom_details": { "alert_id": "mp-41-key-exchange", "severity": "high" }
+  },
+  "client": "Stardust",
+  "client_url": "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention",
+  "links": [
+    {
+      "href": "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention",
+      "text": "Open in ORBIT"
+    }
+  ]
+}

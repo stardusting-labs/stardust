@@ -29,6 +29,13 @@ pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_cod
 /// and field names with the contract owners before release.
 pub const REFRESH_GRANT_TYPE: &str = "refresh_token";
 pub const PATH_TOKEN_REFRESH: &str = PATH_DEVICE_TOKEN;
+/// RFC 7009 style revocation of a refresh token on sign-out.
+///
+/// TODO(Unsu): not in `docs/contracts/stardust-desktop-api-v1.md` yet
+/// (rust-orbit follow-up A). The client calls it only for a saved refresh
+/// token, treats a 404 as "not supported", and deletes the local copy
+/// either way.
+pub const PATH_DEVICE_REVOKE: &str = "/api/pqc/v1/account/device/revoke";
 pub const DEVICE_CODE_TTL_SECONDS: u64 = 600;
 pub const ACCESS_TOKEN_LIFETIME_SECONDS: u64 = 300;
 pub const WORKSPACE_FINDINGS: &str = "/rust-preview/pqc/studio/app/findings";
@@ -145,10 +152,22 @@ impl fmt::Debug for DeviceCodeResponse {
 }
 
 /// `POST /api/pqc/v1/account/device/token` body.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// `device_code` is a secret. Debug output redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceTokenRequest {
     pub grant_type: String,
     pub device_code: String,
+}
+
+impl fmt::Debug for DeviceTokenRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceTokenRequest")
+            .field("grant_type", &self.grant_type)
+            .field("device_code", &"<redacted>")
+            .finish()
+    }
 }
 
 /// `POST /api/pqc/v1/account/device/token` refresh body.
@@ -164,6 +183,23 @@ impl fmt::Debug for RefreshTokenRequest {
             .debug_struct("RefreshTokenRequest")
             .field("grant_type", &self.grant_type)
             .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `POST /api/pqc/v1/account/device/revoke` body, RFC 7009 section 2.1.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct RevokeRequest {
+    pub token: String,
+    pub token_type_hint: String,
+}
+
+impl fmt::Debug for RevokeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RevokeRequest")
+            .field("token", &"<redacted>")
+            .field("token_type_hint", &self.token_type_hint)
             .finish()
     }
 }
@@ -354,7 +390,10 @@ pub fn is_allowed_https_url(server_base: &str, candidate: &str) -> bool {
     let Some(rest) = candidate.strip_prefix("https://") else {
         return false;
     };
-    if candidate.contains([' ', '\\', '@']) || rest.is_empty() {
+    if candidate.contains([' ', '\\', '@'])
+        || candidate.chars().any(char::is_control)
+        || rest.is_empty()
+    {
         return false;
     }
     let (host_port, path) = match rest.split_once('/') {
@@ -372,7 +411,8 @@ pub fn verification_url(server_base: &str, response: &DeviceCodeResponse) -> Opt
         response.verification_uri.as_str()
     } else {
         response.verification_uri_complete.as_str()
-    };
+    }
+    .trim();
     is_allowed_https_url(server_base, candidate).then(|| candidate.to_string())
 }
 
@@ -646,6 +686,35 @@ mod tests {
             "http://127.0.0.1:9",
             "https://127.0.0.1/workspace/high"
         ));
+        for control in [
+            "https://helloorbit.app/account?user_code=AB\tCD",
+            "https://helloorbit.app/account\r\nX-Other: 1",
+            "https://helloorbit.app/account\u{7f}",
+        ] {
+            assert!(
+                !is_allowed_https_url(DEFAULT_SERVER_BASE, control),
+                "{control:?}"
+            );
+        }
+        let padded = super::DeviceCodeResponse {
+            device_code: "a".repeat(64),
+            user_code: "ABCD-EFGH".to_string(),
+            verification_uri: "https://helloorbit.app/account".to_string(),
+            verification_uri_complete: " https://helloorbit.app/account?user_code=ABCD-EFGH\n"
+                .to_string(),
+            expires_in: 600,
+            interval: 5,
+        };
+        assert_eq!(
+            super::verification_url(DEFAULT_SERVER_BASE, &padded).as_deref(),
+            Some("https://helloorbit.app/account?user_code=ABCD-EFGH"),
+            "the page that opens is the trimmed one"
+        );
+        let request = super::DeviceTokenRequest {
+            grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+            device_code: "b".repeat(64),
+        };
+        assert!(!format!("{request:?}").contains(&"b".repeat(64)));
         assert_eq!(bumped_interval(5, false), 5);
         assert_eq!(bumped_interval(5, true), 10);
         assert_eq!(bumped_interval(28, true), 30);

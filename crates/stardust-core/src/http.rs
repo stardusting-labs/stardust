@@ -8,9 +8,10 @@
 
 use crate::api::{
     bumped_interval, AlertsPage, DesktopApi, DesktopStatus, DeviceCodeResponse, DevicePoll,
-    DeviceTokenRequest, DeviceTokenResponse, OrbitError, RefreshTokenRequest,
+    DeviceTokenRequest, DeviceTokenResponse, OrbitError, RefreshTokenRequest, RevokeRequest,
     DEVICE_CODE_TTL_SECONDS, DEVICE_GRANT_TYPE, PATH_DESKTOP_ALERTS, PATH_DESKTOP_STATUS,
-    PATH_DEVICE_CODE, PATH_DEVICE_TOKEN, PATH_TOKEN_REFRESH, REFRESH_GRANT_TYPE,
+    PATH_DEVICE_CODE, PATH_DEVICE_REVOKE, PATH_DEVICE_TOKEN, PATH_TOKEN_REFRESH,
+    REFRESH_GRANT_TYPE,
 };
 use serde::Deserialize;
 use std::io::Read;
@@ -18,6 +19,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BODY_LIMIT: u64 = 65_536;
+
+/// Result of [`HttpOrbitClient::revoke_refresh_token`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Revoke {
+    Revoked,
+    /// The route is off or the server does not revoke refresh tokens.
+    Unsupported,
+    Unreachable,
+}
 
 pub struct HttpOrbitClient {
     base: String,
@@ -115,6 +125,29 @@ impl HttpOrbitClient {
         match oauth_error(&bytes) {
             Some(err) => Err(classify_code(status, err.code)),
             None => Err(classify_status(status)),
+        }
+    }
+
+    /// Ask ORBIT to forget a refresh token, RFC 7009 style.
+    ///
+    /// The route is optional. A 404, a 400 such as `unsupported_token_type`,
+    /// or no connection is [`Revoke::Unsupported`] or [`Revoke::Unreachable`].
+    /// The caller deletes its own copy in every case.
+    pub fn revoke_refresh_token(&self, refresh_token: &str) -> Revoke {
+        if !token_chars(refresh_token) {
+            return Revoke::Unsupported;
+        }
+        let request = RevokeRequest {
+            token: refresh_token.to_string(),
+            token_type_hint: REFRESH_GRANT_TYPE.to_string(),
+        };
+        let Ok(body) = serde_json::to_vec(&request) else {
+            return Revoke::Unsupported;
+        };
+        match self.exchange("POST", PATH_DEVICE_REVOKE, None, Some(&body)) {
+            Ok((200, _)) => Revoke::Revoked,
+            Ok((408 | 429 | 500..=599, _)) | Err(_) => Revoke::Unreachable,
+            Ok(_) => Revoke::Unsupported,
         }
     }
 
