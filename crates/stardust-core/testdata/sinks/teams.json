@@ -1,0 +1,42 @@
+{
+  "type": "message",
+  "attachments": [
+    {
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null,
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+          {
+            "type": "TextBlock",
+            "text": "ORBIT high-severity item",
+            "weight": "Bolder",
+            "size": "Medium",
+            "wrap": true
+          },
+          {
+            "type": "TextBlock",
+            "text": "api.example:443 key-exchange x25519 <!channel> & [docs] (https://evil.example)",
+            "wrap": true
+          },
+          {
+            "type": "FactSet",
+            "facts": [
+              { "title": "Severity", "value": "High" },
+              { "title": "Seen", "value": "2026-10-26T00:00:00Z" }
+            ]
+          }
+        ],
+        "actions": [
+          {
+            "type": "Action.OpenUrl",
+            "title": "Open in ORBIT",
+            "url": "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention"
+          }
+        ]
+      }
+    }
+  ]
+}

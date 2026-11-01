@@ -1,0 +1,10 @@
+{
+  "routing_key": "exampleroutingkey000000000000000",
+  "payload": {
+    "summary": "Stardust test message. Nothing needs attention.",
+    "timestamp": "2026-10-31T09:00:00Z",
+    "source": "helloorbit.app",
+    "custom_details": { "sent_by": "Stardust" }
+  },
+  "links": [{ "href": "https://helloorbit.app", "text": "Open in ORBIT" }]
+}

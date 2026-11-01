@@ -3,10 +3,13 @@
 //! URLs that contain a credential, signing secrets, and access tokens are
 //! not fields on these records. Callers keep them in the OS keychain.
 
+use crate::api::Severity;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const MAX_INTEGRATIONS: usize = 16;
+/// Upper bound for a per-sink `max_per_hour`.
+pub const MAX_PER_HOUR_LIMIT: u32 = 3_600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +19,8 @@ pub enum IntegrationKind {
     GenericJson,
     OrbitMcp,
     SlackMcp,
+    DiscordWebhook,
+    PagerDuty,
 }
 
 impl IntegrationKind {
@@ -26,6 +31,8 @@ impl IntegrationKind {
             "json" | "generic_json" => Some(Self::GenericJson),
             "orbit-mcp" | "orbit_mcp" => Some(Self::OrbitMcp),
             "slack-mcp" | "slack_mcp" => Some(Self::SlackMcp),
+            "discord" | "discord_webhook" => Some(Self::DiscordWebhook),
+            "pagerduty" | "pager_duty" => Some(Self::PagerDuty),
             _ => None,
         }
     }
@@ -37,13 +44,25 @@ impl IntegrationKind {
             Self::GenericJson => "generic_json",
             Self::OrbitMcp => "orbit_mcp",
             Self::SlackMcp => "slack_mcp",
+            Self::DiscordWebhook => "discord_webhook",
+            Self::PagerDuty => "pager_duty",
         }
     }
 
+    /// Kinds the check-schedule summary posts go to. Routing turned on
+    /// moves Slack and Teams to one message per alert instead.
     pub fn posts_webhook(self) -> bool {
         matches!(
             self,
             Self::SlackIncoming | Self::TeamsIncoming | Self::GenericJson
+        )
+    }
+
+    /// Kinds that take one message per alert when routing is on.
+    pub fn routes_alerts(self) -> bool {
+        matches!(
+            self,
+            Self::SlackIncoming | Self::TeamsIncoming | Self::DiscordWebhook | Self::PagerDuty
         )
     }
 }
@@ -82,6 +101,16 @@ pub fn catalog() -> &'static [CatalogEntry] {
             name: "Slack MCP",
             summary: "Optional Slack MCP sign-in. Off until a token is saved",
         },
+        CatalogEntry {
+            kind: IntegrationKind::DiscordWebhook,
+            name: "Discord",
+            summary: "Webhook embed for each new alert. Needs routing on",
+        },
+        CatalogEntry {
+            kind: IntegrationKind::PagerDuty,
+            name: "PagerDuty",
+            summary: "Events API v2 trigger for each new alert. Needs routing on",
+        },
     ]
 }
 
@@ -92,6 +121,8 @@ pub enum SecretSlot {
     AccessToken,
     RefreshToken,
     PkceVerifier,
+    /// PagerDuty Events API v2 integration key.
+    RoutingKey,
 }
 
 impl SecretSlot {
@@ -102,6 +133,7 @@ impl SecretSlot {
             Self::AccessToken => "access-token",
             Self::RefreshToken => "refresh-token",
             Self::PkceVerifier => "pkce-verifier",
+            Self::RoutingKey => "routing-key",
         }
     }
 }
@@ -122,6 +154,17 @@ pub struct IntegrationRecord {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// Routing only: alerts below this severity are not sent here. Unset
+    /// means high for PagerDuty and low for the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<Severity>,
+    /// Routing only: at most this many messages an hour. Unset means 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_hour: Option<u32>,
+    /// Routing only: a high-severity alert is still sent during quiet hours.
+    /// Unset means yes, the same rule the bubble follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_high_bypass: Option<bool>,
 }
 
 impl IntegrationRecord {
@@ -133,6 +176,9 @@ impl IntegrationRecord {
             host: None,
             endpoint: None,
             client_id: None,
+            min_severity: None,
+            max_per_hour: None,
+            quiet_high_bypass: None,
         })
     }
 }
@@ -151,6 +197,8 @@ pub enum IntegrationError {
     Full,
     #[error("the endpoint must be an https URL")]
     Endpoint,
+    #[error("max per hour must be 1 through 3600")]
+    Rate,
 }
 
 pub fn parse_id(value: &str) -> Result<String, IntegrationError> {
@@ -251,7 +299,7 @@ mod tests {
         assert!(catalog()
             .iter()
             .all(|entry| !entry.summary.to_ascii_lowercase().contains("chat")));
-        assert_eq!(catalog().len(), 5);
+        assert_eq!(catalog().len(), 7);
         let record = IntegrationRecord::new(IntegrationKind::SlackIncoming, "ops").unwrap();
         assert!(!record.enabled);
         assert_eq!(integrations_label(&[record]), "Integrations off");
@@ -259,5 +307,31 @@ mod tests {
             secret_account("ops", SecretSlot::Url),
             "integration/ops/url"
         );
+        assert_eq!(
+            secret_account("pd", SecretSlot::RoutingKey),
+            "integration/pd/routing-key"
+        );
+    }
+
+    #[test]
+    fn new_sink_kinds_parse_and_stay_out_of_the_summary_posts() {
+        assert_eq!(
+            IntegrationKind::parse("discord"),
+            Some(IntegrationKind::DiscordWebhook)
+        );
+        assert_eq!(
+            IntegrationKind::parse("PagerDuty"),
+            Some(IntegrationKind::PagerDuty)
+        );
+        for kind in [IntegrationKind::DiscordWebhook, IntegrationKind::PagerDuty] {
+            assert!(!kind.posts_webhook());
+            assert!(kind.routes_alerts());
+            assert_eq!(IntegrationKind::parse(kind.as_str()), Some(kind));
+        }
+        assert!(!IntegrationKind::GenericJson.routes_alerts());
+        assert!(IntegrationKind::SlackIncoming.routes_alerts());
+        let record = IntegrationRecord::new(IntegrationKind::PagerDuty, "pd").unwrap();
+        let text = serde_json::to_string(&record).unwrap();
+        assert_eq!(text, r#"{"id":"pd","kind":"pager_duty","enabled":false}"#);
     }
 }

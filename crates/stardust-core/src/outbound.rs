@@ -27,10 +27,22 @@ pub enum UrlError {
     Url,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A destination that passed [`public_https`]. Webhook URLs carry their
+/// credential in the path or query, so Debug output shows the host only.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CheckedUrl {
     pub url: String,
     pub host: String,
+}
+
+impl fmt::Debug for CheckedUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CheckedUrl")
+            .field("url", &"<redacted>")
+            .field("host", &self.host)
+            .finish()
+    }
 }
 
 pub fn public_https(value: &str) -> Result<CheckedUrl, UrlError> {
@@ -54,6 +66,47 @@ pub fn public_https(value: &str) -> Result<CheckedUrl, UrlError> {
         url: trimmed.to_string(),
         host,
     })
+}
+
+/// [`public_https`] that also accepts a query string, for webhook URLs that
+/// carry their signature there (Teams Workflows). The part before `?`
+/// passes the same checks. The query may hold percent escapes and nothing
+/// that changes the host, such as `@`, `#`, `\`, or a space.
+pub fn public_https_with_query(value: &str) -> Result<CheckedUrl, UrlError> {
+    let trimmed = value.trim();
+    let Some((base, query)) = trimmed.split_once('?') else {
+        return public_https(trimmed);
+    };
+    let checked = public_https(base)?;
+    if !base.trim_start_matches("https://").contains('/')
+        || query.is_empty()
+        || !query.bytes().all(|byte| byte.is_ascii_graphic())
+        || query.contains(['?', '#', '\\', '@'])
+        || !percent_escapes_are_whole(query)
+    {
+        return Err(UrlError::Url);
+    }
+    Ok(CheckedUrl {
+        url: trimmed.to_string(),
+        host: checked.host,
+    })
+}
+
+fn percent_escapes_are_whole(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = bytes.get(index + 1..index + 3);
+            if !pair.is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit)) {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 pub fn ip_is_blocked(ip: IpAddr) -> bool {
@@ -295,9 +348,11 @@ fn summary_body(items: &[AlertItem], window: &DeliveryWindow<'_>) -> Value {
 
 pub fn render_destination(kind: IntegrationKind, generic: &Value) -> Value {
     match kind {
-        IntegrationKind::GenericJson | IntegrationKind::OrbitMcp | IntegrationKind::SlackMcp => {
-            generic.clone()
-        }
+        IntegrationKind::GenericJson
+        | IntegrationKind::OrbitMcp
+        | IntegrationKind::SlackMcp
+        | IntegrationKind::DiscordWebhook
+        | IntegrationKind::PagerDuty => generic.clone(),
         IntegrationKind::SlackIncoming => slack_body(generic),
         IntegrationKind::TeamsIncoming => teams_body(generic),
     }
@@ -673,6 +728,37 @@ mod tests {
         assert_eq!(
             public_https("https://hooks.example/inbound").unwrap().host,
             "hooks.example"
+        );
+    }
+
+    #[test]
+    fn a_query_is_accepted_only_by_the_query_variant_and_only_after_a_path() {
+        use super::public_https_with_query;
+        let workflow = "https://prod-00.westus.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=AbC-123_x";
+        let checked = public_https_with_query(workflow).unwrap();
+        assert_eq!(checked.host, "prod-00.westus.logic.azure.com");
+        assert_eq!(checked.url, workflow);
+        assert!(public_https(workflow).is_err());
+        for refused in [
+            "http://prod-00.westus.logic.azure.com/workflows/a?sig=1",
+            "https://prod-00.westus.logic.azure.com?sig=1",
+            "https://prod-00.westus.logic.azure.com/workflows/a?",
+            "https://prod-00.westus.logic.azure.com/workflows/a?sig=1#frag",
+            "https://prod-00.westus.logic.azure.com/workflows/a?sig=1@evil.example",
+            "https://prod-00.westus.logic.azure.com/workflows/a?sig=%zz",
+            "https://prod-00.westus.logic.azure.com/workflows/a?sig=%2",
+            "https://prod-00.westus.logic.azure.com/workflows/a?sig=a b",
+            "https://user@prod-00.westus.logic.azure.com/workflows/a?sig=1",
+            "https://127.0.0.1/workflows/a?sig=1",
+            "https://localhost/workflows/a?sig=1",
+        ] {
+            assert!(public_https_with_query(refused).is_err(), "{refused}");
+        }
+        assert_eq!(
+            public_https_with_query("https://hooks.example/inbound")
+                .unwrap()
+                .url,
+            "https://hooks.example/inbound"
         );
     }
 }

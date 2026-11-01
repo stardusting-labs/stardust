@@ -23,8 +23,13 @@ impl Refresher for crate::http::HttpOrbitClient {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Access {
     /// A live access token. `refreshed` is true when it came from a refresh
-    /// in this call.
-    Ready { token: StoredToken, refreshed: bool },
+    /// in this call. `unsaved` is true when the keychain did not take the
+    /// refreshed record, so the caller can say so.
+    Ready {
+        token: StoredToken,
+        refreshed: bool,
+        unsaved: bool,
+    },
     /// No usable record. The user needs to sign in.
     SignedOut,
     /// The refresh request did not reach the server or was not readable. The
@@ -102,6 +107,7 @@ pub fn current_access(
         return Access::Ready {
             token: stored,
             refreshed: false,
+            unsaved: false,
         };
     }
     let (Some(refresher), Some(refresh_token)) = (refresher, stored.refresh_token()) else {
@@ -116,12 +122,15 @@ pub fn current_access(
         Ok(response) => match stored_from_response(response, now) {
             Ok(next) => {
                 let next = next.keep_refresh_from(&stored);
-                if store.store(&next).is_err() {
-                    return Access::Unavailable(OrbitError::Refused);
-                }
+                // The server has spent the old refresh token. If the keychain
+                // will not take the new record, this check still uses the new
+                // access token instead of presenting a spent token again; the
+                // next refresh then signs out.
+                let unsaved = store.store(&next).is_err();
                 Access::Ready {
                     token: next,
                     refreshed: true,
+                    unsaved,
                 }
             }
             Err(err) => Access::Unavailable(err),
@@ -188,7 +197,7 @@ mod tests {
             false,
         );
         assert!(
-            matches!(got, Access::Ready { refreshed: false, ref token } if token.access_token() == "access-1")
+            matches!(got, Access::Ready { refreshed: false, ref token, .. } if token.access_token() == "access-1")
         );
         assert!(refresher.seen.borrow().is_empty());
     }
@@ -203,10 +212,16 @@ mod tests {
         let later = now + TimeDelta::minutes(20);
         let refresher = fake(Ok(response("access-2", None)));
         let got = current_access(&store, Some(&refresher), later, false);
-        let Access::Ready { token, refreshed } = got else {
+        let Access::Ready {
+            token,
+            refreshed,
+            unsaved,
+        } = got
+        else {
             panic!("expected a refreshed token");
         };
         assert!(refreshed);
+        assert!(!unsaved);
         assert_eq!(token.access_token(), "access-2");
         assert_eq!(token.refresh_token(), Some("refresh-1"));
         assert_eq!(refresher.seen.borrow().as_slice(), ["refresh-1"]);
@@ -237,8 +252,10 @@ mod tests {
             .unwrap();
         let refresher = fake(Ok(response("access-2", Some("refresh-2"))));
         let got = current_access(&store, Some(&refresher), now, true);
-        assert!(matches!(got, Access::Ready { refreshed: true, ref token }
-            if token.access_token() == "access-2" && token.refresh_token() == Some("refresh-2")));
+        assert!(
+            matches!(got, Access::Ready { refreshed: true, ref token, .. }
+            if token.access_token() == "access-2" && token.refresh_token() == Some("refresh-2"))
+        );
     }
 
     #[test]
@@ -296,6 +313,186 @@ mod tests {
             current_access(&demo_store, None, now + TimeDelta::seconds(11), false),
             Access::SignedOut
         );
+    }
+
+    #[test]
+    fn a_locked_keychain_after_a_refresh_still_lets_this_check_run() {
+        use crate::token::TokenError;
+        /// Reads the seeded record and refuses every write.
+        struct Locked(MemoryTokenStore);
+        impl TokenStore for Locked {
+            fn store(&self, _token: &StoredToken) -> Result<(), TokenError> {
+                Err(TokenError::Keychain)
+            }
+            fn load(&self, now: chrono::DateTime<Utc>) -> Result<Option<StoredToken>, TokenError> {
+                self.0.load(now)
+            }
+            fn clear(&self) -> Result<(), TokenError> {
+                self.0.clear()
+            }
+        }
+        let now = Utc::now();
+        let seeded = MemoryTokenStore::new();
+        seeded
+            .store(&stored_from_response(response("access-1", Some("refresh-1")), now).unwrap())
+            .unwrap();
+        let locked = Locked(seeded);
+        let refresher = fake(Ok(response("access-2", Some("refresh-2"))));
+        let got = current_access(
+            &locked,
+            Some(&refresher),
+            now + TimeDelta::minutes(20),
+            false,
+        );
+        assert!(
+            matches!(got, Access::Ready { refreshed: true, unsaved: true, ref token } if token.access_token() == "access-2"),
+            "the spent refresh token is not presented again in this check, and the caller hears why"
+        );
+    }
+
+    /// A server that rotates: each refresh token works once and the answer
+    /// carries the next one. A reused token is `invalid_grant`.
+    fn rotating_server() -> crate::testserver::TestServer {
+        use crate::testserver::{Reply, TestServer};
+        let used = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        TestServer::start(move |request| {
+            if request.path() == crate::api::PATH_DEVICE_REVOKE {
+                return Reply::json(200, "{}");
+            }
+            let body = request.json();
+            let presented = body["refresh_token"].as_str().unwrap_or("").to_string();
+            let mut used = used.lock().unwrap();
+            let fresh = presented.starts_with("refresh-") && !used.contains(&presented);
+            if !fresh || body["grant_type"] != "refresh_token" {
+                return Reply::json(400, r#"{"error":"invalid_grant"}"#);
+            }
+            used.push(presented.clone());
+            let n: u32 = presented["refresh-".len()..].parse().unwrap_or(0) + 1;
+            Reply::json(
+                200,
+                &format!(
+                    r#"{{"token":"access-{n}","access_token":"access-{n}","token_type":"Bearer","expires_in":300,"expires_at_epoch_ms":4102444800000,"refresh_token":"refresh-{n}","refresh_expires_in":86400}}"#
+                ),
+            )
+        })
+    }
+
+    #[test]
+    fn a_local_server_rotates_the_refresh_token_on_every_use() {
+        let server = rotating_server();
+        let client = crate::http::HttpOrbitClient::with_timeout(
+            &server.base(),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let store = MemoryTokenStore::new();
+        store
+            .store(&stored_from_response(response("access-1", Some("refresh-1")), now).unwrap())
+            .unwrap();
+        let mut at = now;
+        for expected in 2..=4 {
+            at += TimeDelta::minutes(6);
+            let Access::Ready {
+                token, refreshed, ..
+            } = current_access(&store, Some(&client), at, false)
+            else {
+                panic!("expected a refreshed token");
+            };
+            assert!(refreshed);
+            assert_eq!(token.access_token(), format!("access-{expected}"));
+            let kept = store.load(at).unwrap().unwrap();
+            assert_eq!(
+                kept.refresh_token(),
+                Some(format!("refresh-{expected}").as_str()),
+                "the stored refresh token is replaced on each use"
+            );
+        }
+        assert_eq!(server.count(crate::api::PATH_DEVICE_TOKEN), 3);
+        let bodies: Vec<String> = server.requests().into_iter().map(|r| r.body).collect();
+        assert!(bodies[0].contains(r#""refresh_token":"refresh-1""#));
+        assert!(bodies[2].contains(r#""refresh_token":"refresh-3""#));
+    }
+
+    #[test]
+    fn invalid_grant_from_a_local_server_clears_the_keychain_record() {
+        let server = rotating_server();
+        let client = crate::http::HttpOrbitClient::with_timeout(
+            &server.base(),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let store = MemoryTokenStore::new();
+        store
+            .store(
+                &stored_from_response(response("access-1", Some("stolen-refresh")), now).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            current_access(&store, Some(&client), now + TimeDelta::minutes(6), false),
+            Access::SignedOut
+        );
+        assert!(store.load(now + TimeDelta::minutes(6)).unwrap().is_none());
+        assert_eq!(server.count(crate::api::PATH_DEVICE_TOKEN), 1);
+        assert_eq!(
+            current_access(&store, Some(&client), now + TimeDelta::minutes(7), false),
+            Access::SignedOut,
+            "signed out stays signed out; no second request"
+        );
+        assert_eq!(server.count(crate::api::PATH_DEVICE_TOKEN), 1);
+    }
+
+    #[test]
+    fn revoke_is_optional_on_the_server() {
+        use crate::http::{HttpOrbitClient, Revoke};
+        use crate::testserver::{Reply, TestServer};
+        let timeout = std::time::Duration::from_secs(2);
+        let supported = rotating_server();
+        let client = HttpOrbitClient::with_timeout(&supported.base(), timeout).unwrap();
+        assert_eq!(client.revoke_refresh_token("refresh-9"), Revoke::Revoked);
+        let request = supported.requests().pop().unwrap();
+        assert_eq!(request.path(), crate::api::PATH_DEVICE_REVOKE);
+        assert_eq!(
+            request.json(),
+            serde_json::json!({ "token": "refresh-9", "token_type_hint": "refresh_token" })
+        );
+        let missing = TestServer::start(|_| Reply::empty(404));
+        let client = HttpOrbitClient::with_timeout(&missing.base(), timeout).unwrap();
+        assert_eq!(
+            client.revoke_refresh_token("refresh-9"),
+            Revoke::Unsupported
+        );
+        let refuses =
+            TestServer::start(|_| Reply::json(400, r#"{"error":"unsupported_token_type"}"#));
+        let client = HttpOrbitClient::with_timeout(&refuses.base(), timeout).unwrap();
+        assert_eq!(
+            client.revoke_refresh_token("refresh-9"),
+            Revoke::Unsupported
+        );
+        let busy = TestServer::start(|_| Reply::json(503, "{}"));
+        let client = HttpOrbitClient::with_timeout(&busy.base(), timeout).unwrap();
+        assert_eq!(
+            client.revoke_refresh_token("refresh-9"),
+            Revoke::Unreachable
+        );
+        let closed = HttpOrbitClient::with_timeout("http://127.0.0.1:1", timeout).unwrap();
+        assert_eq!(
+            closed.revoke_refresh_token("refresh-9"),
+            Revoke::Unreachable
+        );
+        assert_eq!(
+            closed.revoke_refresh_token("has space"),
+            Revoke::Unsupported
+        );
+        let rendered = format!(
+            "{:?}",
+            crate::api::RevokeRequest {
+                token: "refresh-9".to_string(),
+                token_type_hint: "refresh_token".to_string(),
+            }
+        );
+        assert!(!rendered.contains("refresh-9"));
     }
 
     #[test]

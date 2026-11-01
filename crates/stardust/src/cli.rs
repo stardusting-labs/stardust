@@ -1,4 +1,5 @@
-use stardust_core::config::{FieldUpdate, ScheduleUpdate};
+use stardust_core::api::Severity;
+use stardust_core::config::{Feature, FieldUpdate, RoutingUpdate, ScheduleUpdate};
 use stardust_core::i18n::Language;
 use stardust_core::schedule::parse_interval;
 use std::path::PathBuf;
@@ -31,6 +32,27 @@ pub enum IntegrationAction {
     Connect {
         id: String,
     },
+    /// PagerDuty Events API v2 routing key, kept in the keychain.
+    Key {
+        id: String,
+        key: String,
+    },
+    /// Per-sink routing rules: minimum severity, hourly limit, quiet-hours
+    /// bypass for high-severity alerts.
+    Route {
+        id: String,
+        update: RoutingUpdate,
+    },
+    /// Post the fixed test message now.
+    Test {
+        id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureAction {
+    List,
+    Set { feature: Feature, on: bool },
 }
 
 pub enum Command {
@@ -47,7 +69,13 @@ pub enum Command {
     SignIn {
         config: Option<PathBuf>,
     },
-    SignOut,
+    SignOut {
+        config: Option<PathBuf>,
+    },
+    Feature {
+        config: Option<PathBuf>,
+        action: FeatureAction,
+    },
     Autostart(AutostartAction),
     Language {
         config: Option<PathBuf>,
@@ -106,6 +134,11 @@ Usage:
   stardust [--config PATH] integration token ID TOKEN
   stardust [--config PATH] integration oauth ID --client-id CLIENT_ID
   stardust [--config PATH] integration connect ID
+  stardust [--config PATH] integration key ID ROUTING_KEY
+  stardust [--config PATH] integration route ID [route options]
+  stardust [--config PATH] integration test ID
+  stardust [--config PATH] feature list
+  stardust [--config PATH] feature NAME on|off
 
 Schedule options:
   --interval DURATION    1 minute through 24 hours, such as 45m or 2h
@@ -116,6 +149,11 @@ Schedule options:
   --clear-interval
   --clear-times
   --clear-quiet
+
+Route options:
+  --min-severity LEVEL   low, medium, high, or default (high for PagerDuty, low for the rest)
+  --max-per-hour N       1 through 3600, or default (30)
+  --quiet-bypass on|off  high-severity alerts still go out during quiet hours, or default (on)
 
 The tray lists 1, 30, and 60 minute suggestions. A typed interval is set with schedule set.
 Checks run at the next interval step or clock time, whichever comes first.
@@ -129,8 +167,16 @@ autostart on starts Stardust when you log in. It is off until you turn it on.
 language sets English or Korean. auto follows the system locale.
 --demo uses sample items and does not contact ORBIT.
 
-KIND is slack, teams, json, orbit-mcp, or slack-mcp.
-Every integration stays off until enable. A destination URL, signing secret, and access token stay in the system keychain.
+KIND is slack, teams, json, discord, pagerduty, orbit-mcp, or slack-mcp.
+Every integration stays off until enable. A destination URL, signing secret, routing key, and access token stay in the system keychain.
+Pass - as URL, SIGNING_SECRET, TOKEN, or ROUTING_KEY to read it from standard input, which keeps it out of the process list and shell history.
+
+NAME is auto-sign-in, jittered-backoff, or routing. Each feature is off until turned on.
+auto-sign-in opens the ORBIT sign-in page from the check timer on the first start and shows the connection in the tray.
+jittered-backoff waits a random time, up to a limit that doubles and stops at 15 minutes, after a failed check.
+routing sends one message per new alert to each enabled slack, teams, discord, and pagerduty integration,
+using its minimum severity, hourly limit, and quiet hours, and adds a Send test item for each to the tray.
+With routing on, teams takes a Workflows webhook URL. pagerduty takes the Events API v2 URL, or none for the US one, and a routing key.
 "
     .to_string()
 }
@@ -199,6 +245,7 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
         "schedule" => parse_schedule(&args, index + 1, config),
         "character" => parse_character(&args, index + 1, config),
         "integration" => parse_integration(&args, index + 1, config),
+        "feature" => parse_feature(&args, index + 1, config),
         "sign-in" => {
             if demo {
                 return Err("demo mode does not sign in".to_string());
@@ -212,7 +259,7 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
             if index + 1 != args.len() {
                 return Err("sign-out takes no further arguments".to_string());
             }
-            Ok(Command::SignOut)
+            Ok(Command::SignOut { config })
         }
         "autostart" => {
             let action = match args.get(index + 1).map(String::as_str) {
@@ -454,9 +501,107 @@ fn parse_integration(
         "connect" => IntegrationAction::Connect {
             id: one_id(args, index)?,
         },
+        "key" => {
+            let id = required(args, index, "id")?;
+            let key = required(args, index + 1, "routing key")?;
+            index += 2;
+            finish(index, args.len())?;
+            IntegrationAction::Key { id, key }
+        }
+        "route" => {
+            let id = required(args, index, "id")?;
+            let update = parse_route(&args[index + 1..])?;
+            IntegrationAction::Route { id, update }
+        }
+        "test" => IntegrationAction::Test {
+            id: one_id(args, index)?,
+        },
         other => return Err(format!("unknown integration command {other}")),
     };
     Ok(Command::Integration { config, action })
+}
+
+fn parse_route(args: &[String]) -> Result<RoutingUpdate, String> {
+    let mut update = RoutingUpdate::default();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !matches!(flag, "--min-severity" | "--max-per-hour" | "--quiet-bypass") {
+            return Err(format!("unknown route option {flag}"));
+        }
+        let value = args
+            .get(index + 1)
+            .filter(|item| !item.starts_with("--"))
+            .map(String::as_str)
+            .ok_or_else(|| format!("missing value after {flag}"))?;
+        match flag {
+            "--min-severity" => {
+                if update.min_severity.is_some() {
+                    return Err("repeat --min-severity once".to_string());
+                }
+                update.min_severity = Some(match value {
+                    "default" => FieldUpdate::Clear,
+                    "low" => FieldUpdate::Set(Severity::Low),
+                    "medium" => FieldUpdate::Set(Severity::Medium),
+                    "high" => FieldUpdate::Set(Severity::High),
+                    _ => {
+                        return Err("--min-severity takes low, medium, high, or default".to_string())
+                    }
+                });
+            }
+            "--max-per-hour" => {
+                if update.max_per_hour.is_some() {
+                    return Err("repeat --max-per-hour once".to_string());
+                }
+                update.max_per_hour = Some(match value {
+                    "default" => FieldUpdate::Clear,
+                    number => FieldUpdate::Set(number.parse::<u32>().map_err(|_| {
+                        "--max-per-hour takes 1 through 3600, or default".to_string()
+                    })?),
+                });
+            }
+            _ => {
+                if update.quiet_high_bypass.is_some() {
+                    return Err("repeat --quiet-bypass once".to_string());
+                }
+                update.quiet_high_bypass = Some(match value {
+                    "default" => FieldUpdate::Clear,
+                    "on" => FieldUpdate::Set(true),
+                    "off" => FieldUpdate::Set(false),
+                    _ => return Err("--quiet-bypass takes on, off, or default".to_string()),
+                });
+            }
+        }
+        index += 2;
+    }
+    if update == RoutingUpdate::default() {
+        return Err("integration route needs at least one option".to_string());
+    }
+    Ok(update)
+}
+
+fn parse_feature(
+    args: &[String],
+    index: usize,
+    config: Option<PathBuf>,
+) -> Result<Command, String> {
+    let rest = &args[index.min(args.len())..];
+    let action = match rest {
+        [list] if list == "list" => FeatureAction::List,
+        [name, state] => {
+            let feature = Feature::parse(name).ok_or_else(|| {
+                format!("unknown feature {name}; use auto-sign-in, jittered-backoff, or routing")
+            })?;
+            let on = match state.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err("feature takes on or off".to_string()),
+            };
+            FeatureAction::Set { feature, on }
+        }
+        _ => return Err("feature takes list, or a name and on or off".to_string()),
+    };
+    Ok(Command::Feature { config, action })
 }
 
 fn required(args: &[String], index: usize, name: &str) -> Result<String, String> {
@@ -597,5 +742,145 @@ mod tests {
         assert!(parse(["--demo", "sign-in"]).is_err());
         assert!(parse(["--demo", "--check-once"]).is_ok());
         assert!(!usage().to_ascii_lowercase().contains("chat"));
+    }
+
+    #[test]
+    fn features_are_listed_and_switched_by_name() {
+        use super::FeatureAction;
+        use stardust_core::config::Feature;
+        assert!(matches!(
+            parse(["--config", "/tmp/s.json", "feature", "list"]).unwrap(),
+            Command::Feature {
+                config: Some(_),
+                action: FeatureAction::List
+            }
+        ));
+        assert!(matches!(
+            parse(["feature", "auto-sign-in", "on"]).unwrap(),
+            Command::Feature {
+                action: FeatureAction::Set {
+                    feature: Feature::AutoSignIn,
+                    on: true
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(["feature", "routing", "off"]).unwrap(),
+            Command::Feature {
+                action: FeatureAction::Set {
+                    feature: Feature::Routing,
+                    on: false
+                },
+                ..
+            }
+        ));
+        for refused in [
+            &["feature"][..],
+            &["feature", "list", "now"],
+            &["feature", "telemetry", "on"],
+            &["feature", "routing", "yes"],
+            &["feature", "routing"],
+            &["feature", "routing", "on", "now"],
+        ] {
+            assert!(parse(refused.iter().copied()).is_err(), "{refused:?}");
+        }
+        assert!(matches!(
+            parse(["--config", "/tmp/s.json", "sign-out"]).unwrap(),
+            Command::SignOut { config: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn routing_commands_parse_keys_rules_and_test_sends() {
+        use super::IntegrationAction;
+        use stardust_core::api::Severity;
+        use stardust_core::config::{FieldUpdate, RoutingUpdate};
+        let Command::Integration {
+            action: IntegrationAction::Key { id, key },
+            ..
+        } = parse([
+            "integration",
+            "key",
+            "pd",
+            "exampleroutingkey000000000000000",
+        ])
+        .unwrap()
+        else {
+            panic!("expected key");
+        };
+        assert_eq!(id, "pd");
+        assert_eq!(key, "exampleroutingkey000000000000000");
+        let Command::Integration {
+            action: IntegrationAction::Route { id, update },
+            ..
+        } = parse([
+            "integration",
+            "route",
+            "ops",
+            "--min-severity",
+            "medium",
+            "--max-per-hour",
+            "12",
+            "--quiet-bypass",
+            "off",
+        ])
+        .unwrap()
+        else {
+            panic!("expected route");
+        };
+        assert_eq!(id, "ops");
+        assert_eq!(
+            update,
+            RoutingUpdate {
+                min_severity: Some(FieldUpdate::Set(Severity::Medium)),
+                max_per_hour: Some(FieldUpdate::Set(12)),
+                quiet_high_bypass: Some(FieldUpdate::Set(false)),
+            }
+        );
+        let Command::Integration {
+            action: IntegrationAction::Route { update, .. },
+            ..
+        } = parse(["integration", "route", "ops", "--max-per-hour", "default"]).unwrap()
+        else {
+            panic!("expected route");
+        };
+        assert_eq!(update.max_per_hour, Some(FieldUpdate::Clear));
+        assert_eq!(update.min_severity, None);
+        assert!(matches!(
+            parse(["integration", "test", "ops"]).unwrap(),
+            Command::Integration {
+                action: IntegrationAction::Test { .. },
+                ..
+            }
+        ));
+        for refused in [
+            &["integration", "key", "pd"][..],
+            &["integration", "key", "pd", "k", "extra"],
+            &["integration", "route", "ops"],
+            &["integration", "route", "ops", "--min-severity"],
+            &["integration", "route", "ops", "--min-severity", "urgent"],
+            &["integration", "route", "ops", "--max-per-hour", "many"],
+            &["integration", "route", "ops", "--max-per-hour", "-1"],
+            &["integration", "route", "ops", "--quiet-bypass", "maybe"],
+            &[
+                "integration",
+                "route",
+                "ops",
+                "--min-severity",
+                "low",
+                "--min-severity",
+                "high",
+            ],
+            &["integration", "route", "ops", "--loud", "on"],
+            &["integration", "test"],
+            &["integration", "test", "ops", "extra"],
+        ] {
+            assert!(parse(refused.iter().copied()).is_err(), "{refused:?}");
+        }
+        let help = usage();
+        assert!(help.contains("feature NAME on|off"));
+        assert!(help.contains("integration route ID"));
+        assert!(help.contains("discord, pagerduty"));
     }
 }

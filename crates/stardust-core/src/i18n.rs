@@ -110,9 +110,16 @@ pub enum Msg {
     SkinAstronaut,
     SkinStar,
     NoInterval,
+    ConnectConnecting,
+    ConnectConnected,
+    ConnectSignedOut,
+    ConnectOffline,
+    MenuSendTest,
+    TestSent,
+    TestFailed,
 }
 
-pub const ALL_MSGS: [Msg; 32] = [
+pub const ALL_MSGS: [Msg; 39] = [
     Msg::MenuPet,
     Msg::MenuCheckNow,
     Msg::MenuQuit,
@@ -145,6 +152,13 @@ pub const ALL_MSGS: [Msg; 32] = [
     Msg::SkinAstronaut,
     Msg::SkinStar,
     Msg::NoInterval,
+    Msg::ConnectConnecting,
+    Msg::ConnectConnected,
+    Msg::ConnectSignedOut,
+    Msg::ConnectOffline,
+    Msg::MenuSendTest,
+    Msg::TestSent,
+    Msg::TestFailed,
 ];
 
 pub fn tr(language: Language, msg: Msg) -> &'static str {
@@ -188,6 +202,13 @@ fn english(msg: Msg) -> &'static str {
         Msg::SkinAstronaut => "Astronaut",
         Msg::SkinStar => "Star",
         Msg::NoInterval => "set times only",
+        Msg::ConnectConnecting => "ORBIT: Connecting...",
+        Msg::ConnectConnected => "ORBIT: Connected",
+        Msg::ConnectSignedOut => "ORBIT: Signed out",
+        Msg::ConnectOffline => "ORBIT: Offline",
+        Msg::MenuSendTest => "Send test",
+        Msg::TestSent => "Test sent",
+        Msg::TestFailed => "Test did not go through",
     }
 }
 
@@ -225,6 +246,13 @@ fn korean(msg: Msg) -> &'static str {
         Msg::SkinAstronaut => "우주인",
         Msg::SkinStar => "별",
         Msg::NoInterval => "정한 시각에만",
+        Msg::ConnectConnecting => "ORBIT: 연결 중...",
+        Msg::ConnectConnected => "ORBIT: 연결됨",
+        Msg::ConnectSignedOut => "ORBIT: 로그아웃됨",
+        Msg::ConnectOffline => "ORBIT: 오프라인",
+        Msg::MenuSendTest => "테스트 보내기",
+        Msg::TestSent => "테스트를 보냈어요",
+        Msg::TestFailed => "테스트를 보내지 못했어요",
     }
 }
 

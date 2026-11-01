@@ -73,6 +73,68 @@ pub enum ConfigError {
     Language,
 }
 
+/// Switches for newer behaviour. Every one is off until turned on, and a
+/// file with all of them off is written without this section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Features {
+    /// First start without a token signs in through the browser from the
+    /// check timer, and the tray shows the connection state.
+    #[serde(default)]
+    pub auto_sign_in: bool,
+    /// Backoff after a failed check picks a random wait under a doubling
+    /// ceiling, capped at 15 minutes.
+    #[serde(default)]
+    pub jittered_backoff: bool,
+    /// One message per new alert to each enabled Slack, Teams, Discord, or
+    /// PagerDuty integration, with severity, rate, quiet-hours, and
+    /// do-not-disturb rules.
+    #[serde(default)]
+    pub routing: bool,
+}
+
+impl Features {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feature {
+    AutoSignIn,
+    JitteredBackoff,
+    Routing,
+}
+
+impl Feature {
+    pub const ALL: [Self; 3] = [Self::AutoSignIn, Self::JitteredBackoff, Self::Routing];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto-sign-in" | "auto_sign_in" => Some(Self::AutoSignIn),
+            "jittered-backoff" | "jittered_backoff" => Some(Self::JitteredBackoff),
+            "routing" => Some(Self::Routing),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AutoSignIn => "auto-sign-in",
+            Self::JitteredBackoff => "jittered-backoff",
+            Self::Routing => "routing",
+        }
+    }
+}
+
+/// A change to one routing field. `None` leaves the field alone.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RoutingUpdate {
+    pub min_severity: Option<FieldUpdate<crate::api::Severity>>,
+    pub max_per_hour: Option<FieldUpdate<u32>>,
+    pub quiet_high_bypass: Option<FieldUpdate<bool>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScheduleFile {
@@ -109,6 +171,8 @@ struct ConfigFile {
     /// True after the first-run window was closed once.
     #[serde(default)]
     onboarded: bool,
+    #[serde(default, skip_serializing_if = "Features::is_default")]
+    features: Features,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,8 +203,63 @@ impl Config {
             server_base_url: None,
             language: None,
             onboarded: false,
+            features: Features::default(),
         };
         Self::from_file(file)
+    }
+
+    pub fn features(&self) -> Features {
+        self.file.features
+    }
+
+    pub fn feature(&self, feature: Feature) -> bool {
+        let features = self.file.features;
+        match feature {
+            Feature::AutoSignIn => features.auto_sign_in,
+            Feature::JitteredBackoff => features.jittered_backoff,
+            Feature::Routing => features.routing,
+        }
+    }
+
+    pub fn set_feature(&mut self, feature: Feature, on: bool) {
+        let features = &mut self.file.features;
+        match feature {
+            Feature::AutoSignIn => features.auto_sign_in = on,
+            Feature::JitteredBackoff => features.jittered_backoff = on,
+            Feature::Routing => features.routing = on,
+        }
+    }
+
+    pub fn set_integration_routing(
+        &mut self,
+        id: &str,
+        update: &RoutingUpdate,
+    ) -> Result<(), IntegrationError> {
+        if let Some(FieldUpdate::Set(limit)) = update.max_per_hour {
+            if !valid_rate(limit) {
+                return Err(IntegrationError::Rate);
+            }
+        }
+        let record = self.integration_mut(id)?;
+        if let Some(change) = &update.min_severity {
+            record.min_severity = match change {
+                FieldUpdate::Set(severity) => Some(*severity),
+                FieldUpdate::Clear => None,
+            };
+        }
+        if let Some(change) = &update.max_per_hour {
+            record.max_per_hour = match change {
+                FieldUpdate::Set(limit) => Some(*limit),
+                FieldUpdate::Clear => None,
+            };
+        }
+        if let Some(change) = &update.quiet_high_bypass {
+            record.quiet_high_bypass = match change {
+                FieldUpdate::Set(bypass) => Some(*bypass),
+                FieldUpdate::Clear => None,
+            };
+        }
+        Ok(())
     }
 
     /// Saved language choice, or `None` to follow the system locale.
@@ -387,8 +506,15 @@ fn validate_integrations(records: &[IntegrationRecord]) -> Result<(), Integratio
                 return Err(IntegrationError::Id);
             }
         }
+        if record.max_per_hour.is_some_and(|limit| !valid_rate(limit)) {
+            return Err(IntegrationError::Rate);
+        }
     }
     Ok(())
+}
+
+fn valid_rate(limit: u32) -> bool {
+    (1..=crate::integrations::MAX_PER_HOUR_LIMIT).contains(&limit)
 }
 
 fn deserialize_pet_scale<'de, D>(deserializer: D) -> Result<PetScale, D::Error>
@@ -770,6 +896,70 @@ mod tests {
         );
         let unknown = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"language":"fr","schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
         assert!(parse_config(unknown).is_err());
+    }
+
+    #[test]
+    fn new_features_start_off_and_an_untouched_file_is_written_as_before() {
+        use super::{Feature, RoutingUpdate};
+        use crate::api::Severity;
+        use crate::integrations::{IntegrationError, IntegrationKind};
+        let mut config = Config::default_for("UTC").unwrap();
+        for feature in Feature::ALL {
+            assert!(!config.feature(feature), "{}", feature.name());
+            assert_eq!(Feature::parse(feature.name()), Some(feature));
+        }
+        let text = config.to_json().unwrap();
+        assert!(!text.contains("features"));
+        assert!(!text.contains("min_severity"));
+        let minimal = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"},"integrations":[{"id":"ops","kind":"slack_incoming","enabled":true,"host":"hooks.slack.com"}]}"#;
+        let old = parse_config(minimal).unwrap();
+        assert_eq!(old.features(), super::Features::default());
+        assert_eq!(old.integrations()[0].min_severity, None);
+
+        config.set_feature(Feature::Routing, true);
+        config.set_feature(Feature::AutoSignIn, true);
+        config
+            .add_integration(IntegrationKind::PagerDuty, "pd")
+            .unwrap();
+        config
+            .set_integration_routing(
+                "pd",
+                &RoutingUpdate {
+                    min_severity: Some(FieldUpdate::Set(Severity::Medium)),
+                    max_per_hour: Some(FieldUpdate::Set(12)),
+                    quiet_high_bypass: Some(FieldUpdate::Set(false)),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            config.set_integration_routing(
+                "pd",
+                &RoutingUpdate {
+                    max_per_hour: Some(FieldUpdate::Set(0)),
+                    ..RoutingUpdate::default()
+                },
+            ),
+            Err(IntegrationError::Rate)
+        );
+        let text = config.to_json().unwrap();
+        assert!(text.contains("\"routing\": true"));
+        assert!(text.contains("\"auto_sign_in\": true"));
+        assert!(!text.contains("routing-key"));
+        let loaded = parse_config(&text).unwrap();
+        assert!(loaded.feature(Feature::Routing));
+        assert!(loaded.feature(Feature::AutoSignIn));
+        assert!(!loaded.feature(Feature::JitteredBackoff));
+        let record = &loaded.integrations()[0];
+        assert_eq!(record.min_severity, Some(Severity::Medium));
+        assert_eq!(record.max_per_hour, Some(12));
+        assert_eq!(record.quiet_high_bypass, Some(false));
+        let too_fast = text.replace("\"max_per_hour\": 12", "\"max_per_hour\": 99999");
+        assert!(parse_config(&too_fast).is_err());
+        let unknown = text.replace("\"routing\": true", "\"routing\": true, \"other\": true");
+        assert!(parse_config(&unknown).is_err());
+        config.set_feature(Feature::Routing, false);
+        config.set_feature(Feature::AutoSignIn, false);
+        assert!(!config.to_json().unwrap().contains("features"));
     }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);

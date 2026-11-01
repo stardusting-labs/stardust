@@ -23,6 +23,8 @@ pub enum CheckKind {
 pub struct CheckOutcome {
     pub presentation: Presentation,
     pub items: Vec<AlertItem>,
+    /// The status route's workspace page, the link when no item has one.
+    pub workspace_path: String,
 }
 
 pub async fn perform_check<C: DesktopApi + Sync>(
@@ -50,6 +52,7 @@ pub async fn perform_check<C: DesktopApi + Sync>(
     Ok(CheckOutcome {
         presentation,
         items,
+        workspace_path: status.workspace_path,
     })
 }
 
@@ -85,6 +88,37 @@ pub fn retry_delay(schedule_delay: Duration, failures: u32) -> Duration {
     } else {
         delay
     }
+}
+
+/// Longest wait [`full_jitter`] picks.
+pub const BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+/// First backoff ceiling. It doubles after each further soft failure.
+pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
+
+/// Exponential backoff with full jitter: a wait picked evenly from zero up to
+/// `min(BACKOFF_CAP, BACKOFF_BASE * 2^(failures - 1))`.
+///
+/// `entropy` is any random number; tests pass fixed values.
+pub fn full_jitter(failures: u32, entropy: u64) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let shift = failures.saturating_sub(1).min(16);
+    let base = u64::try_from(BACKOFF_BASE.as_millis()).unwrap_or(u64::MAX);
+    let cap = u64::try_from(BACKOFF_CAP.as_millis()).unwrap_or(u64::MAX);
+    let ceiling = base.saturating_mul(1_u64 << shift).min(cap);
+    Duration::from_millis(entropy % (ceiling + 1))
+}
+
+/// [`retry_delay`] with [`full_jitter`] in place of the fixed doubling.
+///
+/// Still waits at least the schedule, so a failure never brings a check
+/// forward, and anything under a second becomes one second so nothing
+/// spins.
+pub fn jittered_retry_delay(schedule_delay: Duration, failures: u32, entropy: u64) -> Duration {
+    schedule_delay
+        .max(full_jitter(failures, entropy))
+        .max(Duration::from_secs(1))
 }
 
 pub fn note_success(
@@ -269,6 +303,54 @@ mod tests {
         assert_eq!(
             retry_delay(Duration::from_secs(1), 7),
             Duration::from_secs(1920)
+        );
+    }
+
+    #[test]
+    fn full_jitter_stays_under_a_doubling_ceiling_capped_at_fifteen_minutes() {
+        use super::{full_jitter, jittered_retry_delay, BACKOFF_CAP};
+        assert_eq!(full_jitter(0, u64::MAX), Duration::ZERO);
+        assert_eq!(full_jitter(1, 0), Duration::ZERO);
+        assert_eq!(full_jitter(1, 30_000), Duration::from_secs(30));
+        assert_eq!(full_jitter(1, 30_001), Duration::ZERO);
+        assert_eq!(full_jitter(2, 60_000), Duration::from_secs(60));
+        assert_eq!(full_jitter(3, 120_000), Duration::from_secs(120));
+        assert_eq!(
+            full_jitter(5, 480_000),
+            Duration::from_secs(480),
+            "30 s doubled four times is still under the cap"
+        );
+        for failures in [6, 10, 32, u32::MAX] {
+            assert_eq!(full_jitter(failures, 900_000), BACKOFF_CAP);
+            for entropy in [0, 1, 12_345, 899_999, 900_001, u64::MAX] {
+                assert!(full_jitter(failures, entropy) <= BACKOFF_CAP);
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for entropy in 0..64_u64 {
+            seen.insert(full_jitter(4, entropy.wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+        }
+        assert!(seen.len() > 32, "picks should spread out");
+        assert_eq!(
+            jittered_retry_delay(Duration::from_secs(60), 0, 7),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            jittered_retry_delay(Duration::ZERO, 1, 0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            jittered_retry_delay(Duration::ZERO, 1, 5),
+            Duration::from_secs(1),
+            "a few milliseconds of jitter still wait a second"
+        );
+        assert_eq!(
+            jittered_retry_delay(Duration::from_secs(60), 3, 120_000),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            jittered_retry_delay(Duration::from_secs(3_600), 9, 900_000),
+            Duration::from_secs(3_600)
         );
     }
 }

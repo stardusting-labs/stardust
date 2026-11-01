@@ -86,7 +86,7 @@ fn read_reply(status: u16, response: ureq::Response) -> Result<HttpReply, &'stat
     Ok(HttpReply { status, body })
 }
 
-struct PinnedAddrs(Vec<SocketAddr>);
+pub(crate) struct PinnedAddrs(pub(crate) Vec<SocketAddr>);
 
 impl ureq::Resolver for PinnedAddrs {
     fn resolve(&self, _netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
@@ -94,26 +94,44 @@ impl ureq::Resolver for PinnedAddrs {
     }
 }
 
+/// Why [`resolve_checked`] gave no addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolveError {
+    /// No answer, such as no network. Worth trying again later.
+    Lookup,
+    /// An address is loopback, private, or otherwise not public.
+    Blocked,
+}
+
 pub fn resolve_public(host: &str, port: u16) -> Result<Vec<SocketAddr>, &'static str> {
+    resolve_checked(host, port).map_err(|err| match err {
+        ResolveError::Lookup => "could not resolve destination",
+        ResolveError::Blocked => "destination address was refused",
+    })
+}
+
+/// Resolve once. Every address must be public, so the request can be pinned
+/// to them.
+pub(crate) fn resolve_checked(host: &str, port: u16) -> Result<Vec<SocketAddr>, ResolveError> {
     let looked_up = (host, port)
         .to_socket_addrs()
-        .map_err(|_| "could not resolve destination")?;
+        .map_err(|_| ResolveError::Lookup)?;
     let mut addrs = Vec::new();
     for addr in looked_up {
         if ip_is_blocked(addr.ip()) {
-            return Err("destination address was refused");
+            return Err(ResolveError::Blocked);
         }
         addrs.push(addr);
     }
     if addrs.is_empty() {
-        return Err("could not resolve destination");
+        return Err(ResolveError::Lookup);
     }
     Ok(addrs)
 }
 
-fn port_of(url: &str) -> u16 {
+pub(crate) fn port_of(url: &str) -> u16 {
     let rest = url.strip_prefix("https://").unwrap_or(url);
-    let host_port = rest.split('/').next().unwrap_or("");
+    let host_port = rest.split(['/', '?']).next().unwrap_or("");
     let port = if let Some(inner) = host_port.strip_prefix('[') {
         inner.split_once("]:").map(|(_, port)| port)
     } else {
@@ -132,5 +150,10 @@ mod tests {
         assert!(resolve_public("localhost", 443).is_err());
         assert_eq!(port_of("https://helloorbit.app/hooks"), 443);
         assert_eq!(port_of("https://helloorbit.app:8443/hooks"), 8443);
+        assert_eq!(
+            port_of("https://prod-00.westus.logic.azure.com:443/workflows/a?sig=1:2"),
+            443
+        );
+        assert_eq!(port_of("https://[2001:db8::1]:8443/hooks"), 8443);
     }
 }

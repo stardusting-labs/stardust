@@ -1,11 +1,40 @@
 use crate::icon::tray_rgba;
 use crate::inbox::{Inbox, UiMsg};
+use crate::live::LivePet;
+use chrono::Utc;
+use stardust_core::config::Config;
+use stardust_core::connect::FlowPhase;
 use stardust_core::i18n::{every, interval_label, tr, Language, Msg};
-use stardust_core::pet::{tray_edge_px, PetScale, PetSkin, TrayGlyph};
+use stardust_core::pet::{tray_edge_px, ObservedCheck, PetScale, PetSkin, TrayGlyph};
 use stardust_core::schedule::QUICK_PICK_MINUTES;
-use stardust_core::text::MenuText;
+use stardust_core::text::{
+    menu_text_in, with_connect_status_in, with_connection_note_in, MenuText,
+};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+/// Menu text for the current config and check. The ORBIT connection line is
+/// there only with auto sign-in on, and "Send test" only with routing on.
+pub fn tray_text(config: &Config, live: &LivePet, language: Language) -> MenuText {
+    let observed = live.observed();
+    let text = with_connection_note_in(
+        menu_text_in(config, Utc::now(), language),
+        observed,
+        language,
+    );
+    if !config.features().auto_sign_in {
+        return text;
+    }
+    let phase = live.phase();
+    let signed_in = match live.signed_in() {
+        Some(known) => known,
+        // Not known yet and nothing to go on: leave the line out rather
+        // than guess.
+        None if phase == FlowPhase::Idle && observed == ObservedCheck::Waiting => return text,
+        None => observed != ObservedCheck::SignedOut,
+    };
+    with_connect_status_in(text, config, &phase, observed, signed_in, language)
+}
 
 pub struct Tray {
     icon: TrayIcon,
@@ -72,6 +101,9 @@ fn build_menu(text: &MenuText, language: Language) -> Result<Menu, String> {
     let menu = Menu::new();
     append_item(&menu, "settings", tr(language, Msg::MenuSettings), true)?;
     append_item(&menu, "sign-in", tr(language, Msg::MenuSignIn), true)?;
+    if let Some(status) = &text.status {
+        append_item(&menu, "connect-status", status, false)?;
+    }
     append_separator(&menu)?;
     append_item(&menu, "next", &text.next_check, false)?;
     append_item(&menu, "last", &text.last_checked, false)?;
@@ -97,6 +129,9 @@ fn build_menu(text: &MenuText, language: Language) -> Result<Menu, String> {
         )?;
     }
     append_item(&menu, "check-now", tr(language, Msg::MenuCheckNow), true)?;
+    for (id, label) in &text.tests {
+        append_item(&menu, id, label, true)?;
+    }
     append_separator(&menu)?;
     for minutes in QUICK_PICK_MINUTES {
         append_item(
