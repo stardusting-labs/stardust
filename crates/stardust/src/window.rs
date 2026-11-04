@@ -20,7 +20,7 @@ use stardust_core::a11y::{
 use stardust_core::api::{https_origin, is_allowed_https_url, resolve_server_base, ENV_SERVER_URL};
 use stardust_core::config::{save_config, Config};
 use stardust_core::connect::FlowPhase;
-use stardust_core::i18n::{drawn_language, Language};
+use stardust_core::i18n::Language;
 use stardust_core::pet::{
     pet_frame, pet_pose, tray_glyph, ObservedCheck, PetPose, PetScale, PetSkin,
 };
@@ -280,7 +280,6 @@ impl PopupApp {
             character_visible: config.character_visible(),
             skin: config.pet_skin(),
             scale: config.pet_scale(),
-            language: config.effective_language(),
             server_host: host,
         }
     }
@@ -361,7 +360,7 @@ impl PopupApp {
 
     fn paint_settings(&mut self) {
         let view = self.settings_view();
-        let language = drawn_language(self.language(), self.painter.has_hangul());
+        let language = self.language();
         let scale = text_scale(self.session.live.scale_factor());
         let Some(settings) = self.settings.as_mut() else {
             return;
@@ -460,10 +459,6 @@ impl PopupApp {
             SettingsAction::SetScale(scale) => {
                 self.on_menu(event_loop, scale.menu_id());
                 self.redraw_character();
-            }
-            SettingsAction::SetLanguage(language) => {
-                self.update_config(|config| config.set_language(Some(language)));
-                self.refresh_tray();
             }
         }
         self.redraw_settings();

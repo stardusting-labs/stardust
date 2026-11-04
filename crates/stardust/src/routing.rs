@@ -667,8 +667,8 @@ mod tests {
         assert!(!sent.show_os_notification);
         assert_eq!(sent.summary.lines, ["Test sent: ops"]);
         assert!(sent.summary.details_url.is_empty());
-        let failed = test_presentation("ops", &Err(SinkError::Unreachable), Language::Korean);
-        assert_eq!(failed.summary.lines, ["테스트를 보내지 못했어요: ops"]);
+        let failed = test_presentation("ops", &Err(SinkError::Unreachable), Language::English);
+        assert_eq!(failed.summary.lines, ["Test did not go through: ops"]);
     }
 
     #[test]

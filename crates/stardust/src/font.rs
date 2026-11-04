@@ -1,11 +1,8 @@
 //! Letters for the windows the app draws itself.
 //!
 //! The built-in letters are an original 5x7 bitmap that covers ASCII
-//! letters, digits, and a few marks. With the `system-font` feature, a
-//! letter outside that set (Hangul, for example) is drawn from a font that
-//! is already installed on the computer. Without it, such a letter is a
-//! hollow box, and the settings window stays in English (see
-//! `stardust_core::i18n::drawn_language`).
+//! letters, digits, and a few marks. Stardust text is English only; any
+//! other letter is drawn as a hollow box.
 
 pub const SCALE: u32 = 2;
 pub const CELL_W: u32 = 6;
@@ -67,34 +64,13 @@ fn fill_cell(buffer: &mut [u32], width: u32, height: u32, x: i32, y: i32, scale:
     }
 }
 
-/// True when the bitmap has a real glyph for `ch`.
-pub fn bitmap_has(ch: char) -> bool {
+#[cfg(test)]
+fn bitmap_has(ch: char) -> bool {
     ch == ' ' || glyph(ch) != glyph('\u{FFFF}')
 }
 
-/// Width in bitmap cells: two for East Asian wide letters, one otherwise.
-pub fn cell_columns(ch: char) -> u32 {
-    let code = u32::from(ch);
-    let wide = matches!(code,
-        0x1100..=0x115F
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xA960..=0xA97F
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6);
-    if wide {
-        2
-    } else {
-        1
-    }
-}
-
 pub fn text_columns(text: &str) -> u32 {
-    text.chars().map(cell_columns).sum()
+    text.chars().count() as u32
 }
 
 /// Where and how to draw: top-left corner, colour, and bitmap scale.
@@ -106,157 +82,27 @@ pub struct Pen {
     pub scale: u32,
 }
 
-/// Draws text with the bitmap and, when available, a system font fallback.
-pub struct Painter {
-    #[cfg(feature = "system-font")]
-    fallback: std::cell::OnceCell<Option<ab_glyph::FontVec>>,
-}
+/// Draws text with the built-in bitmap.
+pub struct Painter;
 
 impl Painter {
     pub fn new() -> Self {
-        Self {
-            #[cfg(feature = "system-font")]
-            fallback: std::cell::OnceCell::new(),
-        }
+        Self
     }
 
-    /// True when Hangul can be drawn. Loads the system font on first use.
-    pub fn has_hangul(&self) -> bool {
-        #[cfg(feature = "system-font")]
-        {
-            self.fallback_font()
-                .is_some_and(|font| system::covers(font, '\u{AC00}'))
-        }
-        #[cfg(not(feature = "system-font"))]
-        {
-            false
-        }
-    }
-
-    #[cfg(feature = "system-font")]
-    fn fallback_font(&self) -> Option<&ab_glyph::FontVec> {
-        self.fallback
-            .get_or_init(|| system::load(std::env::var("STARDUST_FONT").ok().as_deref()))
-            .as_ref()
-    }
-
-    /// Draw `text` with its top-left at the pen. Each bitmap cell is
-    /// `CELL_W * scale` wide; wide letters take two cells.
+    /// Draw `text` with its top-left at the pen. Each letter is
+    /// `CELL_W * scale` wide.
     pub fn draw(&self, buffer: &mut [u32], width: u32, text: &str, pen: Pen, max_columns: u32) {
         if width == 0 || pen.scale == 0 {
             return;
         }
-        let mut column = 0u32;
-        for ch in text.chars() {
-            let span = cell_columns(ch);
-            if column + span > max_columns {
-                break;
-            }
+        for (column, ch) in text.chars().take(max_columns as usize).enumerate() {
             let at = Pen {
-                x: pen.x + (column * CELL_W * pen.scale) as i32,
+                x: pen.x + (column as u32 * CELL_W * pen.scale) as i32,
                 ..pen
             };
-            if bitmap_has(ch) || !self.draw_fallback(buffer, width, ch, at) {
-                draw_bitmap_char(buffer, width, ch, at);
-            }
-            column += span;
+            draw_bitmap_char(buffer, width, ch, at);
         }
-    }
-
-    #[cfg(feature = "system-font")]
-    fn draw_fallback(&self, buffer: &mut [u32], width: u32, ch: char, pen: Pen) -> bool {
-        let Some(font) = self.fallback_font() else {
-            return false;
-        };
-        system::draw_char(font, buffer, width, ch, pen, CELL_H * pen.scale)
-    }
-
-    #[cfg(not(feature = "system-font"))]
-    fn draw_fallback(&self, _buffer: &mut [u32], _width: u32, _ch: char, _pen: Pen) -> bool {
-        false
-    }
-}
-
-#[cfg(feature = "system-font")]
-mod system {
-    use super::Pen;
-    use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
-
-    /// Fonts that ship with each OS and cover Hangul. The first readable one
-    /// wins. `STARDUST_FONT` overrides the list.
-    pub const CANDIDATES: &[&str] = &[
-        r"C:\Windows\Fonts\malgun.ttf",
-        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-    ];
-
-    pub fn load(override_path: Option<&str>) -> Option<FontVec> {
-        let paths = override_path
-            .filter(|path| !path.is_empty())
-            .into_iter()
-            .chain(CANDIDATES.iter().copied());
-        for path in paths {
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
-            if let Ok(font) = FontVec::try_from_vec_and_index(bytes, 0) {
-                if covers(&font, '\u{AC00}') {
-                    return Some(font);
-                }
-            }
-        }
-        None
-    }
-
-    pub fn covers(font: &FontVec, ch: char) -> bool {
-        font.glyph_id(ch).0 != 0
-    }
-
-    fn blend(under: u32, over: u32, coverage: f32) -> u32 {
-        let mix = |shift: u32| {
-            let a = f32::from(((under >> shift) & 0xFF) as u8);
-            let b = f32::from(((over >> shift) & 0xFF) as u8);
-            ((a + (b - a) * coverage).round().clamp(0.0, 255.0) as u32) << shift
-        };
-        mix(16) | mix(8) | mix(0)
-    }
-
-    pub fn draw_char(
-        font: &FontVec,
-        buffer: &mut [u32],
-        width: u32,
-        ch: char,
-        pen: Pen,
-        cell_height: u32,
-    ) -> bool {
-        let (left, top, color) = (pen.x, pen.y, pen.color);
-        if !covers(font, ch) {
-            return false;
-        }
-        let height = buffer.len() as u32 / width.max(1);
-        let px = PxScale::from(cell_height as f32);
-        let scaled = font.as_scaled(px);
-        let glyph = font
-            .glyph_id(ch)
-            .with_scale_and_position(px, point(left as f32, top as f32 + scaled.ascent()));
-        let Some(outline) = font.outline_glyph(glyph) else {
-            return true;
-        };
-        let bounds = outline.px_bounds();
-        outline.draw(|gx, gy, coverage| {
-            let x = bounds.min.x as i32 + gx as i32;
-            let y = bounds.min.y as i32 + gy as i32;
-            if coverage <= 0.0 || x < 0 || y < 0 || x as u32 >= width || y as u32 >= height {
-                return;
-            }
-            let index = (y as u32 * width + x as u32) as usize;
-            buffer[index] = blend(buffer[index], color, coverage.min(1.0));
-        });
-        true
     }
 }
 
@@ -409,7 +255,7 @@ fn glyph(ch: char) -> [u8; 7] {
 
 #[cfg(test)]
 mod tests {
-    use super::{bitmap_has, cell_columns, draw_text, text_columns, Painter, Pen, CELL_W};
+    use super::{bitmap_has, draw_text, text_columns, Painter, Pen, CELL_W};
 
     #[test]
     fn letter_a_has_ink_and_space_does_not() {
@@ -422,13 +268,11 @@ mod tests {
     }
 
     #[test]
-    fn hangul_is_wide_and_not_in_the_bitmap() {
+    fn ascii_is_in_the_bitmap_and_one_column_wide() {
         assert!(bitmap_has('A'));
         assert!(bitmap_has(' '));
-        assert!(!bitmap_has('가'));
-        assert_eq!(cell_columns('가'), 2);
-        assert_eq!(cell_columns('A'), 1);
-        assert_eq!(text_columns("ORBIT 로그인"), 6 + 6);
+        assert!(!bitmap_has('\u{FFFF}'));
+        assert_eq!(text_columns("ORBIT sign-in"), 13);
     }
 
     #[test]
@@ -449,35 +293,5 @@ mod tests {
             .count();
         assert_eq!(right_of_first, 0);
         assert!(buffer.iter().any(|pixel| *pixel != 0));
-    }
-
-    #[cfg(feature = "system-font")]
-    #[test]
-    fn system_font_draws_hangul_when_one_is_installed() {
-        let painter = Painter::new();
-        let found = super::system::CANDIDATES
-            .iter()
-            .any(|path| std::path::Path::new(path).is_file())
-            || std::env::var("STARDUST_FONT")
-                .is_ok_and(|path| std::path::Path::new(&path).is_file());
-        assert_eq!(painter.has_hangul(), found);
-        let width = 64;
-        let mut buffer = vec![0u32; (width * 32) as usize];
-        let pen = Pen {
-            x: 0,
-            y: 0,
-            color: 0x00FF_FFFF,
-            scale: 2,
-        };
-        painter.draw(&mut buffer, width, "가", pen, 4);
-        let inked = buffer.iter().filter(|pixel| **pixel != 0).count();
-        if found {
-            assert!(inked > 20, "inked {inked}");
-            let mut boxed = vec![0u32; (width * 32) as usize];
-            draw_text(&mut boxed, width, "가", 0x00FF_FFFF, 0, 0, 2);
-            assert_ne!(buffer, boxed);
-        } else {
-            assert!(inked > 0);
-        }
     }
 }

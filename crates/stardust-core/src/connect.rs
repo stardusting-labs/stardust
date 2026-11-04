@@ -573,9 +573,9 @@ mod tests {
                 &FlowPhase::Idle,
                 ObservedCheck::Unavailable,
                 true,
-                Language::Korean
+                Language::English
             ),
-            "ORBIT: 오프라인"
+            "ORBIT: Offline"
         );
     }
 }

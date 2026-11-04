@@ -106,31 +106,8 @@ pub fn menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
 }
 
 /// Tray text in `language`.
-///
-/// The schedule and integrations lines are still English in both languages.
-/// TODO(Unsu): Korean wording for those two lines.
 pub fn menu_text_in(config: &Config, now_utc: DateTime<Utc>, language: Language) -> MenuText {
     let mut text = english_menu_text(config, now_utc);
-    if language == Language::Korean {
-        let last_clock = text
-            .last_checked
-            .strip_prefix("Last checked time ")
-            .unwrap_or("—")
-            .to_string();
-        let next_clock = text
-            .next_check
-            .strip_prefix("Next check ")
-            .unwrap_or("—")
-            .to_string();
-        text.tooltip = format!("Stardust · 마지막 확인 {last_clock}");
-        text.last_checked = format!("마지막 확인 {last_clock}");
-        text.next_check = format!("다음 확인 {next_clock}");
-        text.character = if config.character_visible() {
-            tr(language, Msg::HideCharacter).to_string()
-        } else {
-            tr(language, Msg::ShowCharacter).to_string()
-        };
-    }
     text.tests = test_items(config, language);
     text
 }
@@ -304,25 +281,5 @@ mod tests {
         assert_eq!(super::test_send_target("test-send:chat"), Some("chat"));
         assert_eq!(super::test_send_target("test-send:../x"), None);
         assert_eq!(super::test_send_target("interval-30"), None);
-        let korean = super::menu_text_in(&config, now, Language::Korean);
-        assert_eq!(korean.tests[0].1, "테스트 보내기: chat");
-    }
-
-    #[test]
-    fn korean_tray_text_keeps_the_times_and_adds_the_note() {
-        let config = Config::default_for("UTC").unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 10, 21, 15, 0, 0).unwrap();
-        let text = super::with_connection_note_in(
-            super::menu_text_in(&config, now, crate::i18n::Language::Korean),
-            crate::pet::ObservedCheck::SignedOut,
-            crate::i18n::Language::Korean,
-        );
-        assert_eq!(text.next_check, "다음 확인 16:00");
-        assert_eq!(
-            text.last_checked,
-            "마지막 확인 — · ORBIT 항목을 보려면 로그인하세요"
-        );
-        assert_eq!(text.character, "캐릭터 보이기");
-        assert_eq!(find_disallowed_copy(&text.tooltip), None);
     }
 }

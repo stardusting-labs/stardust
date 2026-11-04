@@ -2,8 +2,7 @@
 
 /// Returns the first disallowed product-copy term found in `text`.
 ///
-/// English terms match without case. Korean terms are the same claims in
-/// Korean product copy.
+/// Terms match without case.
 ///
 /// The license text is not product copy and is not passed through here.
 pub fn find_disallowed_copy(text: &str) -> Option<&'static str> {
@@ -15,12 +14,6 @@ pub fn find_disallowed_copy(text: &str) -> Option<&'static str> {
         "verified",
         "compliance",
         "guaranteed",
-        "모니터링",
-        "실시간",
-        "검증",
-        "보장",
-        "컴플라이언스",
-        "규정 준수",
     ];
     let lower = text.to_ascii_lowercase();
     TERMS.iter().copied().find(|term| lower.contains(term))

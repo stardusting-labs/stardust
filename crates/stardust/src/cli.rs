@@ -1,6 +1,5 @@
 use stardust_core::api::Severity;
 use stardust_core::config::{Feature, FieldUpdate, RoutingUpdate, ScheduleUpdate};
-use stardust_core::i18n::Language;
 use stardust_core::schedule::parse_interval;
 use std::path::PathBuf;
 
@@ -77,10 +76,6 @@ pub enum Command {
         action: FeatureAction,
     },
     Autostart(AutostartAction),
-    Language {
-        config: Option<PathBuf>,
-        language: Option<Language>,
-    },
     ScheduleShow {
         config: Option<PathBuf>,
     },
@@ -121,7 +116,6 @@ Usage:
   stardust [--config PATH] sign-in
   stardust [--config PATH] sign-out
   stardust autostart on|off|status
-  stardust [--config PATH] language en|ko|auto
   stardust [--config PATH] schedule show
   stardust [--config PATH] schedule set [options]
   stardust [--config PATH] character show|hide
@@ -164,7 +158,6 @@ Set server_base_url in the config file, or STARDUST_SERVER_URL, to use another s
 An expired access token is renewed in the background when ORBIT sent a refresh token.
 Settings and sign-in are also in the tray menu. The first start opens the settings window.
 autostart on starts Stardust when you log in. It is off until you turn it on.
-language sets English or Korean. auto follows the system locale.
 --demo uses sample items and does not contact ORBIT.
 
 KIND is slack, teams, json, discord, pagerduty, orbit-mcp, or slack-mcp.
@@ -272,20 +265,6 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
                 return Err("autostart takes one argument".to_string());
             }
             Ok(Command::Autostart(action))
-        }
-        "language" => {
-            let language = match args.get(index + 1).map(String::as_str) {
-                Some("auto") => None,
-                Some(code) => Some(
-                    Language::from_code(code)
-                        .ok_or_else(|| "language takes en, ko, or auto".to_string())?,
-                ),
-                None => return Err("language takes en, ko, or auto".to_string()),
-            };
-            if index + 2 != args.len() {
-                return Err("language takes one argument".to_string());
-            }
-            Ok(Command::Language { config, language })
         }
         other => Err(format!("unknown command {other}")),
     }
@@ -644,7 +623,6 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use stardust_core::config::Config;
     use stardust_core::copy::find_disallowed_copy;
-    use stardust_core::i18n::Language;
 
     #[test]
     fn typed_schedule_applies_and_usage_stays_plain() {
@@ -726,18 +704,7 @@ mod tests {
         ));
         assert!(parse(["autostart"]).is_err());
         assert!(parse(["autostart", "on", "now"]).is_err());
-        assert!(matches!(
-            parse(["language", "ko"]).unwrap(),
-            Command::Language {
-                language: Some(Language::Korean),
-                ..
-            }
-        ));
-        assert!(matches!(
-            parse(["language", "auto"]).unwrap(),
-            Command::Language { language: None, .. }
-        ));
-        assert!(parse(["language", "fr"]).is_err());
+        assert!(parse(["language", "en"]).is_err());
         assert_eq!(find_disallowed_copy(&usage()), None);
         assert!(parse(["--demo", "sign-in"]).is_err());
         assert!(parse(["--demo", "--check-once"]).is_ok());

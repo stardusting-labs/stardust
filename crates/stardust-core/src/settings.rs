@@ -19,18 +19,16 @@ pub enum Row {
     ShowCharacter,
     PetSkin,
     PetSize,
-    Language,
     Done,
 }
 
-pub const ROWS: [Row; 8] = [
+pub const ROWS: [Row; 7] = [
     Row::Account,
     Row::CheckEvery,
     Row::StartAtLogin,
     Row::ShowCharacter,
     Row::PetSkin,
     Row::PetSize,
-    Row::Language,
     Row::Done,
 ];
 
@@ -56,7 +54,6 @@ pub struct SettingsView {
     pub character_visible: bool,
     pub skin: PetSkin,
     pub scale: PetScale,
-    pub language: Language,
     /// The ORBIT host shown on the account row, without a scheme.
     pub server_host: String,
 }
@@ -88,7 +85,6 @@ pub enum SettingsAction {
     SetCharacterVisible(bool),
     SetSkin(PetSkin),
     SetScale(PetScale),
-    SetLanguage(Language),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,11 +273,6 @@ fn row_text(row: Row, view: &SettingsView, language: Language) -> String {
             tr(language, Msg::RowPetSize),
             view.scale.factor()
         ),
-        Row::Language => format!(
-            "{}: {}",
-            tr(language, Msg::RowLanguage),
-            view.language.native_name()
-        ),
         Row::Done => tr(language, Msg::RowDone).to_string(),
     }
 }
@@ -338,7 +329,6 @@ fn step(row: Row, view: &SettingsView, forward: bool) -> SettingsAction {
         Row::ShowCharacter => SettingsAction::SetCharacterVisible(!view.character_visible),
         Row::PetSkin => SettingsAction::SetSkin(other_skin(view.skin)),
         Row::PetSize => SettingsAction::SetScale(other_scale(view.scale)),
-        Row::Language => SettingsAction::SetLanguage(view.language.next()),
         Row::StartAtLogin | Row::Account | Row::Done => SettingsAction::None,
     }
 }
@@ -362,7 +352,6 @@ mod tests {
             character_visible: false,
             skin: PetSkin::Astronaut,
             scale: PetScale::X2,
-            language: Language::English,
             server_host: "helloorbit.app".to_string(),
         }
     }
@@ -444,11 +433,6 @@ mod tests {
             model.handle_key(Key::Right, &view),
             SettingsAction::SetScale(PetScale::X3)
         );
-        model.handle_key(Key::Down, &view);
-        assert_eq!(
-            model.handle_key(Key::Activate, &view),
-            SettingsAction::SetLanguage(Language::Korean)
-        );
     }
 
     #[test]
@@ -468,13 +452,10 @@ mod tests {
             .iter()
             .filter(|line| matches!(line.kind, LineKind::Row(_)) && !line.focused)
             .all(|line| line.text.starts_with("  ")));
-        for language in Language::ALL {
-            for line in model.lines(&view, language) {
-                assert_eq!(find_disallowed_copy(&line.text), None, "{}", line.text);
-            }
+        for line in &lines {
+            assert_eq!(find_disallowed_copy(&line.text), None, "{}", line.text);
+            assert!(line.text.is_ascii(), "{}", line.text);
         }
-        let korean = model.lines(&view, Language::Korean);
-        assert_eq!(korean[0].text, "Stardust에 오신 것을 환영해요");
         assert!(model
             .focus_label(&view, Language::English)
             .starts_with("Stardust settings - Sign in to ORBIT"));

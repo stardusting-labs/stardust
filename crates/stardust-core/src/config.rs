@@ -69,8 +69,6 @@ pub enum ConfigError {
     Integration(#[from] IntegrationError),
     #[error("server address was refused")]
     ServerBase,
-    #[error("language must be en or ko")]
-    Language,
 }
 
 /// Switches for newer behaviour. Every one is off until turned on, and a
@@ -165,9 +163,10 @@ struct ConfigFile {
     integrations: Vec<IntegrationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     server_base_url: Option<String>,
-    /// `"en"` or `"ko"`. Unset follows the system locale.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
+    /// Ignored. Stardust is English only; the key is accepted so config
+    /// files written by earlier builds still load, and it is not written back.
+    #[serde(default, skip_serializing)]
+    language: Option<serde_json::Value>,
     /// True after the first-run window was closed once.
     #[serde(default)]
     onboarded: bool,
@@ -262,23 +261,9 @@ impl Config {
         Ok(())
     }
 
-    /// Saved language choice, or `None` to follow the system locale.
-    pub fn language(&self) -> Option<crate::i18n::Language> {
-        self.file
-            .language
-            .as_deref()
-            .and_then(crate::i18n::Language::from_code)
-    }
-
-    pub fn set_language(&mut self, language: Option<crate::i18n::Language>) {
-        self.file.language = language.map(|language| language.code().to_string());
-    }
-
-    /// Language in effect: the saved choice, then the POSIX locale variables.
+    /// Language in effect. Stardust is English only.
     pub fn effective_language(&self) -> crate::i18n::Language {
-        crate::i18n::detect(self.file.language.as_deref(), &|name| {
-            std::env::var(name).ok()
-        })
+        crate::i18n::Language::English
     }
 
     pub fn onboarded(&self) -> bool {
@@ -464,10 +449,7 @@ impl Config {
         let schedule = schedule_from_file(&file.schedule)?;
         validate_integrations(&file.integrations)?;
         let mut file = file;
-        if let Some(language) = file.language.as_deref() {
-            let parsed = crate::i18n::Language::from_code(language).ok_or(ConfigError::Language)?;
-            file.language = Some(parsed.code().to_string());
-        }
+        file.language = None;
         if let Some(base) = file.server_base_url.as_deref() {
             file.server_base_url =
                 Some(parse_server_base(base).map_err(|_| ConfigError::ServerBase)?);
@@ -874,28 +856,18 @@ mod tests {
     }
 
     #[test]
-    fn language_and_first_run_round_trip_and_old_files_still_load() {
+    fn first_run_round_trips_and_an_old_language_key_is_ignored() {
         let minimal = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
         let mut config = parse_config(minimal).unwrap();
-        assert_eq!(config.language(), None);
         assert!(!config.onboarded());
-        assert!(!config.to_json().unwrap().contains("language"));
-        config.set_language(Some(crate::i18n::Language::Korean));
         config.set_onboarded(true);
         let text = config.to_json().unwrap();
-        assert!(text.contains("\"language\": \"ko\""));
         assert!(text.contains("\"onboarded\": true"));
-        let loaded = parse_config(&text).unwrap();
-        assert_eq!(loaded.language(), Some(crate::i18n::Language::Korean));
-        assert_eq!(loaded.effective_language(), crate::i18n::Language::Korean);
-        assert!(loaded.onboarded());
-        let region = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"language":"ko-KR","schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
-        assert_eq!(
-            parse_config(region).unwrap().language(),
-            Some(crate::i18n::Language::Korean)
-        );
-        let unknown = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"language":"fr","schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
-        assert!(parse_config(unknown).is_err());
+        assert!(parse_config(&text).unwrap().onboarded());
+        let legacy = r#"{"character_visible":false,"character_position":{"x":1,"y":2},"language":"xx","schedule":{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}}"#;
+        let loaded = parse_config(legacy).unwrap();
+        assert_eq!(loaded.effective_language(), crate::i18n::Language::English);
+        assert!(!loaded.to_json().unwrap().contains("language"));
     }
 
     #[test]
