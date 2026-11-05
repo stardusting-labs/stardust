@@ -1,4 +1,6 @@
+use stardust_core::connect::IssuedCode;
 use stardust_core::policy::Presentation;
+use stardust_core::signin_window::SignInEnd;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +22,19 @@ pub enum SignInUpdate {
     Code(String),
     Done,
     Failed,
+    /// For the launch sign-in window: a code was issued for `attempt`. Holds
+    /// the user code, the allowed addresses, and the time left. Never the
+    /// device code.
+    Issued {
+        attempt: u64,
+        code: IssuedCode,
+        lifetime: Duration,
+    },
+    /// For the launch sign-in window: attempt `attempt` stopped.
+    Ended {
+        attempt: u64,
+        end: SignInEnd,
+    },
 }
 
 #[derive(Clone)]

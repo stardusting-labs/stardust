@@ -9,6 +9,7 @@
 use crate::actions::{apply_menu, MenuEffect};
 use crate::font::{self, Painter, Pen};
 use crate::inbox::{Inbox, SignInUpdate, UiMsg, Wake};
+use crate::keychain::KeychainTokenStore;
 use crate::live::LivePet;
 use crate::sprites;
 use crate::tray::{tray_text, Tray};
@@ -20,14 +21,18 @@ use stardust_core::a11y::{
 use stardust_core::api::{https_origin, is_allowed_https_url, resolve_server_base, ENV_SERVER_URL};
 use stardust_core::config::{save_config, Config};
 use stardust_core::connect::FlowPhase;
-use stardust_core::i18n::Language;
+use stardust_core::i18n::{tr, Language, Msg};
 use stardust_core::pet::{
     pet_frame, pet_pose, tray_glyph, ObservedCheck, PetPose, PetScale, PetSkin,
 };
-use stardust_core::policy::Presentation;
+use stardust_core::policy::{Presentation, Summary};
 use stardust_core::position::{layout_bubble, LayoutRequest, ScreenPoint, ScreenRect, WindowSize};
 use stardust_core::settings::{
     Key, Line, LineKind, SettingsAction, SettingsModel, SettingsView, SignInStage,
+};
+use stardust_core::signin_window::{
+    opens_at_launch, LaunchWindow, SessionRead, SignInAction, SignInLine, SignInLineKind,
+    SignInModel, Tick,
 };
 use stardust_core::text::test_send_target;
 use std::cell::RefCell;
@@ -82,6 +87,20 @@ struct SettingsWindow {
     cursor_y: f64,
 }
 
+/// The launch sign-in window. It only draws: polling stays on the check timer.
+struct SignInWindow {
+    surface: SbSurface,
+    model: SignInModel,
+    /// Updates from any other attempt are ignored.
+    attempt: u64,
+    cursor_y: f64,
+    /// Made on the first Copy. On Linux the copied text is served from here,
+    /// so it stays until this window closes.
+    clipboard: Option<arboard::Clipboard>,
+    title: String,
+    next_tick: Option<Instant>,
+}
+
 struct Bubble {
     surface: SbSurface,
     presentation: Presentation,
@@ -99,6 +118,13 @@ pub struct PopupApp {
     character: Option<SbSurface>,
     bubble: Option<Bubble>,
     settings: Option<SettingsWindow>,
+    sign_in_window: Option<SignInWindow>,
+    /// What the keychain held at launch. Read only with the launch sign-in
+    /// window on.
+    launch_session: Option<SessionRead>,
+    /// The first-run settings window waits for the sign-in window to close,
+    /// so two windows never compete at launch.
+    pending_first_run: bool,
     monitors: Vec<ScreenRect>,
     drag: Option<Drag>,
     failure: Option<String>,
@@ -115,6 +141,9 @@ pub struct PopupApp {
 impl Drop for PopupApp {
     fn drop(&mut self) {
         self.session.inbox.clear_proxy();
+        // Its windows go with it. A run that carries on with no windows must
+        // not keep holding back the notice that says to sign in.
+        self.session.live.set_sign_in_window_open(false);
     }
 }
 
@@ -126,14 +155,31 @@ pub fn run(session: Session) -> Result<(), RunError> {
     let context = softbuffer::Context::new(event_loop.owned_display_handle())
         .map_err(|err| RunError::Unavailable(err.to_string()))?;
     session.inbox.set_proxy(event_loop.create_proxy());
-    let signed_in = session.demo || crate::signin::signed_in();
+    let launch_window = session
+        .config
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .features()
+        .launch_sign_in_window;
+    let launch_session = (launch_window && !session.demo).then(crate::signin::session);
+    let signed_in = session.demo
+        || match launch_session {
+            Some(read) => matches!(read, SessionRead::Usable { .. }),
+            None => crate::signin::signed_in(),
+        };
     session.live.set_signed_in(signed_in);
+    if let Some(SessionRead::Usable { until }) = launch_session {
+        session.live.note_session(until);
+    }
     let mut app = PopupApp {
         session,
         context,
         character: None,
         bubble: None,
         settings: None,
+        sign_in_window: None,
+        launch_session,
+        pending_first_run: false,
         monitors: Vec::new(),
         drag: None,
         failure: None,
@@ -261,18 +307,18 @@ impl PopupApp {
             .config
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        let server = resolve_server_base(
-            config.server_base_url(),
-            std::env::var(ENV_SERVER_URL).ok().as_deref(),
-        )
-        .unwrap_or_else(|_| stardust_core::api::DEFAULT_SERVER_BASE.to_string());
-        let host = https_origin(&server)
-            .unwrap_or(server)
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .to_string();
+        let host = server_host(&config);
+        // The saved record can lapse between checks. Only this flag looks.
+        let signed_in = if config.features().launch_sign_in_window {
+            self.session
+                .live
+                .signed_in_at(Utc::now())
+                .unwrap_or(self.signed_in)
+        } else {
+            self.signed_in
+        };
         SettingsView {
-            signed_in: self.signed_in,
+            signed_in,
             sign_in: self.sign_in.clone(),
             interval_minutes: config.schedule().interval_minutes(),
             start_at_login: self.start_at_login,
@@ -290,6 +336,9 @@ impl PopupApp {
             settings.surface.window().request_redraw();
             return;
         }
+        // Settings opened from the tray while the sign-in window is up takes
+        // over the welcome, or `onboarded` would never be set.
+        let first_run = first_run || std::mem::take(&mut self.pending_first_run);
         let model = SettingsModel::new(first_run);
         let view = self.settings_view();
         let language = self.language();
@@ -373,18 +422,8 @@ impl PopupApp {
         if event.state != ElementState::Pressed {
             return;
         }
-        let key = match &event.logical_key {
-            WinitKey::Named(NamedKey::ArrowUp) => Key::Up,
-            WinitKey::Named(NamedKey::ArrowDown) => Key::Down,
-            WinitKey::Named(NamedKey::ArrowLeft) => Key::Left,
-            WinitKey::Named(NamedKey::ArrowRight) => Key::Right,
-            WinitKey::Named(NamedKey::Tab) if self.shift => Key::BackTab,
-            WinitKey::Named(NamedKey::Tab) => Key::Tab,
-            WinitKey::Named(NamedKey::Enter | NamedKey::Space) => Key::Activate,
-            WinitKey::Named(NamedKey::Escape) => Key::Escape,
-            WinitKey::Named(NamedKey::Home) => Key::Home,
-            WinitKey::Named(NamedKey::End) => Key::End,
-            _ => return,
+        let Some(key) = window_key(&event.logical_key, self.shift) else {
+            return;
         };
         let view = self.settings_view();
         let Some(settings) = self.settings.as_mut() else {
@@ -415,7 +454,13 @@ impl PopupApp {
                 self.close_settings();
                 return;
             }
+            SettingsAction::StartSignIn if self.launch_window_on() => {
+                self.sign_in_from_menu(event_loop);
+            }
             SettingsAction::StartSignIn => self.start_sign_in(),
+            SettingsAction::SignOut if self.launch_window_on() => {
+                self.sign_out_under_flag(event_loop);
+            }
             SettingsAction::SignOut => {
                 let finish_on_timer = self.auto_sign_in() && !self.session.demo;
                 // With auto sign-in the check timer finishes the sign-out on
@@ -485,6 +530,316 @@ impl PopupApp {
             .auto_sign_in
     }
 
+    fn launch_window_on(&self) -> bool {
+        self.session
+            .config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .features()
+            .launch_sign_in_window
+    }
+
+    /// "Sign in..." in the tray, or the settings Account row, with the launch
+    /// sign-in window on. Looks in the keychain first, so a sign-in made in a
+    /// terminal shows as signed in rather than starting another one.
+    fn sign_in_from_menu(&mut self, event_loop: &ActiveEventLoop) {
+        if self.session.demo {
+            return;
+        }
+        if let Some(window) = self.sign_in_window.as_ref() {
+            window.surface.window().focus_window();
+            return;
+        }
+        match crate::signin::session() {
+            SessionRead::Usable { until } => self.found_session(until),
+            SessionRead::Missing => self.open_sign_in_window(event_loop, false),
+            SessionRead::Unreadable => self.open_sign_in_window(event_loop, true),
+        }
+    }
+
+    /// The keychain holds a usable record the app did not know about.
+    fn found_session(&mut self, until: Option<chrono::DateTime<Utc>>) {
+        self.session.live.note_session(until);
+        self.session.live.set_signed_in(true);
+        self.session.live.set_observed(ObservedCheck::Waiting);
+        self.on_sign_in(SignInUpdate::Done);
+    }
+
+    fn open_sign_in_window(&mut self, event_loop: &ActiveEventLoop, keychain_unreadable: bool) {
+        let now = Instant::now();
+        let host = server_host(
+            &self
+                .session
+                .config
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+        );
+        let model = if keychain_unreadable {
+            SignInModel::keychain_unreadable(host, now)
+        } else {
+            SignInModel::requesting(host, now)
+        };
+        let scale = text_scale(self.session.live.scale_factor());
+        let (width, height) = settings_size(SETTINGS_COLUMNS, model.max_lines() as u32, scale);
+        let monitor = self.monitors.first().copied().unwrap_or(ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        });
+        let origin = centered(monitor, width, height);
+        let title = model.title(self.language());
+        let attributes = Window::default_attributes()
+            .with_title(title.as_str())
+            .with_decorations(true)
+            .with_resizable(false)
+            .with_active(true)
+            .with_position(PhysicalPosition::new(origin.x, origin.y))
+            .with_inner_size(PhysicalSize::new(width, height));
+        match self.surface_for(event_loop, attributes) {
+            Ok(surface) => {
+                surface.window().request_redraw();
+                let attempt = if keychain_unreadable {
+                    0
+                } else {
+                    let attempt = self.session.live.request_new_sign_in();
+                    self.session.wake.notify_one();
+                    attempt
+                };
+                self.session.live.set_sign_in_window_open(true);
+                self.sign_in_window = Some(SignInWindow {
+                    surface,
+                    model,
+                    attempt,
+                    cursor_y: -1.0,
+                    clipboard: None,
+                    title,
+                    next_tick: None,
+                });
+            }
+            Err(err) => self.fail(event_loop, err),
+        }
+    }
+
+    /// Closing always stops the polling, because every flow under this flag
+    /// belongs to this window and nothing could cancel one left behind. The app
+    /// keeps running in the tray.
+    fn close_sign_in_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.sign_in_window.take().is_none() {
+            return;
+        }
+        self.session.live.set_sign_in_window_open(false);
+        self.session.live.request_cancel();
+        self.session.wake.notify_one();
+        if std::mem::take(&mut self.pending_first_run) {
+            self.open_settings(event_loop, true);
+        }
+        self.refresh_tray();
+    }
+
+    fn sign_in_window_id(&self) -> Option<WindowId> {
+        self.sign_in_window
+            .as_ref()
+            .map(|window| window.surface.window().id())
+    }
+
+    /// Redraw only this window. The title changes when the state does, and
+    /// the tray is left alone, because rebuilding its menu every second could
+    /// disturb one that is open.
+    fn redraw_sign_in_window(&mut self) {
+        let language = self.language();
+        let now = Instant::now();
+        let Some(window) = self.sign_in_window.as_mut() else {
+            return;
+        };
+        let title = window.model.title(language);
+        if title != window.title {
+            window.surface.window().set_title(&title);
+            window.title = title;
+        }
+        window.next_tick = window.model.next_wake(now);
+        window.surface.window().request_redraw();
+    }
+
+    fn paint_sign_in_window(&mut self) {
+        let language = self.language();
+        let scale = text_scale(self.session.live.scale_factor());
+        let Some(window) = self.sign_in_window.as_mut() else {
+            return;
+        };
+        let lines = window.model.lines(Instant::now(), language);
+        paint_sign_in(&mut window.surface, &self.painter, &lines, scale);
+    }
+
+    fn on_sign_in_window_key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+        if event.state != ElementState::Pressed || event.repeat {
+            return;
+        }
+        let Some(key) = window_key(&event.logical_key, self.shift) else {
+            return;
+        };
+        let Some(window) = self.sign_in_window.as_mut() else {
+            return;
+        };
+        let action = window.model.handle_key(key, Instant::now());
+        self.apply_sign_in_window(event_loop, action);
+    }
+
+    fn on_sign_in_window_click(&mut self, event_loop: &ActiveEventLoop) {
+        let scale = text_scale(self.session.live.scale_factor());
+        let Some(window) = self.sign_in_window.as_mut() else {
+            return;
+        };
+        let Some(index) = line_at(window.cursor_y, scale) else {
+            return;
+        };
+        let action = window.model.click(index, Instant::now());
+        self.apply_sign_in_window(event_loop, action);
+    }
+
+    fn apply_sign_in_window(&mut self, event_loop: &ActiveEventLoop, action: SignInAction) {
+        match action {
+            SignInAction::None => return,
+            SignInAction::Moved => {}
+            SignInAction::Open(url) => {
+                // Detached, so a browser that stays in the foreground does
+                // not hold up the window.
+                if let Err(err) = open::that_detached(&url) {
+                    eprintln!("stardust: could not open the browser: {err}");
+                    if let Some(window) = self.sign_in_window.as_mut() {
+                        window.model.note_browser_failed();
+                    }
+                }
+            }
+            SignInAction::Copy(user_code) => {
+                if let Some(window) = self.sign_in_window.as_mut() {
+                    let copied = copy_user_code(&mut window.clipboard, &user_code);
+                    window.model.note_copied(copied);
+                }
+            }
+            SignInAction::Close => {
+                self.close_sign_in_window(event_loop);
+                return;
+            }
+            SignInAction::Restart => {
+                if self.restart_sign_in(event_loop) {
+                    return;
+                }
+            }
+        }
+        self.redraw_sign_in_window();
+    }
+
+    /// Ask for a new code. Returns true when the window closed instead, because
+    /// the keychain turned out to hold a usable record.
+    fn restart_sign_in(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let reread = self
+            .sign_in_window
+            .as_ref()
+            .is_some_and(|window| window.model.is_keychain_unreadable());
+        if reread {
+            match crate::signin::session() {
+                SessionRead::Usable { until } => {
+                    self.found_session(until);
+                    self.close_sign_in_window(event_loop);
+                    return true;
+                }
+                SessionRead::Unreadable => return false,
+                SessionRead::Missing => {}
+            }
+        }
+        let attempt = self.session.live.request_new_sign_in();
+        self.session.wake.notify_one();
+        if let Some(window) = self.sign_in_window.as_mut() {
+            window.attempt = attempt;
+            window.model.start_over(Instant::now());
+        }
+        false
+    }
+
+    /// The window for this attempt, if it is still the one on screen.
+    fn sign_in_window_for(&mut self, attempt: u64) -> Option<&mut SignInWindow> {
+        self.sign_in_window
+            .as_mut()
+            .filter(|window| window.attempt == attempt)
+    }
+
+    /// A phase change from the check timer: the last poll did or did not
+    /// reach ORBIT.
+    fn sync_sign_in_phase(&mut self) {
+        let (user_code, reachable) = match self.session.live.phase() {
+            FlowPhase::Waiting { user_code } => (user_code, true),
+            FlowPhase::Offline { user_code } => (user_code, false),
+            FlowPhase::Idle => return,
+        };
+        let changed = self
+            .sign_in_window
+            .as_mut()
+            .is_some_and(|window| window.model.on_connection(&user_code, reachable));
+        if changed {
+            self.redraw_sign_in_window();
+        }
+    }
+
+    /// The countdown, and closing after a sign-in. Returns when to wake next.
+    fn tick_sign_in_window(&mut self, event_loop: &ActiveEventLoop) -> Option<Instant> {
+        let now = Instant::now();
+        let window = self.sign_in_window.as_mut()?;
+        if window.next_tick.is_some_and(|at| now >= at) {
+            match window.model.tick(now) {
+                Tick::Close => {
+                    self.close_sign_in_window(event_loop);
+                    return None;
+                }
+                Tick::Changed => self.redraw_sign_in_window(),
+                Tick::Idle => window.next_tick = window.model.next_wake(now),
+            }
+        }
+        self.sign_in_window.as_ref()?.next_tick
+    }
+
+    /// Sign out from the tray or the settings window with the launch sign-in
+    /// window on. Immediate, like the settings row has always been. `--demo`
+    /// has no sign-in to touch.
+    fn sign_out_under_flag(&mut self, event_loop: &ActiveEventLoop) {
+        if self.session.demo {
+            return;
+        }
+        match crate::signin::begin_sign_out(&KeychainTokenStore::new(), &self.session.live) {
+            Ok(()) => {
+                self.session.wake.notify_one();
+                self.signed_in = false;
+                self.sign_in = SignInStage::Idle;
+                self.close_sign_in_window(event_loop);
+            }
+            Err(err) => {
+                eprintln!("stardust: could not sign out: {err}");
+                self.show_sign_out_failed(event_loop);
+            }
+        }
+        self.refresh_tray();
+    }
+
+    /// No window may be open, so this goes in a bubble.
+    fn show_sign_out_failed(&mut self, event_loop: &ActiveEventLoop) {
+        let language = self.language();
+        self.refresh_monitors(event_loop);
+        self.show_bubble(
+            event_loop,
+            Presentation {
+                show_bubble: true,
+                show_os_notification: false,
+                summary: Summary {
+                    lines: vec![
+                        tr(language, Msg::SignOutFailed).to_string(),
+                        tr(language, Msg::SignOutFailedHint).to_string(),
+                    ],
+                    details_url: String::new(),
+                },
+            },
+        );
+    }
+
     fn start_sign_in(&mut self) {
         if self.session.demo || self.sign_in_running {
             return;
@@ -532,6 +887,7 @@ impl PopupApp {
     }
 
     fn on_sign_in(&mut self, update: SignInUpdate) {
+        let signed_in_now = matches!(update, SignInUpdate::Done);
         match update {
             SignInUpdate::Code(user_code) => self.sign_in = SignInStage::Waiting { user_code },
             SignInUpdate::Done => {
@@ -545,8 +901,30 @@ impl PopupApp {
                 self.sign_in_running = false;
                 self.sign_in = SignInStage::Failed;
             }
+            SignInUpdate::Issued {
+                attempt,
+                code,
+                lifetime,
+            } => {
+                if let Some(window) = self.sign_in_window_for(attempt) {
+                    window.model.on_code(code, lifetime, Instant::now());
+                }
+            }
+            SignInUpdate::Ended { attempt, end } => {
+                if let Some(window) = self.sign_in_window_for(attempt) {
+                    window.model.on_end(end, Instant::now());
+                }
+            }
         }
-        if self.auto_sign_in() {
+        if signed_in_now {
+            // Not numbered: the token is already saved, so whichever attempt
+            // this was, the app is signed in.
+            if let Some(window) = self.sign_in_window.as_mut() {
+                window.model.on_signed_in(Instant::now());
+            }
+        }
+        self.redraw_sign_in_window();
+        if self.auto_sign_in() || self.launch_window_on() {
             self.refresh_tray();
         }
         self.redraw_settings();
@@ -677,6 +1055,7 @@ impl PopupApp {
                     self.sync_character(event_loop);
                     self.redraw_character();
                     self.refresh_tray();
+                    self.sync_sign_in_phase();
                 }
                 UiMsg::SignIn(update) => self.on_sign_in(update),
             }
@@ -687,6 +1066,15 @@ impl PopupApp {
         match id {
             "settings" => {
                 self.open_settings(event_loop, false);
+                return;
+            }
+            "sign-in" if self.launch_window_on() => {
+                self.sign_in_from_menu(event_loop);
+                return;
+            }
+            "sign-out" if self.launch_window_on() => {
+                self.sign_out_under_flag(event_loop);
+                self.redraw_settings();
                 return;
             }
             "sign-in" => {
@@ -838,8 +1226,21 @@ impl ApplicationHandler<Wake> for PopupApp {
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .onboarded();
-            if !onboarded {
-                self.open_settings(event_loop, true);
+            let session = self.launch_session.take().unwrap_or(SessionRead::Missing);
+            match opens_at_launch(self.launch_window_on(), self.session.demo, session) {
+                LaunchWindow::None => {
+                    if !onboarded {
+                        self.open_settings(event_loop, true);
+                    }
+                }
+                LaunchWindow::SignIn => {
+                    self.pending_first_run = !onboarded;
+                    self.open_sign_in_window(event_loop, false);
+                }
+                LaunchWindow::KeychainUnreadable => {
+                    self.pending_first_run = !onboarded;
+                    self.open_sign_in_window(event_loop, true);
+                }
             }
         }
         self.sync_character(event_loop);
@@ -852,6 +1253,32 @@ impl ApplicationHandler<Wake> for PopupApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.sign_in_window_id() == Some(id) {
+            match event {
+                // Closing the window stops polling. The app stays in the tray.
+                WindowEvent::CloseRequested => self.close_sign_in_window(event_loop),
+                WindowEvent::RedrawRequested => self.paint_sign_in_window(),
+                WindowEvent::Resized(_) => self.redraw_sign_in_window(),
+                WindowEvent::ModifiersChanged(modifiers) => {
+                    self.shift = modifiers.state().shift_key();
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    self.on_sign_in_window_key(event_loop, &event);
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    if let Some(window) = self.sign_in_window.as_mut() {
+                        window.cursor_y = position.y;
+                    }
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } => self.on_sign_in_window_click(event_loop),
+                _ => {}
+            }
+            return;
+        }
         if self.settings_id() == Some(id) {
             match event {
                 WindowEvent::CloseRequested => self.close_settings(),
@@ -991,6 +1418,7 @@ impl ApplicationHandler<Wake> for PopupApp {
             return;
         }
         self.dismiss_expired();
+        let sign_in_wake = self.tick_sign_in_window(event_loop);
         let visible = self
             .session
             .config
@@ -1009,7 +1437,64 @@ impl ApplicationHandler<Wake> for PopupApp {
             Some(bubble) => bubble.deadline.min(self.next_tray_refresh),
             None => self.next_tray_refresh,
         };
+        // Sooner only while the sign-in window has a clock on screen.
+        let wake_at = sign_in_wake.map_or(wake_at, |at| at.min(wake_at));
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+    }
+}
+
+/// The ORBIT host, without a scheme.
+fn server_host(config: &Config) -> String {
+    let server = resolve_server_base(
+        config.server_base_url(),
+        std::env::var(ENV_SERVER_URL).ok().as_deref(),
+    )
+    .unwrap_or_else(|_| stardust_core::api::DEFAULT_SERVER_BASE.to_string());
+    https_origin(&server)
+        .unwrap_or(server)
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string()
+}
+
+/// The keys the settings and sign-in windows act on.
+fn window_key(key: &WinitKey, shift: bool) -> Option<Key> {
+    Some(match key {
+        WinitKey::Named(NamedKey::ArrowUp) => Key::Up,
+        WinitKey::Named(NamedKey::ArrowDown) => Key::Down,
+        WinitKey::Named(NamedKey::ArrowLeft) => Key::Left,
+        WinitKey::Named(NamedKey::ArrowRight) => Key::Right,
+        WinitKey::Named(NamedKey::Tab) if shift => Key::BackTab,
+        WinitKey::Named(NamedKey::Tab) => Key::Tab,
+        WinitKey::Named(NamedKey::Enter | NamedKey::Space) => Key::Activate,
+        WinitKey::Named(NamedKey::Escape) => Key::Escape,
+        WinitKey::Named(NamedKey::Home) => Key::Home,
+        WinitKey::Named(NamedKey::End) => Key::End,
+        _ => return None,
+    })
+}
+
+/// Only the user code goes on the clipboard. A clipboard that cannot be reached
+/// (a Wayland session with no X11 bridge, for one) is reported in the window.
+fn copy_user_code(clipboard: &mut Option<arboard::Clipboard>, user_code: &str) -> bool {
+    if clipboard.is_none() {
+        match arboard::Clipboard::new() {
+            Ok(opened) => *clipboard = Some(opened),
+            Err(err) => {
+                eprintln!("stardust: could not reach the clipboard: {err}");
+                return false;
+            }
+        }
+    }
+    let Some(opened) = clipboard.as_mut() else {
+        return false;
+    };
+    match opened.set_text(user_code) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("stardust: could not copy the code: {err}");
+            false
+        }
     }
 }
 
@@ -1190,11 +1675,211 @@ fn paint_settings(surface: &mut SbSurface, painter: &Painter, lines: &[Line], sc
     let _ = buffer.present();
 }
 
+fn paint_sign_in(surface: &mut SbSurface, painter: &Painter, lines: &[SignInLine], scale: u32) {
+    if resize_surface(surface).is_err() {
+        return;
+    }
+    let Ok(mut buffer) = surface.buffer_mut() else {
+        return;
+    };
+    let width = buffer.width().get();
+    let height = buffer.height().get();
+    draw_sign_in(&mut buffer, width, height, painter, lines, scale);
+    let _ = buffer.present();
+}
+
+/// Draw the sign-in window. Same layout as the settings window, so
+/// [`line_at`] maps a click to a line, with the code drawn at twice the scale
+/// across its own line and the empty one below it.
+fn draw_sign_in(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    painter: &Painter,
+    lines: &[SignInLine],
+    scale: u32,
+) {
+    buffer.fill(SETTINGS_BACKGROUND);
+    let pad = font::PAD * scale / 2;
+    for (index, line) in lines.iter().enumerate() {
+        let top = pad + index as u32 * line_height(scale);
+        let mut color = match line.kind {
+            SignInLineKind::Blank | SignInLineKind::CodeGap => continue,
+            SignInLineKind::Code => {
+                let large = scale * 2;
+                let text_width = font::text_columns(&line.text) * font::CELL_W * large;
+                let pen = Pen {
+                    x: (width.saturating_sub(text_width) / 2) as i32,
+                    y: top as i32,
+                    color: SETTINGS_TEXT,
+                    scale: large,
+                };
+                painter.draw_extended(buffer, width, &line.text, pen, SETTINGS_COLUMNS / 2);
+                continue;
+            }
+            SignInLineKind::Hint => SETTINGS_MUTED_TEXT,
+            SignInLineKind::Title | SignInLineKind::Info | SignInLineKind::Row(_) => SETTINGS_TEXT,
+        };
+        if line.focused {
+            let fill_top = top.saturating_sub(LINE_GAP * scale / 2);
+            let fill_bottom = (fill_top + line_height(scale)).min(height);
+            for y in fill_top..fill_bottom {
+                for x in pad / 2..width.saturating_sub(pad / 2) {
+                    buffer[(y * width + x) as usize] = SETTINGS_FOCUS_FILL;
+                }
+            }
+            color = SETTINGS_FOCUS_TEXT;
+        }
+        let pen = Pen {
+            x: pad as i32,
+            y: top as i32,
+            color,
+            scale,
+        };
+        painter.draw_extended(buffer, width, &line.text, pen, SETTINGS_COLUMNS);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{centered, line_at, settings_size, LINE_GAP};
-    use crate::font::{CELL_H, PAD};
+    use super::{centered, draw_sign_in, line_at, settings_size, LINE_GAP, SETTINGS_COLUMNS};
+    use crate::font::{Painter, CELL_H, PAD};
+    use stardust_core::a11y::{
+        SETTINGS_BACKGROUND, SETTINGS_FOCUS_FILL, SETTINGS_FOCUS_TEXT, SETTINGS_TEXT,
+    };
+    use stardust_core::connect::IssuedCode;
+    use stardust_core::i18n::Language;
     use stardust_core::position::{ScreenPoint, ScreenRect};
+    use stardust_core::signin_window::{
+        SignInEnd, SignInLineKind, SignInModel, SignInRow, COLUMNS,
+    };
+    use std::time::{Duration, Instant};
+
+    fn issued() -> IssuedCode {
+        IssuedCode {
+            user_code: "ABCD-EFGH".to_string(),
+            address: Some("helloorbit.app/rust-preview/pqc/account".to_string()),
+            open_url: Some(
+                "https://helloorbit.app/rust-preview/pqc/account?user_code=ABCD-EFGH".to_string(),
+            ),
+        }
+    }
+
+    fn sign_in_pixels(model: &SignInModel, now: Instant, scale: u32) -> (Vec<u32>, u32, u32) {
+        let (width, height) = settings_size(SETTINGS_COLUMNS, model.max_lines() as u32, scale);
+        let mut buffer = vec![0_u32; (width * height) as usize];
+        let lines = model.lines(now, Language::English);
+        draw_sign_in(&mut buffer, width, height, &Painter::new(), &lines, scale);
+        (buffer, width, height)
+    }
+
+    #[test]
+    fn the_sign_in_window_fits_the_columns_the_model_writes_for() {
+        assert_eq!(COLUMNS as u32, SETTINGS_COLUMNS);
+    }
+
+    #[test]
+    fn the_sign_in_window_draws_the_code_large_and_marks_the_focused_row() {
+        let t0 = Instant::now();
+        let mut model = SignInModel::requesting("helloorbit.app", t0);
+        model.on_code(issued(), Duration::from_secs(582), t0);
+        let scale = 2;
+        let (pixels, width, height) = sign_in_pixels(&model, t0, scale);
+        assert!(pixels.contains(&SETTINGS_BACKGROUND));
+        assert!(pixels.contains(&SETTINGS_TEXT));
+        assert!(pixels.contains(&SETTINGS_FOCUS_FILL));
+        assert!(pixels.contains(&SETTINGS_FOCUS_TEXT));
+
+        let lines = model.lines(t0, Language::English);
+        let step = (CELL_H + LINE_GAP) * scale;
+        let top_of = |index: usize| PAD * scale / 2 + index as u32 * step;
+        let row_has_ink =
+            |y: u32, color: u32| (0..width).any(|x| pixels[(y * width + x) as usize] == color);
+
+        let code_at = lines
+            .iter()
+            .position(|line| line.kind == SignInLineKind::Code)
+            .unwrap();
+        assert_eq!(lines[code_at + 1].kind, SignInLineKind::CodeGap);
+        let tallest = (top_of(code_at)..top_of(code_at + 2))
+            .filter(|y| row_has_ink(*y, SETTINGS_TEXT))
+            .count() as u32;
+        assert!(
+            tallest > CELL_H * scale,
+            "{tallest} px is taller than one line of text"
+        );
+
+        let focused_at = lines.iter().position(|line| line.focused).unwrap();
+        assert_eq!(lines[focused_at].kind, SignInLineKind::Row(SignInRow::Open));
+        assert!(row_has_ink(top_of(focused_at), SETTINGS_FOCUS_FILL));
+        let last_line = top_of(lines.len() - 1) + step;
+        assert!(last_line <= height, "{last_line} fits in {height}");
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_row_maps_back_to_that_row() {
+        let t0 = Instant::now();
+        let after = t0 + Duration::from_secs(1);
+        let mut model = SignInModel::requesting("helloorbit.app", t0);
+        model.on_code(issued(), Duration::from_secs(582), t0);
+        let scale = 3;
+        let lines = model.lines(after, Language::English);
+        let cancel_at = lines
+            .iter()
+            .position(|line| line.kind == SignInLineKind::Row(SignInRow::Cancel))
+            .unwrap();
+        let y = f64::from(PAD * scale / 2 + cancel_at as u32 * (CELL_H + LINE_GAP) * scale) + 1.0;
+        assert_eq!(line_at(y, scale), Some(cancel_at));
+        assert_eq!(
+            model.click(cancel_at, after),
+            stardust_core::signin_window::SignInAction::Close
+        );
+    }
+
+    /// Writes what each state looks like, to look at by eye. Nothing else in
+    /// the test suite can see the drawing. Run it with
+    /// `cargo test preview_sign_in_window -- --ignored`.
+    #[test]
+    #[ignore = "writes PNG files for a manual look"]
+    fn preview_sign_in_window() {
+        let dir = std::env::temp_dir().join("stardust-sign-in-preview");
+        std::fs::create_dir_all(&dir).unwrap();
+        let t0 = Instant::now();
+        let mut waiting = SignInModel::requesting("helloorbit.app", t0);
+        waiting.on_code(issued(), Duration::from_secs(582), t0);
+        let mut reconnecting = waiting.clone();
+        reconnecting.on_connection("ABCD-EFGH", false);
+        let mut denied = waiting.clone();
+        denied.on_end(SignInEnd::Denied, t0);
+        let mut keychain_failed = waiting.clone();
+        keychain_failed.on_end(SignInEnd::KeychainFailed, t0);
+        let mut signed_in = waiting.clone();
+        signed_in.on_signed_in(t0);
+        let states = [
+            ("requesting", SignInModel::requesting("helloorbit.app", t0)),
+            ("waiting", waiting),
+            ("reconnecting", reconnecting),
+            ("denied", denied),
+            ("keychain-failed", keychain_failed),
+            ("signed-in", signed_in),
+        ];
+        for (name, model) in states {
+            let (pixels, width, height) = sign_in_pixels(&model, t0, 2);
+            let rgba: Vec<u8> = pixels
+                .iter()
+                .flat_map(|pixel| {
+                    let [_, red, green, blue] = pixel.to_be_bytes();
+                    [red, green, blue, 255]
+                })
+                .collect();
+            let file = std::fs::File::create(dir.join(format!("{name}.png"))).unwrap();
+            let mut encoder = png::Encoder::new(file, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgba).unwrap();
+        }
+    }
 
     /// This is why the app builds one loop for the whole process. winit
     /// checks its once-per-process guard before it touches the display, so

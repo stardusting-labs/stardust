@@ -19,6 +19,7 @@ use stardust_core::check::{
 use stardust_core::config::{default_config_path, load_config, save_config, Config, Feature};
 use stardust_core::connect::{DeviceFlow, FlowPhase, FlowStep};
 use stardust_core::http::{HttpOrbitClient, Revoke};
+use stardust_core::i18n::Language;
 use stardust_core::integrations::{IntegrationRecord, SecretStore};
 use stardust_core::outbound::{prepare_posts, DeliveryNote, DeliveryWindow};
 use stardust_core::pet::{pet_pose, tray_glyph, ObservedCheck};
@@ -27,8 +28,9 @@ use stardust_core::position::ScreenPoint;
 use stardust_core::route::Router;
 use stardust_core::schedule::{parse_timezone, FireSource};
 use stardust_core::session::{current_access, stored_from_response, Access, Refresher};
+use stardust_core::signin_window::{SessionRead, SignInEnd};
 use stardust_core::text::{menu_text, test_send_target};
-use stardust_core::token::TokenStore;
+use stardust_core::token::{StoredToken, TokenStore};
 use std::cell::RefCell;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
@@ -55,9 +57,12 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             let loaded = load_or_create(&path)?;
             crate::signin::sign_in(&loaded)
         }
-        Command::SignOut { config } => {
+        Command::SignOut { config, demo } => {
             // An unreadable or missing config file signs out as before.
             let loaded = load_config(&config_path(config)).ok().flatten();
+            if demo_sign_out_refused(demo, loaded.as_ref()) {
+                return Err("demo mode does not sign out".to_string());
+            }
             crate::signin::sign_out(loaded.as_ref())
         }
         Command::Feature { config, action } => {
@@ -125,6 +130,13 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             crate::integrations_cmd::apply(&config_path(config), action)
         }
     }
+}
+
+/// `--demo` makes no use of a sign-in, so under the launch sign-in window flag
+/// it must not delete a real one or ask ORBIT to revoke it. With the flag off
+/// the command stays as it was.
+fn demo_sign_out_refused(demo: bool, config: Option<&Config>) -> bool {
+    demo && config.is_some_and(|config| config.features().launch_sign_in_window)
 }
 
 fn config_path(config: Option<PathBuf>) -> PathBuf {
@@ -220,6 +232,7 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
     let wake = Arc::new(tokio::sync::Notify::new());
     let tray = Rc::new(RefCell::new(None));
     let live = LivePet::new(1.0);
+    live.set_demo(demo);
     let scheduler = {
         let config = Arc::clone(&config);
         let manual = Arc::clone(&manual);
@@ -266,11 +279,11 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
         match window::run(session) {
             Ok(()) => {}
             Err(RunError::Unavailable(err) | RunError::Failed(err)) => {
-                let auto_sign_in = config
+                let sign_in_on_timer = config
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .features()
-                    .auto_sign_in;
+                    .sign_in_on_timer();
                 windows_unavailable = true;
                 eprintln!("stardust: windows are unavailable: {err}");
                 inbox.clear_proxy();
@@ -281,7 +294,7 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
                     // Demo mode needs no look; otherwise the connection line
                     // waits for the first check rather than open a keychain
                     // session just for it.
-                    if auto_sign_in && demo {
+                    if sign_in_on_timer && demo {
                         live.set_signed_in(true);
                     }
                     let text = tray_text(&loaded, &live, language);
@@ -300,7 +313,7 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
                 while let Some(message) = inbox.try_pop() {
                     match message {
                         UiMsg::Checked(presentation) => print_lines(&presentation.summary.lines),
-                        UiMsg::SignIn(update) if auto_sign_in => print_sign_in(&update),
+                        UiMsg::SignIn(update) if sign_in_on_timer => print_sign_in(&update),
                         UiMsg::SignIn(_) | UiMsg::Menu(_) | UiMsg::Pet => {}
                     }
                 }
@@ -353,12 +366,12 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
             Some(UiMsg::SignIn(update)) => {
                 // Only the check-timer sign-in reaches this loop; the
                 // settings window, which starts the other one, is not open.
-                let auto = config
+                let on_timer = config
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .features()
-                    .auto_sign_in;
-                if auto {
+                    .sign_in_on_timer();
+                if on_timer {
                     print_sign_in(&update);
                     if matches!(update, SignInUpdate::Done) {
                         manual.store(true, Ordering::SeqCst);
@@ -429,6 +442,7 @@ fn scheduler_thread(job: ScheduleJob) {
         let mut planned: Option<(Instant, Planned)> = None;
         loop {
             if quit.load(Ordering::SeqCst) {
+                finish_sign_out_on_quit(&backend, &config, &tokens, &live);
                 break;
             }
             run_requests(&backend, &config, &tokens, &live, &inbox, &mut flow);
@@ -468,7 +482,7 @@ fn scheduler_thread(job: ScheduleJob) {
                 continue;
             }
             if flow.is_some() {
-                step_flow(&backend, &tokens, &live, &inbox, &mut flow);
+                step_flow(&backend, &tokens, &live, &inbox, &mut flow, Instant::now());
                 if Instant::now() < due {
                     continue;
                 }
@@ -522,15 +536,19 @@ fn next_failures(current: u32, soften: bool) -> u32 {
 }
 
 /// Auto sign-in starts by itself only on a first run: the welcome window
-/// was never closed. After that it starts from a click on "Sign in".
+/// was never closed. After that it starts from a click on "Sign in". With the
+/// launch sign-in window on, that window is the only thing that starts one,
+/// because the window ignores a flow it did not number.
 fn first_run_connect(config: &Mutex<Config>) -> bool {
     let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-    loaded.features().auto_sign_in && !loaded.onboarded()
+    let features = loaded.features();
+    features.auto_sign_in && !features.launch_sign_in_window && !loaded.onboarded()
 }
 
 /// A tray click the check timer carries out with the newer features on.
 enum TimerRequest {
     Connect,
+    SignOut,
     Test(String),
 }
 
@@ -538,12 +556,29 @@ impl TimerRequest {
     fn queue(self, live: &LivePet) {
         match self {
             Self::Connect => live.request_connect(),
+            Self::SignOut => {
+                if let Err(err) = crate::signin::begin_sign_out(&KeychainTokenStore::new(), live) {
+                    eprintln!("stardust: could not sign out: {err}");
+                }
+            }
             Self::Test(id) => live.request_test(&id),
         }
     }
 }
 
 fn timer_request(config: &Mutex<Config>, live: &LivePet, id: &str) -> Option<TimerRequest> {
+    timer_request_with(config, live, id, &crate::signin::session)
+}
+
+/// `read_session` looks in the keychain. The launch sign-in window flag always
+/// looks on a click, so a sign-in made in a terminal is noticed rather than
+/// started again. Tests pass their own.
+fn timer_request_with(
+    config: &Mutex<Config>,
+    live: &LivePet,
+    id: &str,
+    read_session: &dyn Fn() -> SessionRead,
+) -> Option<TimerRequest> {
     let features = config
         .lock()
         .unwrap_or_else(|err| err.into_inner())
@@ -552,6 +587,35 @@ fn timer_request(config: &Mutex<Config>, live: &LivePet, id: &str) -> Option<Tim
         if let Some(target) = test_send_target(id) {
             return Some(TimerRequest::Test(target.to_string()));
         }
+    }
+    if features.launch_sign_in_window {
+        if live.demo() {
+            return None;
+        }
+        return match id {
+            "sign-in" => match read_session() {
+                SessionRead::Usable { until } => {
+                    live.note_session(until);
+                    live.set_signed_in(true);
+                    if live.observed() == ObservedCheck::SignedOut {
+                        live.set_observed(ObservedCheck::Waiting);
+                    }
+                    None
+                }
+                SessionRead::Missing => {
+                    live.set_signed_in(false);
+                    Some(TimerRequest::Connect)
+                }
+                SessionRead::Unreadable => {
+                    eprintln!(
+                        "stardust: could not read the system keychain; unlock it and try again"
+                    );
+                    None
+                }
+            },
+            "sign-out" => Some(TimerRequest::SignOut),
+            _ => None,
+        };
     }
     if features.auto_sign_in && id == "sign-in" {
         // Not known yet: look now, on the click, rather than at start.
@@ -569,10 +633,10 @@ fn timer_request(config: &Mutex<Config>, live: &LivePet, id: &str) -> Option<Tim
 
 /// Requests from the tray and the settings window, carried out on the check
 /// timer so no other thread does network work.
-fn run_requests(
+fn run_requests<S: TokenStore + SecretStore>(
     backend: &Backend,
     config: &Mutex<Config>,
-    tokens: &KeychainTokenStore,
+    tokens: &S,
     live: &LivePet,
     inbox: &Inbox,
     flow: &mut Option<DeviceFlow>,
@@ -587,9 +651,22 @@ fn run_requests(
         live.set_observed(ObservedCheck::SignedOut);
         inbox.push(UiMsg::Pet);
     }
-    if live.take_connect() && flow.is_none() {
-        if let Backend::Live(client) = backend {
-            start_flow(client, config, live, inbox, flow);
+    let requests = live.take_flow_requests();
+    // Only the launch sign-in window asks for this. The code stays valid on
+    // ORBIT until it expires, because no route cancels it; this computer just
+    // stops polling.
+    if requests.cancel {
+        let dropped = flow.take().is_some();
+        live.set_phase(FlowPhase::Idle);
+        if dropped {
+            inbox.push(UiMsg::Pet);
+        }
+    }
+    if let Some(attempt) = requests.connect {
+        if flow.is_none() {
+            if let Backend::Live(client) = backend {
+                start_flow(client, config, live, inbox, flow, attempt);
+            }
         }
     }
     let tests = live.take_tests();
@@ -598,11 +675,37 @@ fn run_requests(
     }
 }
 
+/// Quit can land while a long check holds up the timer, right after Sign out.
+/// The tray already said signed out, so finish it: otherwise the refresh token
+/// is never revoked, and a record that check saved would sign the next launch
+/// back in. Only under the launch sign-in window flag; the other flags keep
+/// what they do today.
+fn finish_sign_out_on_quit(
+    backend: &Backend,
+    config: &Mutex<Config>,
+    tokens: &dyn TokenStore,
+    live: &LivePet,
+) {
+    let window_flag = config
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .features()
+        .launch_sign_in_window;
+    if !window_flag {
+        return;
+    }
+    if let Backend::Live(client) = backend {
+        if let Some(ticket) = live.take_sign_out() {
+            finish_sign_out(client, tokens, ticket.refresh_token());
+        }
+    }
+}
+
 /// The settings window already deleted the keychain record. A check that was
 /// running then may have saved a rotated one, so delete again and revoke
 /// every refresh token seen. A server without the revoke route answers 404,
 /// which is fine.
-fn finish_sign_out(client: &HttpOrbitClient, tokens: &KeychainTokenStore, refresh: Option<&str>) {
+fn finish_sign_out(client: &HttpOrbitClient, tokens: &dyn TokenStore, refresh: Option<&str>) {
     let rotated = tokens
         .load(Utc::now())
         .ok()
@@ -634,12 +737,31 @@ fn start_flow(
     live: &LivePet,
     inbox: &Inbox,
     flow: &mut Option<DeviceFlow>,
+    attempt: u64,
 ) {
-    let server_base = {
+    let (server_base, for_window) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
-        server_base_of(&loaded).unwrap_or_else(|_| DEFAULT_SERVER_BASE.to_string())
+        (
+            server_base_of(&loaded).unwrap_or_else(|_| DEFAULT_SERVER_BASE.to_string()),
+            loaded.features().launch_sign_in_window,
+        )
     };
     match DeviceFlow::start(client, &server_base, Instant::now) {
+        // No browser opens by itself: a window appearing at login should not
+        // also launch one. The Open row is a click away.
+        Ok(started) if for_window => {
+            let started = started.for_window(attempt);
+            live.set_phase(FlowPhase::Waiting {
+                user_code: started.user_code().to_string(),
+            });
+            inbox.push(UiMsg::Pet);
+            inbox.push(UiMsg::SignIn(SignInUpdate::Issued {
+                attempt,
+                code: started.issued(),
+                lifetime: started.remaining(Instant::now()),
+            }));
+            *flow = Some(started);
+        }
         Ok(started) => {
             let user_code = started.user_code().to_string();
             live.set_phase(FlowPhase::Waiting {
@@ -660,7 +782,14 @@ fn start_flow(
             eprintln!("stardust: sign-in: {err}");
             live.set_phase(FlowPhase::Idle);
             inbox.push(UiMsg::Pet);
-            inbox.push(UiMsg::SignIn(SignInUpdate::Failed));
+            inbox.push(UiMsg::SignIn(if for_window {
+                SignInUpdate::Ended {
+                    attempt,
+                    end: SignInEnd::from_error(&err),
+                }
+            } else {
+                SignInUpdate::Failed
+            }));
         }
     }
 }
@@ -668,10 +797,11 @@ fn start_flow(
 /// One device-token poll, when it is due.
 fn step_flow(
     backend: &Backend,
-    tokens: &KeychainTokenStore,
+    tokens: &dyn TokenStore,
     live: &LivePet,
     inbox: &Inbox,
     flow: &mut Option<DeviceFlow>,
+    now: Instant,
 ) {
     let Backend::Live(client) = backend else {
         *flow = None;
@@ -681,7 +811,8 @@ fn step_flow(
         return;
     };
     let user_code = current.user_code().to_string();
-    let step = current.step(client, Instant::now(), entropy());
+    let attempt = current.window_attempt();
+    let step = current.step(client, now, entropy());
     let phase = match step {
         FlowStep::Wait(_) => return,
         FlowStep::Pending(_) => FlowPhase::Waiting { user_code },
@@ -689,11 +820,27 @@ fn step_flow(
         FlowStep::Approved(token) => {
             *flow = None;
             live.set_phase(FlowPhase::Idle);
-            let saved = stored_from_response(token, Utc::now())
-                .map_err(|err| err.to_string())
-                .and_then(|stored| tokens.store(&stored).map_err(|err| err.to_string()));
+            let refresh = token.refresh_token.clone();
+            let stored = stored_from_response(token, Utc::now());
+            let until = stored.as_ref().ok().map(StoredToken::usable_until);
+            let (saved, end) = match stored {
+                Ok(stored) => (
+                    tokens.store(&stored).map_err(|err| err.to_string()),
+                    SignInEnd::KeychainFailed,
+                ),
+                Err(err) => (Err(err.to_string()), SignInEnd::from_error(&err)),
+            };
             match saved {
                 Ok(()) => {
+                    if let Some(until) = until {
+                        live.note_session(until);
+                    }
+                    if attempt.is_some() {
+                        // A new attempt asked for while this poll was out has
+                        // no purpose now. This thread is also the one that
+                        // takes requests, so it cannot race a flow starting.
+                        live.request_cancel();
+                    }
                     live.set_signed_in(true);
                     live.set_observed(ObservedCheck::Waiting);
                     inbox.push(UiMsg::Pet);
@@ -701,8 +848,13 @@ fn step_flow(
                 }
                 Err(err) => {
                     eprintln!("stardust: sign-in: {err}");
+                    if let (Some(_), Some(refresh)) = (attempt, refresh.as_deref()) {
+                        // This token is about to be dropped, so nothing could
+                        // revoke it later.
+                        let _ = client.revoke_refresh_token(refresh);
+                    }
                     inbox.push(UiMsg::Pet);
-                    inbox.push(UiMsg::SignIn(SignInUpdate::Failed));
+                    inbox.push(UiMsg::SignIn(ended_update(attempt, end)));
                 }
             }
             return;
@@ -712,7 +864,10 @@ fn step_flow(
             eprintln!("stardust: sign-in: {err}");
             live.set_phase(FlowPhase::Idle);
             inbox.push(UiMsg::Pet);
-            inbox.push(UiMsg::SignIn(SignInUpdate::Failed));
+            inbox.push(UiMsg::SignIn(ended_update(
+                attempt,
+                SignInEnd::from_error(&err),
+            )));
             return;
         }
     };
@@ -722,7 +877,16 @@ fn step_flow(
     }
 }
 
-fn send_tests(config: &Mutex<Config>, tokens: &KeychainTokenStore, inbox: &Inbox, ids: &[String]) {
+/// How a sign-in that stopped is reported: with its reason to the window that
+/// numbered it, and as before to anything else.
+fn ended_update(attempt: Option<u64>, end: SignInEnd) -> SignInUpdate {
+    match attempt {
+        Some(attempt) => SignInUpdate::Ended { attempt, end },
+        None => SignInUpdate::Failed,
+    }
+}
+
+fn send_tests(config: &Mutex<Config>, tokens: &dyn SecretStore, inbox: &Inbox, ids: &[String]) {
     let (records, server_base, language, routing_on) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
         (
@@ -841,11 +1005,11 @@ impl PendingPosts {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_check(
+async fn run_check<S: TokenStore + SecretStore>(
     client: &Backend,
     config: &Mutex<Config>,
     path: &Path,
-    tokens: &KeychainTokenStore,
+    tokens: &S,
     live: &LivePet,
     router: &mut Router,
     kind: &CheckKind,
@@ -863,6 +1027,7 @@ async fn run_check(
         match current_access(tokens, refresher, now, false) {
             Access::Ready { token, unsaved, .. } => {
                 note_unsaved(unsaved);
+                live.note_session(token.usable_until());
                 Some(token)
             }
             Access::SignedOut => {
@@ -902,6 +1067,7 @@ async fn run_check(
             current_access(tokens, refresher, Utc::now(), true)
         {
             note_unsaved(unsaved);
+            live.note_session(token.usable_until());
             result = perform_check(
                 client,
                 token.access_token(),
@@ -1066,14 +1232,19 @@ fn soft_signal(
         Notice::SignedOut => ObservedCheck::SignedOut,
     };
     let previous = live.observed();
-    let language = {
+    let (language, window_flag) = {
         let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
         note_anchor(loaded.state_mut(), kind);
         if let Err(err) = save_config(path, &loaded) {
             eprintln!("stardust: could not save config: {err}");
         }
-        loaded.effective_language()
+        (
+            loaded.effective_language(),
+            loaded.features().launch_sign_in_window,
+        )
     };
+    // The bubble that says to sign in stays away from a sign-in in progress.
+    let already_signing_in = window_flag && notice == Notice::SignedOut && live.sign_in_active();
     live.set_observed(observed);
     if notice == Notice::SignedOut {
         live.set_signed_in(false);
@@ -1081,7 +1252,7 @@ fn soft_signal(
     let manual = matches!(kind, CheckKind::Manual);
     CheckSignal {
         presentation: calm_notice_in(notice, server_base, language),
-        publish: manual || previous != observed,
+        publish: (manual || previous != observed) && !already_signing_in,
         soften,
         posts: None,
     }
@@ -1170,6 +1341,26 @@ fn print_sign_in(update: &SignInUpdate) {
         }
         SignInUpdate::Done => println!("Signed in. The access token is in the system keychain."),
         SignInUpdate::Failed => println!("Sign-in did not finish. Choose Sign in to try again."),
+        SignInUpdate::Issued { code, .. } => {
+            // No browser opens by itself with this flow, so the address is
+            // the way there.
+            println!(
+                "Enter this code on the ORBIT account page: {}",
+                code.user_code
+            );
+            match &code.address {
+                Some(address) => println!("https://{address}"),
+                None => println!(
+                    "Open the ORBIT account page in your browser and enter the code there."
+                ),
+            }
+        }
+        SignInUpdate::Ended { end, .. } => {
+            println!(
+                "{}. Choose Sign in to try again.",
+                end.message(Language::default())
+            );
+        }
     }
 }
 
@@ -1181,12 +1372,758 @@ fn print_lines(lines: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_run_connect, plan_next, timer_request, TimerRequest};
+    use super::{
+        demo_sign_out_refused, finish_sign_out_on_quit, first_run_connect, plan_next, run_check,
+        run_requests, soft_signal, start_flow, step_flow, timer_request, timer_request_with,
+        Backend, TimerRequest,
+    };
+    use crate::inbox::{Inbox, SignInUpdate, UiMsg};
     use crate::live::LivePet;
-    use stardust_core::check::BACKOFF_CAP;
-    use stardust_core::config::{Config, Feature};
+    use crate::mock_orbit::{serve_forever, Script};
+    use crate::testmock::MockOrbit;
+    use chrono::{DateTime, Utc};
+    use stardust_core::api::{PATH_DEVICE_CODE, PATH_DEVICE_REVOKE, PATH_DEVICE_TOKEN};
+    use stardust_core::check::{CheckKind, BACKOFF_CAP};
+    use stardust_core::config::{parse_config, Config, Feature};
+    use stardust_core::connect::{DeviceFlow, FlowPhase};
+    use stardust_core::http::HttpOrbitClient;
+    use stardust_core::integrations::{SecretError, SecretStore};
+    use stardust_core::pet::ObservedCheck;
+    use stardust_core::policy::Notice;
+    use stardust_core::signin_window::{SessionRead, SignInEnd};
+    use stardust_core::token::{MemoryTokenStore, StoredToken, TokenError, TokenStore};
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    const DEVICE_CODE: &str = "abababababababababababababababababababababababababababababababab";
+    const PENDING: &str = r#"{"error":"authorization_pending"}"#;
+
+    /// Stands in for the keychain, so no test here touches the real one.
+    struct TestStore {
+        tokens: MemoryTokenStore,
+        refuse_store: bool,
+    }
+
+    impl TestStore {
+        fn new() -> Self {
+            Self {
+                tokens: MemoryTokenStore::new(),
+                refuse_store: false,
+            }
+        }
+    }
+
+    impl TokenStore for TestStore {
+        fn store(&self, token: &StoredToken) -> Result<(), TokenError> {
+            if self.refuse_store {
+                return Err(TokenError::Keychain);
+            }
+            self.tokens.store(token)
+        }
+        fn load(&self, now: DateTime<Utc>) -> Result<Option<StoredToken>, TokenError> {
+            self.tokens.load(now)
+        }
+        fn clear(&self) -> Result<(), TokenError> {
+            self.tokens.clear()
+        }
+    }
+
+    impl SecretStore for TestStore {
+        fn put(&self, _: &str, _: &str) -> Result<(), SecretError> {
+            Ok(())
+        }
+        fn get(&self, _: &str) -> Result<Option<String>, SecretError> {
+            Ok(None)
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            Ok(())
+        }
+    }
+
+    fn code_body() -> String {
+        format!(
+            r#"{{"device_code":"{DEVICE_CODE}","user_code":"ABCD-EFGH","verification_uri":"https://helloorbit.app/rust-preview/pqc/account","verification_uri_complete":"https://helloorbit.app/rust-preview/pqc/account?user_code=ABCD-EFGH","expires_in":600,"interval":1}}"#
+        )
+    }
+
+    fn token_body(refresh: Option<&str>) -> String {
+        let stamp = Utc::now().timestamp_millis() + 300_000;
+        let refresh = refresh.map_or(String::new(), |token| {
+            format!(r#","refresh_token":"{token}""#)
+        });
+        format!(
+            r#"{{"token":"access-1","access_token":"access-1","token_type":"Bearer","expires_in":300,"expires_at_epoch_ms":{stamp}{refresh}}}"#
+        )
+    }
+
+    /// How a server answers a device-token poll: the status and the body.
+    type PollReply = fn() -> (u16, String);
+
+    /// A server that issues a code and answers each poll with `poll`.
+    fn server(poll: PollReply) -> MockOrbit {
+        MockOrbit::start(move |path, _| match path {
+            PATH_DEVICE_CODE => (200, code_body()),
+            PATH_DEVICE_TOKEN => poll(),
+            PATH_DEVICE_REVOKE => (200, "{}".to_string()),
+            _ => (404, String::new()),
+        })
+    }
+
+    /// A config on the loopback mock with these features. A loopback base
+    /// allows no browser page, so nothing here can open one.
+    fn config_on(base: &str, features: &[Feature]) -> Mutex<Config> {
+        let mut config = parse_config(&format!(
+            r#"{{"character_visible":false,"character_position":{{"x":1,"y":2}},"schedule":{{"interval_minutes":60,"clock_times":[],"weekdays":["mon"],"timezone":"UTC"}},"server_base_url":"{base}"}}"#
+        ))
+        .unwrap();
+        for feature in features {
+            config.set_feature(*feature, true);
+        }
+        Mutex::new(config)
+    }
+
+    fn backend(base: &str) -> Backend {
+        Backend::Live(HttpOrbitClient::with_timeout(base, Duration::from_secs(2)).unwrap())
+    }
+
+    fn client_of(backend: &Backend) -> &HttpOrbitClient {
+        match backend {
+            Backend::Live(client) => client,
+            Backend::Demo(_) => panic!("a live backend"),
+        }
+    }
+
+    /// Everything waiting in the inbox, sign-in updates only.
+    fn updates(inbox: &Inbox) -> Vec<SignInUpdate> {
+        std::iter::from_fn(|| inbox.try_pop())
+            .filter_map(|message| match message {
+                UiMsg::SignIn(update) => Some(update),
+                UiMsg::Menu(_) | UiMsg::Checked(_) | UiMsg::Pet => None,
+            })
+            .collect()
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    #[test]
+    fn with_the_flag_a_new_sign_in_is_numbered_and_carries_only_what_the_window_may_show() {
+        let orbit = server(|| (400, PENDING.to_string()));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        let attempt = live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert_eq!(orbit.count(PATH_DEVICE_CODE), 1);
+        assert_eq!(flow.as_ref().unwrap().window_attempt(), Some(attempt));
+        assert_eq!(
+            live.phase(),
+            FlowPhase::Waiting {
+                user_code: "ABCD-EFGH".to_string()
+            }
+        );
+        let updates = updates(&inbox);
+        let [SignInUpdate::Issued {
+            attempt: stamped,
+            code,
+            lifetime,
+        }] = updates.as_slice()
+        else {
+            panic!("expected one issued update");
+        };
+        assert_eq!(*stamped, attempt);
+        assert_eq!(code.user_code, "ABCD-EFGH");
+        assert_eq!(code.open_url, None, "no page on a plain-http server");
+        assert!(*lifetime > Duration::from_secs(590));
+        assert!(!format!("{code:?}").contains(DEVICE_CODE));
+    }
+
+    #[test]
+    fn with_only_auto_sign_in_the_old_updates_are_sent() {
+        let orbit = server(|| (400, r#"{"error":"access_denied"}"#.to_string()));
+        let config = config_on(orbit.base(), &[Feature::AutoSignIn]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_connect();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert_eq!(flow.as_ref().unwrap().window_attempt(), None);
+        assert!(matches!(
+            updates(&inbox).as_slice(),
+            [SignInUpdate::Code(code)] if code == "ABCD-EFGH"
+        ));
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert!(matches!(updates(&inbox).as_slice(), [SignInUpdate::Failed]));
+    }
+
+    #[test]
+    fn approval_stores_the_token_and_reports_done() {
+        let orbit = server(|| (200, token_body(Some("refresh-1"))));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        updates(&inbox);
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert!(flow.is_none());
+        assert_eq!(live.phase(), FlowPhase::Idle);
+        assert_eq!(live.signed_in(), Some(true));
+        assert_eq!(live.observed(), ObservedCheck::Waiting);
+        let saved = store.load(Utc::now()).unwrap().unwrap();
+        assert_eq!(saved.access_token(), "access-1");
+        assert_eq!(saved.refresh_token(), Some("refresh-1"));
+        assert!(matches!(updates(&inbox).as_slice(), [SignInUpdate::Done]));
+        assert_eq!(orbit.count(PATH_DEVICE_REVOKE), 0);
+    }
+
+    #[test]
+    fn a_keychain_that_will_not_save_reports_it_and_revokes_the_dropped_token() {
+        let orbit = server(|| (200, token_body(Some("refresh-1"))));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox) = (LivePet::new(1.0), Inbox::new());
+        let store = TestStore {
+            tokens: MemoryTokenStore::new(),
+            refuse_store: true,
+        };
+        let mut flow = None;
+        let attempt = live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        updates(&inbox);
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert!(flow.is_none());
+        assert_eq!(live.phase(), FlowPhase::Idle);
+        assert_ne!(live.signed_in(), Some(true));
+        assert!(matches!(
+            updates(&inbox).as_slice(),
+            [SignInUpdate::Ended { attempt: stamped, end: SignInEnd::KeychainFailed }]
+                if *stamped == attempt
+        ));
+        assert_eq!(orbit.count(PATH_DEVICE_REVOKE), 1);
+        assert!(orbit.bodies(PATH_DEVICE_REVOKE)[0].contains("refresh-1"));
+    }
+
+    #[test]
+    fn each_way_a_sign_in_can_end_has_its_own_reason() {
+        let cases: [(PollReply, SignInEnd); 3] = [
+            (
+                || (400, r#"{"error":"access_denied"}"#.to_string()),
+                SignInEnd::Denied,
+            ),
+            (
+                || (400, r#"{"error":"expired_token"}"#.to_string()),
+                SignInEnd::Expired,
+            ),
+            (|| (404, String::new()), SignInEnd::Unavailable),
+        ];
+        for (poll, expected) in cases {
+            let orbit = server(poll);
+            let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+            let backend = backend(orbit.base());
+            let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+            let mut flow = None;
+            live.request_new_sign_in();
+            run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+            updates(&inbox);
+            step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+            assert!(flow.is_none(), "{expected:?}");
+            assert_eq!(live.phase(), FlowPhase::Idle);
+            assert!(
+                matches!(
+                    updates(&inbox).as_slice(),
+                    [SignInUpdate::Ended { end, .. }] if *end == expected
+                ),
+                "{expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_request_for_a_code_says_why() {
+        let off = MockOrbit::start(|_, _| (404, String::new()));
+        let config = config_on(off.base(), &[Feature::LaunchSignInWindow]);
+        let backend_off = backend(off.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_new_sign_in();
+        run_requests(&backend_off, &config, &store, &live, &inbox, &mut flow);
+        assert!(flow.is_none());
+        assert_eq!(live.phase(), FlowPhase::Idle);
+        assert!(matches!(
+            updates(&inbox).as_slice(),
+            [SignInUpdate::Ended {
+                end: SignInEnd::Unavailable,
+                ..
+            }]
+        ));
+
+        let closed = backend("http://127.0.0.1:1");
+        let config = config_on("http://127.0.0.1:1", &[Feature::LaunchSignInWindow]);
+        live.request_new_sign_in();
+        run_requests(&closed, &config, &store, &live, &inbox, &mut flow);
+        assert!(matches!(
+            updates(&inbox).as_slice(),
+            [SignInUpdate::Ended {
+                end: SignInEnd::Offline,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn going_offline_keeps_the_flow_and_recovers() {
+        let orbit = server(|| (400, PENDING.to_string()));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let live_backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_new_sign_in();
+        run_requests(&live_backend, &config, &store, &live, &inbox, &mut flow);
+        updates(&inbox);
+        let closed = backend("http://127.0.0.1:1");
+        step_flow(&closed, &store, &live, &inbox, &mut flow, later());
+        assert!(flow.is_some(), "still trying");
+        let code = "ABCD-EFGH".to_string();
+        assert_eq!(
+            live.phase(),
+            FlowPhase::Offline {
+                user_code: code.clone()
+            }
+        );
+        assert!(updates(&inbox).is_empty(), "a phase change, not an ending");
+        let long_after = Instant::now() + Duration::from_secs(120);
+        step_flow(&live_backend, &store, &live, &inbox, &mut flow, long_after);
+        assert_eq!(live.phase(), FlowPhase::Waiting { user_code: code });
+    }
+
+    #[test]
+    fn cancel_stops_the_polling_and_resets_the_phase() {
+        let orbit = server(|| (400, PENDING.to_string()));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert_eq!(orbit.count(PATH_DEVICE_TOKEN), 1);
+        while inbox.try_pop().is_some() {}
+
+        live.request_cancel();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert!(flow.is_none());
+        assert_eq!(live.phase(), FlowPhase::Idle);
+        assert!(
+            matches!(inbox.try_pop(), Some(UiMsg::Pet)),
+            "so the tray stops showing the old code"
+        );
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert_eq!(orbit.count(PATH_DEVICE_TOKEN), 1, "no further polls");
+        assert_eq!(orbit.count(PATH_DEVICE_CODE), 1);
+    }
+
+    #[test]
+    fn open_then_cancel_asks_for_nothing_and_cancel_then_open_asks_once() {
+        let orbit = server(|| (400, PENDING.to_string()));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+
+        live.request_new_sign_in();
+        live.request_cancel();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert_eq!(orbit.count(PATH_DEVICE_CODE), 0);
+        assert!(flow.is_none());
+
+        live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert_eq!(orbit.count(PATH_DEVICE_CODE), 1);
+        let first = flow.as_ref().unwrap().window_attempt().unwrap();
+
+        live.request_cancel();
+        let second = live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert_eq!(orbit.count(PATH_DEVICE_CODE), 2, "the old code is replaced");
+        assert_eq!(flow.as_ref().unwrap().window_attempt(), Some(second));
+        assert!(second > first);
+    }
+
+    #[test]
+    fn try_again_stamps_the_new_attempt_so_the_window_can_ignore_the_old_one() {
+        let orbit = server(|| (400, PENDING.to_string()));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        let old = live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        let new = live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        let stamps: Vec<u64> = updates(&inbox)
+            .iter()
+            .filter_map(|update| match update {
+                SignInUpdate::Issued { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamps, [old, new]);
+    }
+
+    #[test]
+    fn a_slow_answer_keeps_the_number_it_was_asked_under() {
+        // The request for a code blocks the timer. A newer attempt made during
+        // it must not relabel this answer, or the window would show a code
+        // that is about to be dropped.
+        let orbit = server(|| (400, PENDING.to_string()));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let live_backend = backend(orbit.base());
+        let (live, inbox) = (LivePet::new(1.0), Inbox::new());
+        let mut flow: Option<DeviceFlow> = None;
+        let asked = live.request_new_sign_in();
+        let requests = live.take_flow_requests();
+        live.request_new_sign_in();
+        start_flow(
+            client_of(&live_backend),
+            &config,
+            &live,
+            &inbox,
+            &mut flow,
+            requests.connect.unwrap(),
+        );
+        assert!(matches!(
+            updates(&inbox).as_slice(),
+            [SignInUpdate::Issued { attempt, .. }] if *attempt == asked
+        ));
+    }
+
+    #[test]
+    fn sign_out_during_a_sign_in_drops_the_flow_and_revokes_the_saved_token() {
+        let orbit = server(|| (200, token_body(None)));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let now = Utc::now();
+        store
+            .store(
+                &StoredToken::issue(
+                    "access-0",
+                    Some("refresh-0".to_string()),
+                    now + chrono::TimeDelta::seconds(100),
+                    now,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut flow = None;
+        live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert!(flow.is_some());
+
+        crate::signin::begin_sign_out(&store, &live).unwrap();
+        assert!(store.load(Utc::now()).unwrap().is_none());
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert!(flow.is_none(), "it could otherwise save a token afterwards");
+        assert_eq!(live.phase(), FlowPhase::Idle);
+        assert_eq!(live.signed_in(), Some(false));
+        assert_eq!(live.observed(), ObservedCheck::SignedOut);
+        assert_eq!(orbit.count(PATH_DEVICE_REVOKE), 1);
+        assert!(orbit.bodies(PATH_DEVICE_REVOKE)[0].contains("refresh-0"));
+        assert_eq!(orbit.count(PATH_DEVICE_TOKEN), 0);
+    }
+
+    #[test]
+    fn the_sign_in_bubble_stays_away_while_signing_in_and_only_under_the_flag() {
+        let path = std::env::temp_dir()
+            .join(format!("stardust-test-{}", uuid::Uuid::new_v4()))
+            .join("config.json");
+        let shown = |features: &[Feature], signing_in: bool, notice: Notice| {
+            let config = config_on("http://127.0.0.1:1", features);
+            let live = LivePet::new(1.0);
+            live.set_sign_in_window_open(signing_in);
+            soft_signal(
+                &config,
+                &path,
+                &live,
+                &CheckKind::Manual,
+                "http://127.0.0.1:1",
+                notice,
+                false,
+            )
+            .publish
+        };
+        let flag = [Feature::LaunchSignInWindow];
+        assert!(shown(&flag, false, Notice::SignedOut));
+        assert!(!shown(&flag, true, Notice::SignedOut));
+        assert!(
+            shown(&flag, true, Notice::Unavailable),
+            "only the sign-in bubble is held back"
+        );
+        assert!(shown(&[Feature::AutoSignIn], true, Notice::SignedOut));
+        assert!(shown(&[], true, Notice::SignedOut));
+    }
+
+    #[test]
+    fn with_no_window_the_tray_starts_a_sign_in_after_a_fresh_look_at_the_keychain() {
+        let config = Mutex::new(Config::default_for("UTC").unwrap());
+        config
+            .lock()
+            .unwrap()
+            .set_feature(Feature::LaunchSignInWindow, true);
+        let live = LivePet::new(1.0);
+        // The last answer said signed in, and the keychain now has nothing.
+        live.set_signed_in(true);
+        assert!(matches!(
+            timer_request_with(&config, &live, "sign-in", &|| SessionRead::Missing),
+            Some(TimerRequest::Connect)
+        ));
+        assert_eq!(live.signed_in(), Some(false));
+        // A sign-in made in a terminal is noticed, not started again.
+        live.set_observed(ObservedCheck::SignedOut);
+        assert!(timer_request_with(&config, &live, "sign-in", &|| {
+            SessionRead::Usable { until: None }
+        })
+        .is_none());
+        assert_eq!(live.signed_in(), Some(true));
+        assert_eq!(live.observed(), ObservedCheck::Waiting);
+        assert!(
+            timer_request_with(&config, &live, "sign-in", &|| { SessionRead::Unreadable })
+                .is_none()
+        );
+        assert!(matches!(
+            timer_request_with(&config, &live, "sign-out", &|| SessionRead::Missing),
+            Some(TimerRequest::SignOut)
+        ));
+        assert!(
+            timer_request_with(&config, &live, "check-now", &|| SessionRead::Missing).is_none()
+        );
+        live.set_demo(true);
+        for id in ["sign-in", "sign-out"] {
+            assert!(
+                timer_request_with(&config, &live, id, &|| SessionRead::Missing).is_none(),
+                "{id}: --demo has no sign-in to touch"
+            );
+        }
+    }
+
+    #[test]
+    fn an_approval_during_a_new_request_starts_nothing_more() {
+        let orbit = server(|| (200, token_body(None)));
+        let config = config_on(orbit.base(), &[Feature::LaunchSignInWindow]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert_eq!(orbit.count(PATH_DEVICE_CODE), 1);
+        updates(&inbox);
+
+        // The user cancelled and reopened while a poll was out, so the
+        // keychain still looked empty. Then that poll came back approved.
+        live.request_new_sign_in();
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert!(matches!(updates(&inbox).as_slice(), [SignInUpdate::Done]));
+
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert_eq!(orbit.count(PATH_DEVICE_CODE), 1, "no code nobody needs");
+        assert!(flow.is_none(), "no flow left polling with no window");
+        assert!(updates(&inbox).is_empty());
+        assert_eq!(live.phase(), FlowPhase::Idle);
+        assert_eq!(live.signed_in(), Some(true));
+    }
+
+    #[test]
+    fn with_only_auto_sign_in_an_approval_leaves_a_waiting_request_alone() {
+        let orbit = server(|| (200, token_body(None)));
+        let config = config_on(orbit.base(), &[Feature::AutoSignIn]);
+        let backend = backend(orbit.base());
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_connect();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        live.request_connect();
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert!(live.take_flow_requests().connect.is_some());
+    }
+
+    #[test]
+    fn sign_out_then_quit_still_revokes_and_deletes_under_the_flag_only() {
+        for (features, finished) in [
+            (&[Feature::LaunchSignInWindow][..], true),
+            (&[Feature::AutoSignIn][..], false),
+        ] {
+            let orbit = server(|| (400, PENDING.to_string()));
+            let config = config_on(orbit.base(), features);
+            let backend = backend(orbit.base());
+            let (live, store) = (LivePet::new(1.0), TestStore::new());
+            let now = Utc::now();
+            live.queue_sign_out(Some("refresh-0"));
+            // A check that was running saved a rotated record after the delete.
+            store
+                .store(
+                    &StoredToken::issue(
+                        "access-1",
+                        Some("refresh-1".to_string()),
+                        now + chrono::TimeDelta::seconds(100),
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            finish_sign_out_on_quit(&backend, &config, &store, &live);
+            assert_eq!(store.load(now).unwrap().is_none(), finished, "{features:?}");
+            let revoked = orbit.bodies(PATH_DEVICE_REVOKE);
+            if finished {
+                assert_eq!(revoked.len(), 2, "both refresh tokens");
+                assert!(revoked[0].contains("refresh-0"));
+                assert!(revoked[1].contains("refresh-1"));
+                assert!(live.take_sign_out().is_none());
+            } else {
+                assert!(revoked.is_empty());
+                assert!(live.take_sign_out().is_some(), "left as it was");
+            }
+        }
+    }
+
+    #[test]
+    fn demo_sign_out_is_refused_only_under_the_flag() {
+        let off = config_on("http://127.0.0.1:1", &[]);
+        let on = config_on("http://127.0.0.1:1", &[Feature::LaunchSignInWindow]);
+        let off = off.lock().unwrap();
+        let on = on.lock().unwrap();
+        assert!(demo_sign_out_refused(true, Some(&on)));
+        assert!(!demo_sign_out_refused(false, Some(&on)));
+        assert!(!demo_sign_out_refused(true, Some(&off)));
+        assert!(!demo_sign_out_refused(true, None));
+    }
+
+    /// `scripts/mock_orbit.rs` on a free loopback port, for the life of the
+    /// test process.
+    fn script_mock(script: Script) -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || serve_forever(&listener, script));
+        base
+    }
+
+    #[test]
+    fn end_to_end_on_the_mock_approval_saves_the_token_and_the_first_check_uses_it() {
+        let base = script_mock(Script::Approve);
+        let config = config_on(&base, &[Feature::LaunchSignInWindow]);
+        let backend = backend(&base);
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let path = std::env::temp_dir()
+            .join(format!("stardust-test-{}", uuid::Uuid::new_v4()))
+            .join("config.json");
+        let mut flow = None;
+        let attempt = live.request_new_sign_in();
+        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        assert!(matches!(
+            updates(&inbox).as_slice(),
+            [SignInUpdate::Issued { attempt: stamped, .. }] if *stamped == attempt
+        ));
+        step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+        assert!(matches!(updates(&inbox).as_slice(), [SignInUpdate::Done]));
+        assert_eq!(live.signed_in(), Some(true));
+
+        // Done is what asks the window for a check. This is that check, with
+        // the saved token as the bearer, which the mock verifies.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let signal = runtime.block_on(run_check(
+            &backend,
+            &config,
+            &path,
+            &store,
+            &live,
+            &mut stardust_core::route::Router::new(),
+            &CheckKind::Manual,
+            true,
+        ));
+        assert!(signal.publish);
+        assert!(matches!(
+            live.observed(),
+            ObservedCheck::Succeeded { item_count: 1, .. }
+        ));
+        assert_eq!(live.signed_in(), Some(true));
+        assert!(
+            live.signed_in_at(Utc::now()).unwrap(),
+            "the session end was noted, and it is still ahead"
+        );
+    }
+
+    #[test]
+    fn end_to_end_on_the_mock_each_scripted_ending_reaches_the_window() {
+        for (script, expected) in [
+            (Script::Deny, SignInEnd::Denied),
+            (Script::Expire, SignInEnd::Expired),
+        ] {
+            let base = script_mock(script);
+            let config = config_on(&base, &[Feature::LaunchSignInWindow]);
+            let backend = backend(&base);
+            let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+            let mut flow = None;
+            live.request_new_sign_in();
+            run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+            updates(&inbox);
+            step_flow(&backend, &store, &live, &inbox, &mut flow, later());
+            assert!(flow.is_none(), "{expected:?}");
+            assert!(store.load(Utc::now()).unwrap().is_none());
+            assert!(
+                matches!(
+                    updates(&inbox).as_slice(),
+                    [SignInUpdate::Ended { end, .. }] if *end == expected
+                ),
+                "{expected:?}"
+            );
+        }
+
+        let base = script_mock(Script::Off);
+        let config = config_on(&base, &[Feature::LaunchSignInWindow]);
+        let backend_off = backend(&base);
+        let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
+        let mut flow = None;
+        live.request_new_sign_in();
+        run_requests(&backend_off, &config, &store, &live, &inbox, &mut flow);
+        assert!(matches!(
+            updates(&inbox).as_slice(),
+            [SignInUpdate::Ended {
+                end: SignInEnd::Unavailable,
+                ..
+            }]
+        ));
+
+        let base = script_mock(Script::Pending);
+        let config = config_on(&base, &[Feature::LaunchSignInWindow]);
+        let backend_pending = backend(&base);
+        live.request_new_sign_in();
+        run_requests(&backend_pending, &config, &store, &live, &inbox, &mut flow);
+        updates(&inbox);
+        step_flow(&backend_pending, &store, &live, &inbox, &mut flow, later());
+        assert!(flow.is_some(), "still waiting for approval");
+        assert!(updates(&inbox).is_empty());
+    }
+
+    #[test]
+    fn the_launch_window_is_the_only_thing_that_starts_a_sign_in_with_its_flag_on() {
+        let config = Mutex::new(Config::default_for("UTC").unwrap());
+        config
+            .lock()
+            .unwrap()
+            .set_feature(Feature::AutoSignIn, true);
+        assert!(first_run_connect(&config));
+        config
+            .lock()
+            .unwrap()
+            .set_feature(Feature::LaunchSignInWindow, true);
+        assert!(!first_run_connect(&config));
+    }
 
     #[test]
     fn tray_clicks_reach_the_check_timer_only_with_their_features_on() {

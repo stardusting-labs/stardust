@@ -70,6 +70,7 @@ pub enum Command {
     },
     SignOut {
         config: Option<PathBuf>,
+        demo: bool,
     },
     Feature {
         config: Option<PathBuf>,
@@ -164,8 +165,9 @@ KIND is slack, teams, json, discord, pagerduty, orbit-mcp, or slack-mcp.
 Every integration stays off until enable. A destination URL, signing secret, routing key, and access token stay in the system keychain.
 Pass - as URL, SIGNING_SECRET, TOKEN, or ROUTING_KEY to read it from standard input, which keeps it out of the process list and shell history.
 
-NAME is auto-sign-in, jittered-backoff, or routing. Each feature is off until turned on.
+NAME is auto-sign-in, jittered-backoff, routing, or launch-sign-in-window. Each feature is off until turned on. Quit Stardust before changing one.
 auto-sign-in opens the ORBIT sign-in page from the check timer on the first start and shows the connection in the tray.
+launch-sign-in-window opens a sign-in window when Stardust starts with no usable sign-in, and adds the connection and Sign out to the tray.
 jittered-backoff waits a random time, up to a limit that doubles and stops at 15 minutes, after a failed check.
 routing sends one message per new alert to each enabled slack, teams, discord, and pagerduty integration,
 using its minimum severity, hourly limit, and quiet hours, and adds a Send test item for each to the tray.
@@ -252,7 +254,7 @@ pub fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Command,
             if index + 1 != args.len() {
                 return Err("sign-out takes no further arguments".to_string());
             }
-            Ok(Command::SignOut { config })
+            Ok(Command::SignOut { config, demo })
         }
         "autostart" => {
             let action = match args.get(index + 1).map(String::as_str) {
@@ -569,7 +571,9 @@ fn parse_feature(
         [list] if list == "list" => FeatureAction::List,
         [name, state] => {
             let feature = Feature::parse(name).ok_or_else(|| {
-                format!("unknown feature {name}; use auto-sign-in, jittered-backoff, or routing")
+                format!(
+                    "unknown feature {name}; use auto-sign-in, jittered-backoff, routing, or launch-sign-in-window"
+                )
             })?;
             let on = match state.as_str() {
                 "on" => true,
@@ -742,6 +746,21 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            parse(["feature", "launch-sign-in-window", "on"]).unwrap(),
+            Command::Feature {
+                action: FeatureAction::Set {
+                    feature: Feature::LaunchSignInWindow,
+                    on: true
+                },
+                ..
+            }
+        ));
+        assert!(parse(["feature", "nope", "on"])
+            .err()
+            .unwrap()
+            .contains("launch-sign-in-window"));
+        assert!(super::usage().contains("launch-sign-in-window opens a sign-in window"));
         for refused in [
             &["feature"][..],
             &["feature", "list", "now"],
@@ -754,7 +773,14 @@ mod tests {
         }
         assert!(matches!(
             parse(["--config", "/tmp/s.json", "sign-out"]).unwrap(),
-            Command::SignOut { config: Some(_) }
+            Command::SignOut {
+                config: Some(_),
+                demo: false
+            }
+        ));
+        assert!(matches!(
+            parse(["--demo", "sign-out"]).unwrap(),
+            Command::SignOut { demo: true, .. }
         ));
     }
 
