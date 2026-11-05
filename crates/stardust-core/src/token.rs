@@ -139,6 +139,18 @@ impl StoredToken {
         !self.is_expired(now) || self.can_refresh(now)
     }
 
+    /// When the record stops being usable, as [`StoredToken::is_usable`] sees
+    /// it. `None` is no known end: a refresh token with no server expiry. This
+    /// is a time, not a secret.
+    pub fn usable_until(&self) -> Option<DateTime<Utc>> {
+        if self.record.refresh_token.is_none() {
+            return Some(self.record.expires_at);
+        }
+        self.record
+            .refresh_expires_at
+            .map(|refresh| refresh.max(self.record.expires_at))
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(&self.record).unwrap_or_else(|_| "{}".to_string())
     }

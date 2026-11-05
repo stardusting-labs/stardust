@@ -416,6 +416,20 @@ pub fn verification_url(server_base: &str, response: &DeviceCodeResponse) -> Opt
     is_allowed_https_url(server_base, candidate).then(|| candidate.to_string())
 }
 
+/// The address to show so the page can be typed on another device: the plain
+/// `verification_uri` without its scheme, never the complete form that also
+/// carries the code. Left out unless it is https on the configured host and
+/// printable ASCII, because that check does not limit the path.
+pub fn verification_address(server_base: &str, response: &DeviceCodeResponse) -> Option<String> {
+    let candidate = response.verification_uri.trim();
+    if !is_allowed_https_url(server_base, candidate)
+        || !candidate.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return None;
+    }
+    candidate.strip_prefix("https://").map(str::to_string)
+}
+
 pub fn bumped_interval(current: u64, slow_down: bool) -> u64 {
     let current = current.clamp(1, 30);
     if slow_down {

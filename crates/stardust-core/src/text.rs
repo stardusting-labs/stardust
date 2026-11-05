@@ -8,6 +8,17 @@ use crate::schedule::{format_interval, Schedule};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Tz;
 
+/// The account item in the tray menu.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrayAccount {
+    /// "Sign in...". Always this one with the launch sign-in window off.
+    #[default]
+    SignIn,
+    SignOut,
+    /// `--demo` has no account to sign in or out of.
+    Hidden,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuText {
     pub tooltip: String,
@@ -18,8 +29,10 @@ pub struct MenuText {
     pub integrations: String,
     pub pet_skin: PetSkin,
     pub pet_scale: PetScale,
-    /// ORBIT connection line. Only with auto sign-in on.
+    /// ORBIT connection line. Only with auto sign-in or the launch sign-in
+    /// window on.
     pub status: Option<String>,
+    pub account: TrayAccount,
     /// `(menu id, label)` for "Send test" on each enabled sink. Only with
     /// routing on.
     pub tests: Vec<(String, String)>,
@@ -39,7 +52,8 @@ pub fn test_send_target(menu_id: &str) -> Option<&str> {
         .filter(|id| crate::integrations::parse_id(id).as_deref() == Ok(*id))
 }
 
-/// Adds the connection line when auto sign-in is on.
+/// Adds the connection line when auto sign-in or the launch sign-in window is
+/// on.
 pub fn with_connect_status_in(
     mut text: MenuText,
     config: &Config,
@@ -48,7 +62,7 @@ pub fn with_connect_status_in(
     signed_in: bool,
     language: Language,
 ) -> MenuText {
-    if config.features().auto_sign_in {
+    if config.features().sign_in_on_timer() {
         text.status = Some(crate::connect::status_line(
             phase, observed, signed_in, language,
         ));
@@ -147,6 +161,7 @@ fn english_menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
         pet_skin: config.pet_skin(),
         pet_scale: config.pet_scale(),
         status: None,
+        account: TrayAccount::SignIn,
         tests: Vec::new(),
     }
 }
@@ -281,5 +296,30 @@ mod tests {
         assert_eq!(super::test_send_target("test-send:chat"), Some("chat"));
         assert_eq!(super::test_send_target("test-send:../x"), None);
         assert_eq!(super::test_send_target("interval-30"), None);
+    }
+
+    #[test]
+    fn the_launch_window_flag_alone_adds_the_connection_line() {
+        use crate::config::Feature;
+        use crate::connect::FlowPhase;
+        use crate::i18n::Language;
+        use crate::pet::ObservedCheck;
+        use crate::text::TrayAccount;
+        let mut config = Config::default_for("UTC").unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 21, 15, 0, 0).unwrap();
+        let line = |config: &Config| {
+            super::with_connect_status_in(
+                super::menu_text_in(config, now, Language::English),
+                config,
+                &FlowPhase::Idle,
+                ObservedCheck::Waiting,
+                false,
+                Language::English,
+            )
+        };
+        assert_eq!(line(&config).status, None);
+        assert_eq!(line(&config).account, TrayAccount::SignIn);
+        config.set_feature(Feature::LaunchSignInWindow, true);
+        assert_eq!(line(&config).status.as_deref(), Some("ORBIT: Signed out"));
     }
 }

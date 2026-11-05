@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 stardust-core = { path = "../stardust-core" }
+arboard = { version = "3.7.0", default-features = false }
 chrono = { workspace = true }
 iana-time-zone = "0.1.65"
 keyring = "4.2.0"

@@ -18,11 +18,19 @@ mod inbox;
 mod integrations_cmd;
 mod keychain;
 mod live;
+/// The stand-in server `scripts/measure-idle-lane.sh` builds by hand, compiled
+/// here so it keeps building and so tests can drive a sign-in against it.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../scripts/mock_orbit.rs"]
+mod mock_orbit;
 mod notify;
 mod oauth;
 mod routing;
 mod signin;
 mod sprites;
+#[cfg(test)]
+mod testmock;
 mod tray;
 mod window;
 

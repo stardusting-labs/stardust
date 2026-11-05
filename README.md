@@ -81,6 +81,28 @@ The server is `https://helloorbit.app` unless `server_base_url` is set in the co
 
 `--demo` skips sign-in and shows sample items.
 
+### Sign-in window at launch
+
+This is off until you turn it on. Quit Stardust first, because a running app writes its own copy of the config back after each check, so a change made while it runs is lost.
+
+```text
+stardust feature launch-sign-in-window on
+```
+
+With it on, starting Stardust with no usable sign-in opens a sign-in window. The window opens by itself only at launch, including a start at login. Sign in in the tray and the Account row in the settings window also open it. A sign-in that lapses while the app runs is shown in the tray and the bubble, and no window appears. `--demo`, `--headless`, and a machine with no display never open it. With no display, Sign in in the tray prints the code and the address to the terminal.
+
+The window shows a large user code, the address of the ORBIT account page, how long the code has left, and rows to open the page, copy the code, or cancel. The window does not open your browser by itself. `stardust sign-in` in a terminal still does. Only enter the code if you started the sign-in, because approving a code signs in whichever computer asked for it. Denied, expired, offline, a server with sign-in off, and a keychain failure each have their own message and a way to try again.
+
+Cancel, Esc, and closing the window all stop polling on this computer, and the app stays in the tray. The code stays valid on ORBIT until it expires, because no route cancels a code. A poll already on its way when you cancel can still finish the sign-in, and the tray shows it. An approval that no poll has collected yet is not picked up, so sign in again.
+
+The window works from the keyboard: arrows or Tab move, and Enter or Space chooses. While it is still asking for a code, Enter does nothing and Esc cancels. Keys and clicks wait half a second after the window opens or changes, so a stray Enter does not act on a row you have not seen. The focused row is marked with `>` and a dark band. A screen reader can read the window title, which names the state and the code, but not the rows.
+
+After you approve, the token goes to the OS keychain, the window closes after two seconds, and a check runs right away. The tray then shows the connection and offers Sign out, and Sign in appears again once the saved sign-in has lapsed. Sign out from the tray, the settings window, or `stardust sign-out` also asks ORBIT to revoke a saved refresh token. A server without that route is fine, and the local copy is removed either way. If the keychain will not delete the record, Stardust says so and stays signed in. With this feature on, `stardust --demo sign-out` is refused.
+
+Copy code uses the OS clipboard. On Linux it needs X11 or an X11 bridge under Wayland, and the window says so when it cannot copy. There the copied code stays available until the window closes.
+
+Without a refresh token from ORBIT, a sign-in lasts at most 5 minutes, so this window would appear again at the next launch.
+
 ## Start at login
 
 ```text
@@ -176,9 +198,12 @@ Network calls, when you are not in `--demo`:
 
 - `POST /api/pqc/v1/account/device/code` and `POST /api/pqc/v1/account/device/token` during sign-in.
 - `POST /api/pqc/v1/account/device/token` with the `refresh_token` grant, only when a saved refresh token is used.
+- `POST /api/pqc/v1/account/device/revoke` when you sign out with a saved refresh token, only with `auto-sign-in` or `launch-sign-in-window` on. With `launch-sign-in-window` on it is also sent if a sign-in was approved and the keychain would not save it.
 - `GET /api/pqc/v1/desktop/status` and `GET /api/pqc/v1/desktop/alerts` on each check, with the keychain token as a bearer header. A 404 with an empty body means those routes are turned off. The alerts response is the current list, with no cursor.
 - Optional Slack, Teams, JSON webhook, or MCP calls that you enable.
-- Opening your browser to an https page on the configured host when you click a bubble or start sign-in.
+- Opening your browser to an https page on the configured host when you click a bubble or start sign-in. With `launch-sign-in-window` on, the running app opens it for sign-in only when you choose Open ORBIT in browser. `stardust sign-in` in a terminal still opens it.
+
+With `launch-sign-in-window` on, Copy code places the user code on the OS clipboard when you choose it. The code is not a secret, and nothing else is copied.
 
 ## Dependencies
 
@@ -192,6 +217,9 @@ Direct crates:
 | uuid | 1.28.0 | Apache-2.0 OR MIT |
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
 | png | 0.18.1 | MIT OR Apache-2.0 |
+| arboard | 3.7.0 | MIT OR Apache-2.0 |
+
+`arboard` provides Copy code in the sign-in window, with its default features off, so it copies text only. It is opened on the first Copy, and not at all otherwise. It adds `lock_api` 0.4.14, `parking_lot` 0.12.5, `parking_lot_core` 0.9.12, and `scopeguard` 1.2.0 (all MIT OR Apache-2.0), and on Windows `clipboard-win` 5.4.3 and `error-code` 3.4.0 (both BSL-1.0).
 
 `uuid` was already in the tree. `sha2` 0.11.1 was already in the tree; 0.10.9 is the version this crate calls. `png` 0.18.1 was already in the tree through the tray icon. This crate calls it, with default features off, to decode the pet sprites. No new transitive crates were added. No new crate was added for the ORBIT client. It uses `ureq` 2.12.1, which was already the HTTPS client. The HTTPS client adds these crates:
 
