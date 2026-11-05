@@ -61,7 +61,6 @@ The first start opens a small settings window. It is also under Settings in the 
 - Check every 1, 30, or 60 minutes. Other schedules are set with `stardust schedule set`.
 - Start at login, off until you turn it on.
 - Show character, pet, and size.
-- Language: English or Korean. The picker shows each language by its own name.
 
 Every row works from the keyboard. Up and Down, or Tab and Shift+Tab, move between rows. Enter or Space changes a row. Left and Right step through a choice. Esc closes the window. The focused row is marked with `>` and a dark band, so focus does not depend on colour alone. The window title names the focused row. Text in the window and in the bubble meets a 4.5:1 contrast ratio, and the letters grow with the monitor scale.
 
@@ -98,15 +97,7 @@ Turning it off removes that entry.
 
 ## Language
 
-```text
-stardust language ko
-stardust language en
-stardust language auto
-```
-
-The tray menu, the settings window, notices, and notifications have English and Korean text. `auto` follows `LC_ALL`, `LC_MESSAGES`, or `LANG`. Windows and macOS usually do not set those for desktop apps, so choose the language in the settings window there.
-
-The tray menu and OS notifications use the system font, so Hangul shows there. The settings window and the bubble draw their own letters. Their built-in letters cover English only. A build with the `system-font` feature draws Hangul from a font that is already on the computer (Malgun Gothic on Windows, Apple SD Gothic Neo on macOS, Noto Sans CJK or Nanum Gothic on Linux, or the file named by `STARDUST_FONT`). Without that feature, or without such a font, those two windows stay in English. The schedule line, the integrations line, and item summaries are still English in both languages.
+Stardust is English only. The tray menu, the settings window, notices, and notifications are in English.
 
 ## Run
 
@@ -136,12 +127,11 @@ Config is JSON. On Linux it is `$XDG_CONFIG_HOME/stardust/config.json` or `~/.co
     "timezone": "America/New_York"
   },
   "integrations": [],
-  "language": "ko",
   "onboarded": true
 }
 ```
 
-`language` is optional. Leave it out to follow the system locale. `onboarded` is set after the first settings window is closed.
+A `language` key left by an earlier build is ignored and removed on the next save. `onboarded` is set after the first settings window is closed.
 
 An ORBIT access token is kept in the system keychain until the server expiry, and never longer than 5 minutes. Stardust will not store one that is already expired. The token is not written into the config file.
 
@@ -175,7 +165,7 @@ Stardust does not send telemetry.
 
 Stored on this computer:
 
-- The config file holds the schedule, character position, skin, size, language, whether the first settings window was closed, integration ids and public hosts, the last checked time, and an optional server address. An older alerts cursor, if one is still in the file, is cleared and is not sent. The file does not hold the access token.
+- The config file holds the schedule, character position, skin, size, whether the first settings window was closed, integration ids and public hosts, the last checked time, and an optional server address. An older alerts cursor, if one is still in the file, is cleared and is not sent. The file does not hold the access token.
 - The OS keychain holds the ORBIT access token and any refresh token, and, only if you turn an integration on, that integration's destination URL, signing secret, or access token.
 
 Network calls, when you are not in `--demo`:
@@ -198,9 +188,6 @@ Direct crates:
 | uuid | 1.28.0 | Apache-2.0 OR MIT |
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
 | png | 0.18.1 | MIT OR Apache-2.0 |
-| ab_glyph | 0.2.32 | Apache-2.0 |
-
-`ab_glyph` is used only with the `system-font` feature, which is off by default. It was already in the Linux tree through the window toolkit. It reads a font file that is already on the computer; no font file is bundled.
 
 `uuid` was already in the tree. `sha2` 0.11.1 was already in the tree; 0.10.9 is the version this crate calls. `png` 0.18.1 was already in the tree through the tray icon. This crate calls it, with default features off, to decode the pet sprites. No new transitive crates were added. No new crate was added for the ORBIT client. It uses `ureq` 2.12.1, which was already the HTTPS client. The HTTPS client adds these crates:
 

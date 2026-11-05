@@ -8,16 +8,8 @@ version.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-# Draw Hangul and other non-Latin letters with a font already installed on
-# the computer (Malgun Gothic, Apple SD Gothic Neo, Noto Sans CJK). No font
-# file is bundled. Off by default.
-system-font = ["dep:ab_glyph"]
-
 [dependencies]
 stardust-core = { path = "../stardust-core" }
-ab_glyph = { version = "0.2.32", optional = true }
 chrono = { workspace = true }
 iana-time-zone = "0.1.65"
 keyring = "4.2.0"

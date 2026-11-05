@@ -91,20 +91,6 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             println!("start at login {state}");
             Ok(())
         }
-        Command::Language { config, language } => {
-            let path = config_path(config);
-            let mut loaded = load_or_create(&path)?;
-            loaded.set_language(language);
-            save_config(&path, &loaded).map_err(|err| err.to_string())?;
-            println!(
-                "language {}",
-                match language {
-                    Some(language) => language.code(),
-                    None => "auto",
-                }
-            );
-            Ok(())
-        }
         Command::ScheduleShow { config } => {
             let path = config_path(config);
             let loaded = load_or_create(&path)?;

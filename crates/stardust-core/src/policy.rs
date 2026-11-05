@@ -289,12 +289,6 @@ mod tests {
                 .details_url,
             ""
         );
-        let korean = super::calm_notice_in(
-            Notice::SignedOut,
-            DEFAULT_SERVER_BASE,
-            crate::i18n::Language::Korean,
-        );
-        assert_eq!(korean.summary.lines[0], "ORBIT 항목을 보려면 로그인하세요");
         assert_eq!(
             calm_notice(Notice::SignedOut, DEFAULT_SERVER_BASE)
                 .summary
