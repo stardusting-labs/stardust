@@ -161,6 +161,26 @@ stardust integration oauth slack --client-id CLIENT_ID
 stardust integration connect slack
 ```
 
+### Integrations panel
+
+`stardust feature integrations-panel on` adds an Integrations page to the settings window and the tray. It is off until you turn it on. With it off, nothing above changes. Quit Stardust before you turn it on, or start it again afterwards: a running app keeps the features it started with and writes them back to the config file.
+
+The page lists each integration with its kind, name, on/off state, destination host, and last delivery result, and offers Send test. It never shows a full URL or a secret. Adding an integration and saving its destination still use `stardust integration`. The app picks up those changes at its next save or check.
+
+An integration sends nothing until you accept what it sends, to that host. The page asks when you turn it on, and `integration enable ID` asks on the command line. `integration enable ID --accept` answers yes after showing the same text. A new host asks again. Integrations that were already on stay quiet until accepted.
+
+| Destination | What leaves this computer for each alert |
+|---|---|
+| Slack, Teams, Discord | Alert title, severity, time, and ORBIT link |
+| PagerDuty | The same, plus the alert ID and ORBIT host. Your routing key goes with each post so PagerDuty accepts it |
+| JSON webhook | The same, plus the check time, alert ID, event ID, placeholder tenant and workspace IDs, and check interval. Each post is signed with your signing secret, which is not sent |
+
+With the panel on, alerts leave only as one message per alert through the router, which applies each integration's minimum severity, hourly limit, and quiet hours, retries a busy destination from a later check, and does not repeat what a destination already took. That includes the JSON webhook, so `integration route` works for it. The summary posts stop, and the `routing` feature no longer has to be on for these posts; it still decides how the bubble behaves. The event ID stays the same for an alert at one severity, so a receiver can drop a repeat. A `Send test` post has the event type `stardust.test`.
+
+A destination that answers 404 or 410 is turned off, with a note on the page and one bubble. Other refusals leave it on and show on the page. The last result is kept in memory, so it starts empty after a restart. MCP integrations show "No alert delivery": no alert ever goes to them.
+
+A config file written with this feature on, or holding an accepted integration, does not load in a build from before this feature.
+
 ## Privacy
 
 The same text is in [PRIVACY.md](PRIVACY.md).

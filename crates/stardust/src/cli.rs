@@ -11,6 +11,9 @@ pub enum IntegrationAction {
     },
     Enable {
         id: String,
+        /// Accept what the integration sends without being asked. Only with
+        /// the integrations panel on.
+        accept: bool,
     },
     Disable {
         id: String,
@@ -170,6 +173,7 @@ jittered-backoff waits a random time, up to a limit that doubles and stops at 15
 routing sends one message per new alert to each enabled slack, teams, discord, and pagerduty integration,
 using its minimum severity, hourly limit, and quiet hours, and adds a Send test item for each to the tray.
 With routing on, teams takes a Workflows webhook URL. pagerduty takes the Events API v2 URL, or none for the US one, and a routing key.
+integrations-panel is also a NAME. It adds an Integrations page to settings and the tray, shows what each integration sends and asks before it first sends (integration enable ID --accept answers yes), and posts one signed message per alert to a json integration.
 "
     .to_string()
 }
@@ -435,9 +439,16 @@ fn parse_integration(
             finish(index, args.len())?;
             IntegrationAction::Add { kind, id }
         }
-        "enable" => IntegrationAction::Enable {
-            id: one_id(args, index)?,
-        },
+        "enable" => {
+            let id = required(args, index, "id")?;
+            index += 1;
+            let accept = args.get(index).map(String::as_str) == Some("--accept");
+            if accept {
+                index += 1;
+            }
+            finish(index, args.len())?;
+            IntegrationAction::Enable { id, accept }
+        }
         "disable" => IntegrationAction::Disable {
             id: one_id(args, index)?,
         },
@@ -690,7 +701,29 @@ mod tests {
             panic!("expected add");
         };
         assert_eq!((kind, id), ("json".to_string(), "ops".to_string()));
-        assert!(parse(["integration", "enable", "ops"]).is_ok());
+        assert!(matches!(
+            parse(["integration", "enable", "ops"]).unwrap(),
+            Command::Integration {
+                action: super::IntegrationAction::Enable { accept: false, .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(["integration", "enable", "ops", "--accept"]).unwrap(),
+            Command::Integration {
+                action: super::IntegrationAction::Enable { accept: true, .. },
+                ..
+            }
+        ));
+        for refused in [
+            &["integration", "enable"][..],
+            &["integration", "enable", "--accept"],
+            &["integration", "enable", "ops", "--yes"],
+            &["integration", "enable", "ops", "--accept", "now"],
+            &["integration", "disable", "ops", "--accept"],
+        ] {
+            assert!(parse(refused.iter().copied()).is_err(), "{refused:?}");
+        }
         assert!(parse(["integration", "oauth", "slack", "--client-id", "123.456"]).is_ok());
         assert!(parse(["integration", "url"]).is_err());
         assert!(parse(["sign-in"]).is_ok());
@@ -738,6 +771,16 @@ mod tests {
                 action: FeatureAction::Set {
                     feature: Feature::Routing,
                     on: false
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(["feature", "integrations-panel", "on"]).unwrap(),
+            Command::Feature {
+                action: FeatureAction::Set {
+                    feature: Feature::IntegrationsPanel,
+                    on: true
                 },
                 ..
             }

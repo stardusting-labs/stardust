@@ -8,13 +8,14 @@ use stardust_core::i18n::{every, interval_label, tr, Language, Msg};
 use stardust_core::pet::{tray_edge_px, ObservedCheck, PetScale, PetSkin, TrayGlyph};
 use stardust_core::schedule::QUICK_PICK_MINUTES;
 use stardust_core::text::{
-    menu_text_in, with_connect_status_in, with_connection_note_in, MenuText,
+    menu_text_in, with_connect_status_in, with_connection_note_in, with_delivery_panel_in, MenuText,
 };
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// Menu text for the current config and check. The ORBIT connection line is
-/// there only with auto sign-in on, and "Send test" only with routing on.
+/// there only with auto sign-in on, "Send test" only with routing on, and the
+/// integrations line opens the panel only with the panel on.
 pub fn tray_text(config: &Config, live: &LivePet, language: Language) -> MenuText {
     let observed = live.observed();
     let text = with_connection_note_in(
@@ -22,6 +23,7 @@ pub fn tray_text(config: &Config, live: &LivePet, language: Language) -> MenuTex
         observed,
         language,
     );
+    let text = with_delivery_panel_in(text, config, &live.delivery(), language);
     if !config.features().auto_sign_in {
         return text;
     }
@@ -108,7 +110,12 @@ fn build_menu(text: &MenuText, language: Language) -> Result<Menu, String> {
     append_item(&menu, "next", &text.next_check, false)?;
     append_item(&menu, "last", &text.last_checked, false)?;
     append_item(&menu, "schedule", &text.schedule, false)?;
-    append_item(&menu, "integrations", &text.integrations, false)?;
+    append_item(
+        &menu,
+        "integrations",
+        &text.integrations,
+        text.integrations_opens_panel,
+    )?;
     append_separator(&menu)?;
     append_item(&menu, "character", &text.character, true)?;
     append_item(&menu, "pet", tr(language, Msg::MenuPet), false)?;

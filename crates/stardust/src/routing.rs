@@ -12,6 +12,8 @@
 use crate::deliver::{port_of, resolve_checked, PinnedAddrs, ResolveError};
 use chrono::{DateTime, Utc};
 use stardust_core::api::AlertItem;
+use stardust_core::consent::has_valid_consent;
+use stardust_core::delivery::{outcome_of, Outcome};
 use stardust_core::i18n::{tr, Language, Msg};
 use stardust_core::integrations::{secret_account, IntegrationRecord, SecretSlot, SecretStore};
 use stardust_core::outbound::CheckedUrl;
@@ -56,6 +58,26 @@ impl HttpsTransport {
 
 impl Transport for HttpsTransport {
     fn post_json(&self, url: &CheckedUrl, body: &[u8]) -> Result<u16, SinkError> {
+        self.post(url, body, &[])
+    }
+
+    fn post_json_with_headers(
+        &self,
+        url: &CheckedUrl,
+        body: &[u8],
+        headers: &[(String, String)],
+    ) -> Result<u16, SinkError> {
+        self.post(url, body, headers)
+    }
+}
+
+impl HttpsTransport {
+    fn post(
+        &self,
+        url: &CheckedUrl,
+        body: &[u8],
+        headers: &[(String, String)],
+    ) -> Result<u16, SinkError> {
         if self.offline.get() || self.unresolved.borrow().contains(&url.host) {
             return Err(SinkError::Unreachable);
         }
@@ -77,11 +99,11 @@ impl Transport for HttpsTransport {
             .redirects(0)
             .resolver(PinnedAddrs(addrs))
             .build();
-        match agent
-            .post(&url.url)
-            .set("Content-Type", "application/json")
-            .send_bytes(body)
-        {
+        let mut request = agent.post(&url.url).set("Content-Type", "application/json");
+        for (name, value) in headers {
+            request = request.set(name, value);
+        }
+        match request.send_bytes(body) {
             Ok(response) => Ok(response.status()),
             Err(ureq::Error::Status(status, _)) => Ok(status),
             Err(ureq::Error::Transport(_)) => Err(SinkError::Unreachable),
@@ -108,6 +130,8 @@ pub struct CheckRouting<'a> {
     /// Inside the schedule's quiet hours.
     pub quiet: bool,
     pub now: Instant,
+    /// The schedule's interval, for the JSON webhook's field.
+    pub interval_minutes: u32,
 }
 
 impl CheckRouting<'_> {
@@ -239,6 +263,121 @@ pub fn route_remote(router: &mut Router, check: &CheckRouting<'_>, transport: &d
     }
 }
 
+/// [`route_remote`] with the integrations panel on. The JSON webhook goes
+/// through the router too, an integration without a valid yes is skipped
+/// before any keychain read, and MCP integrations are never routed. Returns
+/// what the panel and the tray should show for each integration: only what
+/// happened in this check, so one with nothing to report keeps its last line.
+pub fn route_consented(
+    router: &mut Router,
+    check: &CheckRouting<'_>,
+    transport: &dyn Transport,
+) -> Vec<(String, Outcome)> {
+    let alerts = check.alerts();
+    let mut outcomes = Vec::new();
+    let mut sinks: Vec<(SinkRule, WebhookSink<'_>)> = Vec::new();
+    for record in check.records.iter().filter(|record| record.enabled) {
+        let Some(kind) = SinkKind::with_panel(record.kind) else {
+            continue;
+        };
+        if !has_valid_consent(record) {
+            outcomes.push((record.id.clone(), Outcome::NeedsConsent));
+            continue;
+        }
+        let rule = SinkRule::for_sink(record, kind);
+        let sends_now = router.wants_any(&record.id, &alerts, |alert| {
+            Router::sends_now(&rule, alert, check.quiet)
+        });
+        if !sends_now {
+            // Nothing to post, so no keychain read. An alert still waiting
+            // can only be waiting for the quiet hours to end.
+            let held = check.quiet
+                && router.wants_any(&record.id, &alerts, |alert| {
+                    Router::sends_now(&rule, alert, false)
+                });
+            let outcome = if held {
+                Outcome::HeldByQuietHours
+            } else {
+                Outcome::NothingWaiting
+            };
+            outcomes.push((record.id.clone(), outcome));
+            continue;
+        }
+        let built = build_routed(record, kind, check, transport);
+        match ready_once(&record.id, built) {
+            Some(sink) if consent_covers(record, sink.host()) => sinks.push((rule, sink)),
+            Some(_) => outcomes.push((record.id.clone(), Outcome::NeedsConsent)),
+            None => outcomes.push((record.id.clone(), Outcome::NotReady)),
+        }
+    }
+    if sinks.is_empty() {
+        return outcomes;
+    }
+    let routes: Vec<Route<'_>> = sinks
+        .iter()
+        .map(|(rule, sink)| Route {
+            id: sink.id(),
+            rule: *rule,
+            sink,
+        })
+        .collect();
+    let context = RouteContext {
+        quiet: check.quiet,
+        dnd: false,
+        now: check.now,
+        post_until: Instant::now() + POST_BUDGET,
+    };
+    let report = router.route(&alerts, &routes, &context);
+    for (id, err) in &report.errors {
+        eprintln!("stardust: integration {id}: {err}");
+    }
+    for (_, sink) in &sinks {
+        let tally = report.tally(sink.id());
+        if tally.delivered > 0 {
+            eprintln!(
+                "stardust: sent {} alert(s) to {} ({})",
+                tally.delivered,
+                sink.id(),
+                sink.host()
+            );
+        }
+        let error = report
+            .errors
+            .iter()
+            .find(|(id, _)| id == sink.id())
+            .map(|(_, err)| err);
+        if let Some(outcome) = outcome_of(tally, error) {
+            outcomes.push((sink.id().to_string(), outcome));
+        }
+    }
+    outcomes
+}
+
+/// The saved destination is the one the user said yes to. The config and the
+/// keychain are written apart, so they could differ.
+fn consent_covers(record: &IntegrationRecord, host: &str) -> bool {
+    record
+        .consent
+        .as_ref()
+        .is_some_and(|consent| consent.host == host)
+}
+
+/// The bubble that says integrations were switched off because their
+/// destination is gone. Links nowhere, and shows ids only.
+pub fn gone_presentation(ids: &[String], language: Language) -> Presentation {
+    Presentation {
+        show_bubble: true,
+        show_os_notification: false,
+        summary: Summary {
+            lines: ids
+                .iter()
+                .map(|id| format!("{id}: {}", tr(language, Msg::OutcomeGoneDisabled)))
+                .collect(),
+            details_url: String::new(),
+        },
+    }
+}
+
 /// The records the check-summary posts go to. With routing on, Slack and
 /// Teams take one message per alert instead, so they are left out here.
 pub fn summary_records(records: &[IntegrationRecord], routing: bool) -> Vec<IntegrationRecord> {
@@ -266,6 +405,31 @@ pub fn send_test(
     let kind = SinkKind::of(record.kind).ok_or(SinkError::Refused)?;
     let sink = build_sink(record, kind, secrets, server_base, transport)?;
     sink.send_test(server_base, now)?;
+    Ok(sink.host().to_string())
+}
+
+/// [`send_test`] with the integrations panel on: the JSON webhook can be
+/// tested too, and only an integration the user said yes to is posted to.
+pub fn send_test_consented(
+    check: &CheckRouting<'_>,
+    id: &str,
+    now: DateTime<Utc>,
+    transport: &dyn Transport,
+) -> Result<String, SinkError> {
+    let record = check
+        .records
+        .iter()
+        .find(|record| record.id == id)
+        .ok_or(SinkError::Missing)?;
+    let kind = SinkKind::with_panel(record.kind).ok_or(SinkError::Refused)?;
+    if !has_valid_consent(record) {
+        return Err(SinkError::NeedsConsent);
+    }
+    let sink = build_routed(record, kind, check, transport)?;
+    if !consent_covers(record, sink.host()) {
+        return Err(SinkError::NeedsConsent);
+    }
+    sink.send_test(check.server_base, now)?;
     Ok(sink.host().to_string())
 }
 
@@ -309,22 +473,49 @@ fn load_sinks<'a>(
             let kind = SinkKind::of(record.kind)?;
             let rule = SinkRule::for_record(record)?;
             let built = build_sink(record, kind, secrets, server_base, transport);
-            let mut noted = NOT_READY.lock().unwrap_or_else(|err| err.into_inner());
-            match built {
-                Ok(sink) => {
-                    noted.retain(|id| id != &record.id);
-                    Some((rule, sink))
-                }
-                Err(err) => {
-                    if !noted.contains(&record.id) {
-                        eprintln!("stardust: integration {} is not ready: {err}", record.id);
-                        noted.push(record.id.clone());
-                    }
-                    None
-                }
-            }
+            ready_once(&record.id, built).map(|sink| (rule, sink))
         })
         .collect()
+}
+
+/// The sink if it could be built. If not, its id is logged, once until it is
+/// ready again.
+fn ready_once<'a>(id: &str, built: Result<WebhookSink<'a>, SinkError>) -> Option<WebhookSink<'a>> {
+    let mut noted = NOT_READY.lock().unwrap_or_else(|err| err.into_inner());
+    match built {
+        Ok(sink) => {
+            noted.retain(|noted_id| noted_id != id);
+            Some(sink)
+        }
+        Err(err) => {
+            if !noted.iter().any(|noted_id| noted_id == id) {
+                eprintln!("stardust: integration {id} is not ready: {err}");
+                noted.push(id.to_string());
+            }
+            None
+        }
+    }
+}
+
+/// [`build_sink`], and the signed JSON webhook the panel adds.
+fn build_routed<'a>(
+    record: &IntegrationRecord,
+    kind: SinkKind,
+    check: &CheckRouting<'_>,
+    transport: &'a dyn Transport,
+) -> Result<WebhookSink<'a>, SinkError> {
+    if kind != SinkKind::Generic {
+        return build_sink(record, kind, check.secrets, check.server_base, transport);
+    }
+    let url = saved(check.secrets, &record.id, SecretSlot::Url);
+    let secret = saved(check.secrets, &record.id, SecretSlot::SigningSecret);
+    WebhookSink::signed_json(
+        &record.id,
+        url.as_deref(),
+        secret.as_deref(),
+        check.interval_minutes,
+        transport,
+    )
 }
 
 fn build_sink<'a>(
@@ -337,7 +528,7 @@ fn build_sink<'a>(
     let url = saved(secrets, &record.id, SecretSlot::Url);
     let key = match kind {
         SinkKind::PagerDuty => saved(secrets, &record.id, SecretSlot::RoutingKey),
-        SinkKind::Slack | SinkKind::Teams | SinkKind::Discord => None,
+        SinkKind::Slack | SinkKind::Teams | SinkKind::Discord | SinkKind::Generic => None,
     };
     WebhookSink::new(
         &record.id,
@@ -404,6 +595,15 @@ mod tests {
             self.posts.borrow_mut().push((url.url.clone(), body));
             Ok(self.status)
         }
+
+        fn post_json_with_headers(
+            &self,
+            url: &CheckedUrl,
+            body: &[u8],
+            _headers: &[(String, String)],
+        ) -> Result<u16, SinkError> {
+            self.post_json(url, body)
+        }
     }
 
     fn record(kind: IntegrationKind, id: &str, enabled: bool) -> IntegrationRecord {
@@ -443,6 +643,7 @@ mod tests {
             server_base: DEFAULT_SERVER_BASE,
             quiet: false,
             now: Instant::now(),
+            interval_minutes: 60,
         }
     }
 
@@ -671,6 +872,279 @@ mod tests {
         assert_eq!(failed.summary.lines, ["Test did not go through: ops"]);
     }
 
+    mod panel {
+        use super::{check, item, record, Counting, Recorder, SLACK};
+        use crate::routing::{
+            gone_presentation, route_consented, route_remote, send_test_consented,
+        };
+        use chrono::{TimeZone, Utc};
+        use stardust_core::api::Severity;
+        use stardust_core::consent::{Consent, CONSENT_VERSION};
+        use stardust_core::delivery::Outcome;
+        use stardust_core::i18n::Language;
+        use stardust_core::integrations::{
+            secret_account, IntegrationKind, IntegrationRecord, MemorySecretStore, SecretSlot,
+            SecretStore,
+        };
+        use stardust_core::route::Router;
+        use stardust_core::sink::SinkError;
+        use std::cell::Cell;
+
+        const HOOK: &str = "https://hooks.example/inbound";
+
+        fn accepted(kind: IntegrationKind, id: &str, host: &str) -> IntegrationRecord {
+            let mut one = record(kind, id, true);
+            one.host = Some(host.to_string());
+            one.consent = Some(Consent {
+                host: host.to_string(),
+                version: CONSENT_VERSION,
+            });
+            one
+        }
+
+        fn secrets() -> Counting {
+            let inner = MemorySecretStore::new();
+            for (id, slot, value) in [
+                ("ops", SecretSlot::Url, SLACK),
+                ("json", SecretSlot::Url, HOOK),
+                ("json", SecretSlot::SigningSecret, "example-signing-secret"),
+            ] {
+                inner.put(&secret_account(id, slot), value).unwrap();
+            }
+            Counting {
+                inner,
+                reads: Cell::new(0),
+            }
+        }
+
+        #[test]
+        fn without_consent_nothing_is_posted_and_the_keychain_is_not_read() {
+            let mut slack = accepted(IntegrationKind::SlackIncoming, "ops", "hooks.slack.com");
+            slack.consent = None;
+            let mut moved = accepted(IntegrationKind::GenericJson, "json", "hooks.example");
+            moved.host = Some("hooks.example.net".to_string());
+            let records = [slack, moved];
+            let secrets = secrets();
+            let transport = Recorder::answering(200);
+            let items = [item("a", Severity::High)];
+            let outcomes = route_consented(
+                &mut Router::new(),
+                &check(&records, &secrets, &items),
+                &transport,
+            );
+            assert_eq!(
+                outcomes,
+                [
+                    ("ops".to_string(), Outcome::NeedsConsent),
+                    ("json".to_string(), Outcome::NeedsConsent),
+                ]
+            );
+            assert!(transport.urls().is_empty());
+            assert_eq!(secrets.reads.get(), 0);
+        }
+
+        #[test]
+        fn the_saved_url_must_be_on_the_host_that_was_accepted() {
+            // The file says one host and the keychain holds another, as a
+            // failed save could leave them.
+            let records = [accepted(
+                IntegrationKind::GenericJson,
+                "json",
+                "other.example",
+            )];
+            let secrets = secrets();
+            let transport = Recorder::answering(200);
+            let items = [item("a", Severity::High)];
+            let outcomes = route_consented(
+                &mut Router::new(),
+                &check(&records, &secrets, &items),
+                &transport,
+            );
+            assert_eq!(outcomes, [("json".to_string(), Outcome::NeedsConsent)]);
+            assert!(transport.urls().is_empty());
+            let now = Utc.with_ymd_and_hms(2026, 10, 31, 9, 0, 0).unwrap();
+            assert_eq!(
+                send_test_consented(&check(&records, &secrets, &[]), "json", now, &transport),
+                Err(SinkError::NeedsConsent)
+            );
+            assert!(transport.urls().is_empty());
+        }
+
+        #[test]
+        fn the_router_takes_the_json_webhook_only_with_the_panel_path() {
+            let records = [accepted(
+                IntegrationKind::GenericJson,
+                "json",
+                "hooks.example",
+            )];
+            let secrets = secrets();
+            let items = [item("a", Severity::Low)];
+            let off = Recorder::answering(200);
+            route_remote(&mut Router::new(), &check(&records, &secrets, &items), &off);
+            assert!(off.urls().is_empty(), "as before with the panel off");
+
+            let on = Recorder::answering(204);
+            let mut router = Router::new();
+            let outcomes = route_consented(&mut router, &check(&records, &secrets, &items), &on);
+            assert_eq!(outcomes, [("json".to_string(), Outcome::Delivered)]);
+            assert_eq!(on.urls(), [HOOK]);
+            let (_, body) = on.posts.borrow()[0].clone();
+            assert!(body.contains("\"subject_id\":\"a\""), "{body}");
+            let reads = secrets.reads.get();
+            let outcomes = route_consented(&mut router, &check(&records, &secrets, &items), &on);
+            assert_eq!(on.urls().len(), 1, "once");
+            assert_eq!(outcomes, [("json".to_string(), Outcome::NothingWaiting)]);
+            assert_eq!(secrets.reads.get(), reads, "no keychain read for nothing");
+        }
+
+        #[test]
+        fn quiet_hours_hold_without_a_keychain_read_and_say_so() {
+            let records = [accepted(
+                IntegrationKind::SlackIncoming,
+                "ops",
+                "hooks.slack.com",
+            )];
+            let secrets = secrets();
+            let transport = Recorder::answering(200);
+            let items = [item("m", Severity::Medium)];
+            let mut router = Router::new();
+            let mut quiet = check(&records, &secrets, &items);
+            quiet.quiet = true;
+            let outcomes = route_consented(&mut router, &quiet, &transport);
+            assert_eq!(outcomes, [("ops".to_string(), Outcome::HeldByQuietHours)]);
+            assert_eq!(secrets.reads.get(), 0);
+            assert!(transport.urls().is_empty());
+
+            let mixed = [item("m", Severity::Medium), item("h", Severity::High)];
+            let mut quiet = check(&records, &secrets, &mixed);
+            quiet.quiet = true;
+            let outcomes = route_consented(&mut router, &quiet, &transport);
+            assert_eq!(
+                outcomes,
+                [("ops".to_string(), Outcome::HeldByQuietHours)],
+                "the high one went out and the medium one still waits"
+            );
+            assert_eq!(transport.urls().len(), 1);
+
+            let outcomes =
+                route_consented(&mut router, &check(&records, &secrets, &mixed), &transport);
+            assert_eq!(outcomes, [("ops".to_string(), Outcome::Delivered)]);
+            assert_eq!(transport.urls().len(), 2);
+        }
+
+        #[test]
+        fn mcp_integrations_and_disabled_ones_are_not_routed() {
+            let mut orbit = record(IntegrationKind::OrbitMcp, "orbit", true);
+            orbit.host = Some("helloorbit.app".to_string());
+            let slack_mcp = record(IntegrationKind::SlackMcp, "slack", true);
+            let mut off = accepted(IntegrationKind::SlackIncoming, "ops", "hooks.slack.com");
+            off.enabled = false;
+            let records = [orbit, slack_mcp, off];
+            let secrets = secrets();
+            let transport = Recorder::answering(200);
+            let items = [item("a", Severity::High)];
+            let outcomes = route_consented(
+                &mut Router::new(),
+                &check(&records, &secrets, &items),
+                &transport,
+            );
+            assert!(outcomes.is_empty(), "{outcomes:?}");
+            assert!(transport.urls().is_empty());
+            assert_eq!(secrets.reads.get(), 0);
+        }
+
+        #[test]
+        fn an_incomplete_destination_is_not_ready_and_failures_are_reported() {
+            let mut unsigned = accepted(IntegrationKind::GenericJson, "bare", "hooks.example");
+            unsigned.id = "bare".to_string();
+            let records = [unsigned];
+            let secrets = secrets();
+            secrets
+                .put(&secret_account("bare", SecretSlot::Url), HOOK)
+                .unwrap();
+            let transport = Recorder::answering(200);
+            let items = [item("a", Severity::High)];
+            assert_eq!(
+                route_consented(
+                    &mut Router::new(),
+                    &check(&records, &secrets, &items),
+                    &transport
+                ),
+                [("bare".to_string(), Outcome::NotReady)],
+                "never posted unsigned"
+            );
+            assert!(transport.urls().is_empty());
+
+            let slack = [accepted(
+                IntegrationKind::SlackIncoming,
+                "ops",
+                "hooks.slack.com",
+            )];
+            for (status, expected) in [
+                (500, Outcome::RetryPending),
+                (429, Outcome::RetryPending),
+                (404, Outcome::GoneDisabled),
+                (410, Outcome::GoneDisabled),
+                (400, Outcome::Refused),
+                (401, Outcome::Refused),
+                (403, Outcome::Refused),
+                (302, Outcome::Refused),
+            ] {
+                let answering = Recorder::answering(status);
+                assert_eq!(
+                    route_consented(
+                        &mut Router::new(),
+                        &check(&slack, &secrets, &items),
+                        &answering
+                    ),
+                    [("ops".to_string(), expected)],
+                    "{status}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_test_needs_consent_but_not_the_switch_and_covers_the_json_webhook() {
+            let mut off = accepted(IntegrationKind::GenericJson, "json", "hooks.example");
+            off.enabled = false;
+            let mut unasked = accepted(IntegrationKind::SlackIncoming, "ops", "hooks.slack.com");
+            unasked.consent = None;
+            let orbit = record(IntegrationKind::OrbitMcp, "orbit", true);
+            let records = [off, unasked, orbit];
+            let secrets = secrets();
+            let transport = Recorder::answering(204);
+            let now = Utc.with_ymd_and_hms(2026, 10, 31, 9, 0, 0).unwrap();
+            let routing = check(&records, &secrets, &[]);
+            assert_eq!(
+                send_test_consented(&routing, "json", now, &transport).as_deref(),
+                Ok("hooks.example")
+            );
+            let (_, body) = transport.posts.borrow()[0].clone();
+            assert!(body.contains("stardust.test"), "{body}");
+            for (id, expected) in [
+                ("ops", SinkError::NeedsConsent),
+                ("orbit", SinkError::Refused),
+                ("nope", SinkError::Missing),
+            ] {
+                assert_eq!(
+                    send_test_consented(&routing, id, now, &transport),
+                    Err(expected),
+                    "{id}"
+                );
+            }
+            assert_eq!(transport.urls().len(), 1);
+        }
+
+        #[test]
+        fn the_gone_bubble_shows_ids_and_links_nowhere() {
+            let shown = gone_presentation(&["ops".to_string()], Language::English);
+            assert!(shown.show_bubble);
+            assert!(!shown.show_os_notification);
+            assert_eq!(shown.summary.lines, ["ops: Turned off: destination gone"]);
+            assert!(shown.summary.details_url.is_empty());
+        }
+    }
+
     #[test]
     fn the_https_transport_refuses_a_private_address_before_any_request() {
         for (url, host) in [
@@ -688,6 +1162,19 @@ mod tests {
             );
             assert!(!format!("{checked:?}").contains("hook"));
         }
+    }
+
+    #[test]
+    fn a_signed_post_through_the_https_transport_gets_the_same_address_check() {
+        let checked = CheckedUrl {
+            url: "https://127.0.0.1/hook".to_string(),
+            host: "127.0.0.1".to_string(),
+        };
+        let headers = [("Orbit-Signature".to_string(), "t=1,v1=00".to_string())];
+        assert_eq!(
+            HttpsTransport::new().post_json_with_headers(&checked, b"{}", &headers),
+            Err(SinkError::Blocked)
+        );
     }
 
     #[test]

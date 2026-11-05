@@ -3,6 +3,7 @@
 //! connection and the requests the check timer carries out on its next tick.
 
 use stardust_core::connect::FlowPhase;
+use stardust_core::delivery::{DeliveryBoard, Outcome};
 use stardust_core::pet::ObservedCheck;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ struct Inner {
     connect_requested: bool,
     tests: Vec<String>,
     sign_out: Option<SignOutTicket>,
+    delivery: DeliveryBoard,
 }
 
 /// A sign-out from the settings window, finished by the check timer: it
@@ -58,6 +60,7 @@ impl LivePet {
                 connect_requested: false,
                 tests: Vec::new(),
                 sign_out: None,
+                delivery: DeliveryBoard::default(),
             })),
         }
     }
@@ -135,6 +138,21 @@ impl LivePet {
         self.lock().sign_out.take()
     }
 
+    /// The last delivery result per integration, with the panel on.
+    pub fn delivery(&self) -> DeliveryBoard {
+        self.lock().delivery.clone()
+    }
+
+    pub fn record_delivery(&self, id: &str, outcome: Outcome) {
+        self.lock().delivery.record(id, outcome);
+    }
+
+    /// Forget a result that no longer says anything, as when the user turns
+    /// an integration back on after it was switched off.
+    pub fn clear_delivery(&self, id: &str) {
+        self.lock().delivery.clear(id);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|err| err.into_inner())
     }
@@ -184,5 +202,17 @@ mod tests {
         assert_eq!(ticket.refresh_token(), Some("refresh-secret"));
         assert!(!format!("{ticket:?}").contains("refresh-secret"));
         assert!(live.take_sign_out().is_none());
+    }
+
+    #[test]
+    fn delivery_results_are_kept_per_integration_until_cleared() {
+        use stardust_core::delivery::Outcome;
+        let live = LivePet::new(1.0);
+        assert_eq!(live.delivery().get("ops"), None);
+        live.record_delivery("ops", Outcome::RetryPending);
+        live.clone().record_delivery("ops", Outcome::Delivered);
+        assert_eq!(live.delivery().get("ops"), Some(Outcome::Delivered));
+        live.clear_delivery("ops");
+        assert_eq!(live.delivery().get("ops"), None);
     }
 }
