@@ -1,6 +1,8 @@
 //! Tray and bubble wording.
 
 use crate::config::Config;
+use crate::consent::{destination_host, needs_consent};
+use crate::delivery::{DeliveryBoard, Outcome};
 use crate::i18n::{tr, Language, Msg};
 use crate::integrations::integrations_label;
 use crate::pet::{ObservedCheck, PetScale, PetSkin};
@@ -23,6 +25,9 @@ pub struct MenuText {
     /// `(menu id, label)` for "Send test" on each enabled sink. Only with
     /// routing on.
     pub tests: Vec<(String, String)>,
+    /// The integrations line opens the panel. Only with the panel on;
+    /// otherwise it is a label.
+    pub integrations_opens_panel: bool,
 }
 
 const TEST_SEND_PREFIX: &str = "test-send:";
@@ -52,6 +57,48 @@ pub fn with_connect_status_in(
         text.status = Some(crate::connect::status_line(
             phase, observed, signed_in, language,
         ));
+    }
+    text
+}
+
+/// With the integrations panel on, the tray's integrations line opens the
+/// panel and says how many send, and the tooltip names the last delivery
+/// result that most needs the user. Does nothing with the panel off.
+pub fn with_delivery_panel_in(
+    mut text: MenuText,
+    config: &Config,
+    board: &DeliveryBoard,
+    language: Language,
+) -> MenuText {
+    if !config.features().integrations_panel {
+        return text;
+    }
+    let records = config.integrations();
+    let waiting: Vec<&str> = records
+        .iter()
+        .filter(|record| {
+            record.enabled && needs_consent(record) && destination_host(record).is_some()
+        })
+        .map(|record| record.id.as_str())
+        .collect();
+    let on = records
+        .iter()
+        .filter(|record| record.enabled && !needs_consent(record))
+        .count();
+    let title = tr(language, Msg::PanelTitle);
+    text.integrations = match (on, waiting.len()) {
+        (0, 0) => format!("{title}: off..."),
+        (on, 0) => format!("{title}: {on} on..."),
+        (on, count) => format!("{title}: {on} on, {count} waiting for consent..."),
+    };
+    text.integrations_opens_panel = true;
+    let ids: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+    let mut shown = board.clone();
+    for id in waiting {
+        shown.record(id, Outcome::NeedsConsent);
+    }
+    if let Some(note) = shown.tooltip_note(&ids, language) {
+        text.tooltip = format!("{} · {note}", text.tooltip);
     }
     text
 }
@@ -148,6 +195,7 @@ fn english_menu_text(config: &Config, now_utc: DateTime<Utc>) -> MenuText {
         pet_scale: config.pet_scale(),
         status: None,
         tests: Vec::new(),
+        integrations_opens_panel: false,
     }
 }
 
@@ -281,5 +329,58 @@ mod tests {
         assert_eq!(super::test_send_target("test-send:chat"), Some("chat"));
         assert_eq!(super::test_send_target("test-send:../x"), None);
         assert_eq!(super::test_send_target("interval-30"), None);
+    }
+
+    #[test]
+    fn the_tray_line_and_tooltip_change_only_with_the_panel_on() {
+        use crate::config::Feature;
+        use crate::delivery::{DeliveryBoard, Outcome};
+        use crate::i18n::Language;
+        use crate::integrations::IntegrationKind;
+        let mut config = Config::default_for("UTC").unwrap();
+        config
+            .add_integration(IntegrationKind::SlackIncoming, "ops")
+            .unwrap();
+        config
+            .set_integration_host("ops", "hooks.slack.com")
+            .unwrap();
+        config.set_integration_enabled("ops", true).unwrap();
+        config
+            .add_integration(IntegrationKind::OrbitMcp, "orbit")
+            .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 21, 15, 0, 0).unwrap();
+        let mut board = DeliveryBoard::default();
+        board.record("ops", Outcome::Delivered);
+        let plain = menu_text(&config, now);
+        let apply = |config: &Config, board: &DeliveryBoard| {
+            super::with_delivery_panel_in(menu_text(config, now), config, board, Language::English)
+        };
+        assert_eq!(apply(&config, &board), plain, "nothing changes with it off");
+        assert!(!plain.integrations_opens_panel);
+        assert_eq!(plain.integrations, "1 integration on");
+
+        config.set_feature(Feature::IntegrationsPanel, true);
+        let waiting = apply(&config, &board);
+        assert!(waiting.integrations_opens_panel);
+        assert_eq!(
+            waiting.integrations,
+            "Integrations: 0 on, 1 waiting for consent..."
+        );
+        assert!(
+            waiting.tooltip.ends_with("· ops: Needs consent"),
+            "{}",
+            waiting.tooltip
+        );
+
+        config.accept_integration_consent("ops").unwrap();
+        let on = apply(&config, &board);
+        assert_eq!(on.integrations, "Integrations: 1 on...");
+        assert!(on.tooltip.ends_with("· ops: Delivered"), "{}", on.tooltip);
+        assert!(!on.tooltip.contains("hooks.slack.com"), "{}", on.tooltip);
+
+        config.set_integration_enabled("ops", false).unwrap();
+        let off = apply(&config, &DeliveryBoard::default());
+        assert_eq!(off.integrations, "Integrations: off...");
+        assert_eq!(off.tooltip, menu_text(&config, now).tooltip);
     }
 }

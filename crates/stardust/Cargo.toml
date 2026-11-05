@@ -23,5 +23,8 @@ ureq = { workspace = true }
 uuid = { workspace = true }
 winit = "0.30.13"
 
+[dev-dependencies]
+stardust-core = { path = "../stardust-core", features = ["test-support"] }
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }

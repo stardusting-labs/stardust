@@ -18,8 +18,8 @@ use std::fmt;
 use std::net::IpAddr;
 use uuid::Uuid;
 
-const PREVIEW_TENANT: &str = "00000000-0000-4000-8000-000000000001";
-const PREVIEW_WORKSPACE: &str = "00000000-0000-4000-8000-000000000002";
+pub(crate) const PREVIEW_TENANT: &str = "00000000-0000-4000-8000-000000000001";
+pub(crate) const PREVIEW_WORKSPACE: &str = "00000000-0000-4000-8000-000000000002";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UrlError {

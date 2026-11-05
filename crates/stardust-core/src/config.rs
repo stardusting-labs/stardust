@@ -3,6 +3,7 @@
 //! Tokens are not stored here.
 
 use crate::api::parse_server_base;
+use crate::consent::{destination_host, Consent, CONSENT_VERSION};
 use crate::integrations::{
     parse_id, IntegrationError, IntegrationKind, IntegrationRecord, MAX_INTEGRATIONS,
 };
@@ -89,11 +90,25 @@ pub struct Features {
     /// do-not-disturb rules.
     #[serde(default)]
     pub routing: bool,
+    /// An Integrations page in settings and the tray, consent before an
+    /// integration sends, and last-result reporting. Alerts then leave only
+    /// through the router, as one signed post per alert for the JSON webhook.
+    /// Not written while off, so a file with only the older switches on stays
+    /// loadable by an older build.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub integrations_panel: bool,
 }
 
 impl Features {
     fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The per-alert router posts to integrations. The panel turns it on for
+    /// remote sinks by itself, so accepting an integration there is enough
+    /// for it to deliver. The bubble still follows `routing` alone.
+    pub fn routes_remote(&self) -> bool {
+        self.routing || self.integrations_panel
     }
 }
 
@@ -102,16 +117,23 @@ pub enum Feature {
     AutoSignIn,
     JitteredBackoff,
     Routing,
+    IntegrationsPanel,
 }
 
 impl Feature {
-    pub const ALL: [Self; 3] = [Self::AutoSignIn, Self::JitteredBackoff, Self::Routing];
+    pub const ALL: [Self; 4] = [
+        Self::AutoSignIn,
+        Self::JitteredBackoff,
+        Self::Routing,
+        Self::IntegrationsPanel,
+    ];
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto-sign-in" | "auto_sign_in" => Some(Self::AutoSignIn),
             "jittered-backoff" | "jittered_backoff" => Some(Self::JitteredBackoff),
             "routing" => Some(Self::Routing),
+            "integrations-panel" | "integrations_panel" => Some(Self::IntegrationsPanel),
             _ => None,
         }
     }
@@ -121,6 +143,7 @@ impl Feature {
             Self::AutoSignIn => "auto-sign-in",
             Self::JitteredBackoff => "jittered-backoff",
             Self::Routing => "routing",
+            Self::IntegrationsPanel => "integrations-panel",
         }
     }
 }
@@ -217,6 +240,7 @@ impl Config {
             Feature::AutoSignIn => features.auto_sign_in,
             Feature::JitteredBackoff => features.jittered_backoff,
             Feature::Routing => features.routing,
+            Feature::IntegrationsPanel => features.integrations_panel,
         }
     }
 
@@ -226,6 +250,7 @@ impl Config {
             Feature::AutoSignIn => features.auto_sign_in = on,
             Feature::JitteredBackoff => features.jittered_backoff = on,
             Feature::Routing => features.routing = on,
+            Feature::IntegrationsPanel => features.integrations_panel = on,
         }
     }
 
@@ -354,6 +379,59 @@ impl Config {
     ) -> Result<(), IntegrationError> {
         self.integration_mut(id)?.enabled = enabled;
         Ok(())
+    }
+
+    /// Record the user's yes to what this integration sends, for its current
+    /// destination.
+    pub fn accept_integration_consent(&mut self, id: &str) -> Result<(), IntegrationError> {
+        let record = self.integration_mut(id)?;
+        let host = destination_host(record).ok_or(IntegrationError::NoDestination)?;
+        record.consent = Some(Consent {
+            host,
+            version: CONSENT_VERSION,
+        });
+        Ok(())
+    }
+
+    /// [`Config::accept_integration_consent`] for the host the user was
+    /// shown. If the destination changed since, nothing is recorded: the
+    /// user said yes to another host.
+    pub fn accept_integration_consent_for(
+        &mut self,
+        id: &str,
+        shown_host: &str,
+    ) -> Result<(), IntegrationError> {
+        let record = self.integration_mut(id)?;
+        let host = destination_host(record).ok_or(IntegrationError::NoDestination)?;
+        if host != shown_host {
+            return Err(IntegrationError::HostChanged);
+        }
+        record.consent = Some(Consent {
+            host,
+            version: CONSENT_VERSION,
+        });
+        Ok(())
+    }
+
+    /// Take the integration list from another copy of the config.
+    pub fn adopt_integrations(&mut self, other: &Config) {
+        self.file.integrations = other.file.integrations.clone();
+    }
+
+    /// With the integrations panel on, take the integration list from the
+    /// file at `path`. `stardust integration ...` changes that file while the
+    /// app runs, and the panel tells people to use it, so the running app
+    /// calls this before it changes and saves anything rather than write its
+    /// older copy over theirs. The app's own changes are saved as they
+    /// happen, so the file is never behind it. An unreadable file changes
+    /// nothing. With the panel off this does not touch the file.
+    pub fn adopt_saved_integrations(&mut self, path: &Path) {
+        if !self.file.features.integrations_panel {
+            return;
+        }
+        if let Ok(Some(saved)) = load_config(path) {
+            self.adopt_integrations(&saved);
+        }
     }
 
     pub fn set_integration_host(&mut self, id: &str, host: &str) -> Result<(), IntegrationError> {
@@ -490,6 +568,11 @@ fn validate_integrations(records: &[IntegrationRecord]) -> Result<(), Integratio
         }
         if record.max_per_hour.is_some_and(|limit| !valid_rate(limit)) {
             return Err(IntegrationError::Rate);
+        }
+        if let Some(consent) = &record.consent {
+            if !valid_host(&consent.host) {
+                return Err(IntegrationError::Endpoint);
+            }
         }
     }
     Ok(())
@@ -932,6 +1015,127 @@ mod tests {
         config.set_feature(Feature::Routing, false);
         config.set_feature(Feature::AutoSignIn, false);
         assert!(!config.to_json().unwrap().contains("features"));
+    }
+
+    /// With the panel off a config file must stay exactly what an older build
+    /// wrote and can read: `deny_unknown_fields` refuses anything new.
+    #[test]
+    fn the_panel_flag_and_consent_leave_no_trace_in_the_file_until_used() {
+        use super::Feature;
+        use crate::integrations::{IntegrationError, IntegrationKind};
+        let mut config = Config::default_for("UTC").unwrap();
+        config.set_feature(Feature::Routing, true);
+        config
+            .add_integration(IntegrationKind::SlackIncoming, "ops")
+            .unwrap();
+        config
+            .set_integration_host("ops", "hooks.slack.com")
+            .unwrap();
+        let text = config.to_json().unwrap();
+        assert!(text.contains("\"routing\": true"), "{text}");
+        assert!(!text.contains("integrations_panel"), "{text}");
+        assert!(!text.contains("consent"), "{text}");
+        assert!(!config.features().integrations_panel);
+        assert!(config.features().routes_remote());
+        config.set_feature(Feature::Routing, false);
+        assert!(!config.features().routes_remote());
+
+        config.set_feature(Feature::IntegrationsPanel, true);
+        assert!(config.features().routes_remote());
+        assert!(!config.features().routing, "the bubble rules stay as set");
+        config.accept_integration_consent("ops").unwrap();
+        let text = config.to_json().unwrap();
+        assert!(text.contains("\"integrations_panel\": true"), "{text}");
+        assert!(text.contains("\"consent\""), "{text}");
+        let loaded = parse_config(&text).unwrap();
+        assert_eq!(loaded, config, "the yes survives a restart");
+        let record = &loaded.integrations()[0];
+        assert_eq!(
+            record.consent.as_ref().map(|consent| consent.host.as_str()),
+            Some("hooks.slack.com")
+        );
+        let bad_host = text.replace(
+            "\"host\": \"hooks.slack.com\",\n        \"version\"",
+            "\"host\": \"https://evil.example/x\",\n        \"version\"",
+        );
+        assert_ne!(bad_host, text);
+        assert!(parse_config(&bad_host).is_err());
+        let extra = text.replace("\"version\": 1", "\"version\": 1, \"note\": \"x\"");
+        assert!(parse_config(&extra).is_err());
+
+        config
+            .add_integration(IntegrationKind::GenericJson, "json")
+            .unwrap();
+        assert_eq!(
+            config.accept_integration_consent("json"),
+            Err(IntegrationError::NoDestination)
+        );
+        assert!(config.accept_integration_consent("nope").is_err());
+
+        // A yes given to the host on screen does not cover another one.
+        config.set_integration_host("json", "b.example").unwrap();
+        assert_eq!(
+            config.accept_integration_consent_for("json", "a.example"),
+            Err(IntegrationError::HostChanged)
+        );
+        assert_eq!(config.integrations()[1].consent, None);
+        config
+            .accept_integration_consent_for("json", "b.example")
+            .unwrap();
+        assert_eq!(
+            config.integrations()[1]
+                .consent
+                .as_ref()
+                .map(|consent| consent.host.as_str()),
+            Some("b.example")
+        );
+    }
+
+    #[test]
+    fn the_integration_list_can_be_taken_from_the_copy_on_disk() {
+        use crate::integrations::IntegrationKind;
+        let mut running = Config::default_for("UTC").unwrap();
+        running.set_character_visible(true);
+        let mut disk = Config::default_for("UTC").unwrap();
+        disk.add_integration(IntegrationKind::SlackIncoming, "ops")
+            .unwrap();
+        running.adopt_integrations(&disk);
+        assert_eq!(running.integrations(), disk.integrations());
+        assert!(running.character_visible(), "nothing else is taken");
+    }
+
+    #[test]
+    fn the_running_app_reads_the_file_only_with_the_panel_on() {
+        use super::Feature;
+        use crate::integrations::IntegrationKind;
+        let dir = std::env::temp_dir().join(format!(
+            "stardust-adopt-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut file = Config::default_for("UTC").unwrap();
+        file.add_integration(IntegrationKind::SlackIncoming, "added")
+            .unwrap();
+        save_config(&path, &file).unwrap();
+
+        let mut running = Config::default_for("UTC").unwrap();
+        running.adopt_saved_integrations(&path);
+        assert!(running.integrations().is_empty(), "off: as before");
+
+        running.set_feature(Feature::IntegrationsPanel, true);
+        running.adopt_saved_integrations(&path);
+        assert_eq!(running.integrations().len(), 1);
+        assert_eq!(running.integrations()[0].id, "added");
+
+        std::fs::write(&path, "not json").unwrap();
+        running.adopt_saved_integrations(&path);
+        assert_eq!(running.integrations().len(), 1, "unreadable: keep ours");
+        std::fs::remove_file(&path).unwrap();
+        running.adopt_saved_integrations(&path);
+        assert_eq!(running.integrations().len(), 1, "missing: keep ours");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);

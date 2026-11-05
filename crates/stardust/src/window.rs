@@ -20,6 +20,7 @@ use stardust_core::a11y::{
 use stardust_core::api::{https_origin, is_allowed_https_url, resolve_server_base, ENV_SERVER_URL};
 use stardust_core::config::{save_config, Config};
 use stardust_core::connect::FlowPhase;
+use stardust_core::delivery::Outcome;
 use stardust_core::i18n::Language;
 use stardust_core::pet::{
     pet_frame, pet_pose, tray_glyph, ObservedCheck, PetPose, PetScale, PetSkin,
@@ -27,7 +28,8 @@ use stardust_core::pet::{
 use stardust_core::policy::Presentation;
 use stardust_core::position::{layout_bubble, LayoutRequest, ScreenPoint, ScreenRect, WindowSize};
 use stardust_core::settings::{
-    Key, Line, LineKind, SettingsAction, SettingsModel, SettingsView, SignInStage,
+    panel_view, Key, Line, LineKind, SettingsAction, SettingsModel, SettingsView, SignInStage,
+    PANEL_LINES,
 };
 use stardust_core::text::test_send_target;
 use std::cell::RefCell;
@@ -51,7 +53,7 @@ const TRAY_REFRESH: Duration = Duration::from_secs(45);
 /// Extra space between settings lines, in bitmap pixels before scaling.
 const LINE_GAP: u32 = 4;
 /// Widest settings line, in bitmap cells.
-const SETTINGS_COLUMNS: u32 = 52;
+const SETTINGS_COLUMNS: u32 = stardust_core::settings::SETTINGS_COLUMNS as u32;
 
 type SbContext = softbuffer::Context<winit::event_loop::OwnedDisplayHandle>;
 type SbSurface = softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Window>;
@@ -80,7 +82,14 @@ struct SettingsWindow {
     surface: SbSurface,
     model: SettingsModel,
     cursor_y: f64,
+    /// Clicks before this are dropped: a click just changed the page, and the
+    /// second click of a double-click would land on the new one.
+    clicks_after: Option<Instant>,
 }
+
+/// How long after a click changes the page another click is dropped. About
+/// the usual double-click interval.
+const PAGE_CHANGE_CLICK_GUARD: Duration = Duration::from_millis(500);
 
 struct Bubble {
     surface: SbSurface,
@@ -281,10 +290,22 @@ impl PopupApp {
             skin: config.pet_skin(),
             scale: config.pet_scale(),
             server_host: host,
+            panel: config.features().integrations_panel.then(|| {
+                panel_view(
+                    config.integrations(),
+                    &self.session.live.delivery(),
+                    config.effective_language(),
+                )
+            }),
         }
     }
 
     fn open_settings(&mut self, event_loop: &ActiveEventLoop, first_run: bool) {
+        self.session
+            .config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .adopt_saved_integrations(&self.session.config_path);
         if let Some(settings) = self.settings.as_ref() {
             settings.surface.window().focus_window();
             settings.surface.window().request_redraw();
@@ -293,7 +314,12 @@ impl PopupApp {
         let model = SettingsModel::new(first_run);
         let view = self.settings_view();
         let language = self.language();
-        let rows = model.lines(&view, language).len() as u32;
+        let mut rows = model.lines(&view, language).len() as u32;
+        if view.panel.is_some() {
+            // The window is not resized while open, so it starts with room
+            // for the tallest integrations page.
+            rows = rows.max(PANEL_LINES as u32);
+        }
         let scale = text_scale(self.session.live.scale_factor());
         let (width, height) = settings_size(SETTINGS_COLUMNS, rows, scale);
         let monitor = self.monitors.first().copied().unwrap_or(ScreenRect {
@@ -317,6 +343,7 @@ impl PopupApp {
                     surface,
                     model,
                     cursor_y: -1.0,
+                    clicks_after: None,
                 });
             }
             Err(err) => self.fail(event_loop, err),
@@ -333,6 +360,7 @@ impl PopupApp {
                 .config
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
+            config.adopt_saved_integrations(&self.session.config_path);
             config.set_onboarded(true);
             if let Err(err) = save_config(&self.session.config_path, &config) {
                 eprintln!("stardust: could not save config: {err}");
@@ -344,6 +372,58 @@ impl PopupApp {
         self.settings
             .as_ref()
             .map(|settings| settings.surface.window().id())
+    }
+
+    /// The tray's integrations line. With the panel off it is only a label,
+    /// so a click cannot arrive here, and if one did it would do nothing.
+    fn open_integrations(&mut self, event_loop: &ActiveEventLoop) {
+        let panel_on = self
+            .session
+            .config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .features()
+            .integrations_panel;
+        if !panel_on {
+            return;
+        }
+        self.open_settings(event_loop, false);
+        if let Some(settings) = self.settings.as_mut() {
+            settings.model.open_panel();
+        }
+        self.redraw_settings();
+    }
+
+    /// A new delivery result, for the integrations page if it is showing.
+    fn redraw_panel(&self) {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.model.in_panel())
+        {
+            self.redraw_settings();
+        }
+    }
+
+    /// `accepted_host` is the host the consent page showed, when this follows
+    /// one. The file is read again first, so if `stardust integration url`
+    /// moved the destination since, nothing is recorded or turned on.
+    fn set_integration(&mut self, id: &str, on: bool, accepted_host: Option<&str>) {
+        self.update_config(|config| {
+            let changed = match accepted_host {
+                Some(host) => config.accept_integration_consent_for(id, host),
+                None => Ok(()),
+            }
+            .and_then(|()| config.set_integration_enabled(id, on));
+            if let Err(err) = changed {
+                eprintln!("stardust: could not change integration {id}: {err}");
+            }
+        });
+        if on {
+            // A note such as "destination gone" no longer says anything.
+            self.session.live.clear_delivery(id);
+        }
+        self.refresh_tray();
     }
 
     fn redraw_settings(&self) {
@@ -403,7 +483,15 @@ impl PopupApp {
         let Some(index) = line_at(settings.cursor_y, scale) else {
             return;
         };
+        let now = Instant::now();
+        if settings.clicks_after.is_some_and(|after| now < after) {
+            return;
+        }
+        let before = settings.model.page_marker();
         let action = settings.model.click(index, &view);
+        if settings.model.page_marker() != before {
+            settings.clicks_after = Some(now + PAGE_CHANGE_CLICK_GUARD);
+        }
         self.apply_settings(event_loop, action);
     }
 
@@ -460,6 +548,16 @@ impl PopupApp {
                 self.on_menu(event_loop, scale.menu_id());
                 self.redraw_character();
             }
+            SettingsAction::SetIntegration { id, on } => self.set_integration(&id, on, None),
+            SettingsAction::AcceptConsent { id, host } => {
+                self.set_integration(&id, true, Some(&host));
+            }
+            SettingsAction::SendTest { id } => {
+                // Posted from the check timer, like every alert.
+                self.session.live.record_delivery(&id, Outcome::TestSending);
+                self.session.live.request_test(&id);
+                self.session.wake.notify_one();
+            }
         }
         self.redraw_settings();
     }
@@ -470,6 +568,7 @@ impl PopupApp {
             .config
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        config.adopt_saved_integrations(&self.session.config_path);
         change(&mut config);
         if let Err(err) = save_config(&self.session.config_path, &config) {
             eprintln!("stardust: could not save config: {err}");
@@ -669,6 +768,7 @@ impl PopupApp {
                     self.show_bubble(event_loop, presentation);
                     self.redraw_character();
                     self.refresh_tray();
+                    self.redraw_panel();
                 }
                 UiMsg::Pet => {
                     if self.session.live.observed() == ObservedCheck::SignedOut {
@@ -677,6 +777,7 @@ impl PopupApp {
                     self.sync_character(event_loop);
                     self.redraw_character();
                     self.refresh_tray();
+                    self.redraw_panel();
                 }
                 UiMsg::SignIn(update) => self.on_sign_in(update),
             }
@@ -695,6 +796,10 @@ impl PopupApp {
                     self.start_sign_in();
                 }
                 self.redraw_settings();
+                return;
+            }
+            "integrations" => {
+                self.open_integrations(event_loop);
                 return;
             }
             other => {
@@ -722,6 +827,7 @@ impl PopupApp {
                 .config
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
+            config.adopt_saved_integrations(&self.session.config_path);
             match apply_menu(&mut config, id, now) {
                 Ok(effect) => {
                     if matches!(effect, MenuEffect::Refresh) {
@@ -805,6 +911,7 @@ impl PopupApp {
             .config
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        config.adopt_saved_integrations(&self.session.config_path);
         config.set_character_position(point);
         if let Err(err) = save_config(&self.session.config_path, &config) {
             eprintln!("stardust: could not save config: {err}");
@@ -885,6 +992,7 @@ impl ApplicationHandler<Wake> for PopupApp {
                         .config
                         .lock()
                         .unwrap_or_else(|err| err.into_inner());
+                    config.adopt_saved_integrations(&self.session.config_path);
                     config.set_character_visible(false);
                     if let Err(err) = save_config(&self.session.config_path, &config) {
                         eprintln!("stardust: could not save config: {err}");
@@ -1177,7 +1285,7 @@ fn paint_settings(surface: &mut SbSurface, painter: &Painter, lines: &[Line], sc
                 SETTINGS_FOCUS_TEXT
             }
             (LineKind::Info | LineKind::Hint, false) => SETTINGS_MUTED_TEXT,
-            (LineKind::Title | LineKind::Row(_), false) => SETTINGS_TEXT,
+            (LineKind::Title | LineKind::Row(_) | LineKind::Panel(_), false) => SETTINGS_TEXT,
         };
         let pen = Pen {
             x: pad as i32,

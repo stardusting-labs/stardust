@@ -9,6 +9,7 @@ use crate::routing::{self, HttpsTransport};
 use chrono::Utc;
 use stardust_core::api::{resolve_server_base, Severity, ENV_SERVER_URL};
 use stardust_core::config::{load_config, save_config, Config, RoutingUpdate};
+use stardust_core::consent::{destination_host, needs_consent, what_is_sent};
 use stardust_core::integrations::{secret_account, IntegrationKind, SecretSlot, SecretStore};
 use stardust_core::mcp::{
     initialize_request, server_name, tool_names, tools_list_request, SLACK_MCP_URL,
@@ -22,6 +23,11 @@ use std::path::Path;
 use crate::cli::IntegrationAction;
 
 pub fn apply(path: &Path, action: IntegrationAction) -> Result<(), String> {
+    if matches!(action, IntegrationAction::Enable { accept: true, .. }) && !panel_on_disk(path) {
+        // Refused before any file is created or rewritten, with the answer a
+        // build without the integrations panel gives.
+        return Err("unexpected arguments after the integration command".to_string());
+    }
     let mut config = load_or_create(path)?;
     let secrets = KeychainTokenStore::new();
     match action {
@@ -38,7 +44,13 @@ pub fn apply(path: &Path, action: IntegrationAction) -> Result<(), String> {
             save_config(path, &config).map_err(|err| err.to_string())?;
             println!("added {} {id} (off)", parsed.as_str());
         }
-        IntegrationAction::Enable { id } => set_enabled(path, &mut config, &id, true)?,
+        IntegrationAction::Enable { id, accept } => {
+            if config.features().integrations_panel {
+                let input = std::io::stdin().lock();
+                settle_consent(&mut config, &id, accept, input, &mut std::io::stdout())?;
+            }
+            set_enabled(path, &mut config, &id, true)?;
+        }
         IntegrationAction::Disable { id } => set_enabled(path, &mut config, &id, false)?,
         IntegrationAction::Url {
             id,
@@ -53,6 +65,9 @@ pub fn apply(path: &Path, action: IntegrationAction) -> Result<(), String> {
             save_config(path, &config).map_err(|err| err.to_string())?;
             println!("saved destination for {id} ({})", saved.host);
             if let Some(note) = saved.note {
+                println!("{note}");
+            }
+            if let Some(note) = consent_note(&config, &id) {
                 println!("{note}");
             }
         }
@@ -81,7 +96,7 @@ pub fn apply(path: &Path, action: IntegrationAction) -> Result<(), String> {
             let line = set_route(&mut config, &id, &update)?;
             save_config(path, &config).map_err(|err| err.to_string())?;
             println!("{line}");
-            if !config.features().routing {
+            if !config.features().routes_remote() {
                 println!("routing is off; turn it on with: stardust feature routing on");
             }
         }
@@ -91,19 +106,94 @@ pub fn apply(path: &Path, action: IntegrationAction) -> Result<(), String> {
                 std::env::var(ENV_SERVER_URL).ok().as_deref(),
             )
             .map_err(|err| err.to_string())?;
-            let host = routing::send_test(
-                config.integrations(),
-                &secrets,
-                &id,
-                &base,
-                Utc::now(),
-                &HttpsTransport::new(),
-            )
-            .map_err(|err| format!("test to {id} did not go through: {err}"))?;
+            let result = if config.features().integrations_panel {
+                let check = routing::CheckRouting {
+                    records: config.integrations(),
+                    secrets: &secrets,
+                    items: &[],
+                    server_base: &base,
+                    quiet: false,
+                    now: std::time::Instant::now(),
+                    interval_minutes: config.schedule().interval_minutes().unwrap_or(1440),
+                };
+                routing::send_test_consented(&check, &id, Utc::now(), &HttpsTransport::new())
+            } else {
+                routing::send_test(
+                    config.integrations(),
+                    &secrets,
+                    &id,
+                    &base,
+                    Utc::now(),
+                    &HttpsTransport::new(),
+                )
+            };
+            let host = result.map_err(|err| format!("test to {id} did not go through: {err}"))?;
             println!("test sent to {id} ({host})");
         }
     }
     Ok(())
+}
+
+/// With the integrations panel on: the first time an integration is turned
+/// on, say exactly what it sends and to which host, and take a typed `yes` or
+/// `--accept` before recording the consent. The caller saves the config.
+pub(crate) fn settle_consent(
+    config: &mut Config,
+    id: &str,
+    accept: bool,
+    input: impl std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    let record = config
+        .integrations()
+        .iter()
+        .find(|record| record.id == id)
+        .ok_or_else(|| format!("unknown integration {id}"))?;
+    if !needs_consent(record) {
+        return Ok(());
+    }
+    let kind = record.kind;
+    let host = destination_host(record)
+        .ok_or_else(|| stardust_core::integrations::IntegrationError::NoDestination.to_string())?;
+    let say = |output: &mut dyn std::io::Write, line: String| {
+        writeln!(output, "{line}").map_err(|_| "could not write the question".to_string())
+    };
+    say(output, format!("{id} sends each alert to {host}."))?;
+    say(output, what_is_sent(kind).unwrap_or("").to_string())?;
+    if !accept {
+        say(output, "Type yes to accept and turn it on:".to_string())?;
+        let _ = output.flush();
+        let answer = read_line(input, "answer").unwrap_or_default();
+        if !answer.eq_ignore_ascii_case("yes") {
+            return Err(format!("{id} stays off: the question was not accepted"));
+        }
+    }
+    config
+        .accept_integration_consent(id)
+        .map_err(|err| err.to_string())
+}
+
+/// The config file at `path` exists, reads, and has the integrations panel
+/// on. Reads only; never creates the file.
+fn panel_on_disk(path: &Path) -> bool {
+    load_config(path)
+        .ok()
+        .flatten()
+        .is_some_and(|config| config.features().integrations_panel)
+}
+
+/// A new destination asks again, so say so rather than go quiet.
+fn consent_note(config: &Config, id: &str) -> Option<String> {
+    if !config.features().integrations_panel {
+        return None;
+    }
+    let record = config
+        .integrations()
+        .iter()
+        .find(|record| record.id == id)?;
+    (record.enabled && needs_consent(record)).then(|| {
+        format!("{id} sends nothing to this host until accepted: stardust integration enable {id}")
+    })
 }
 
 /// `-` reads the value as one line from standard input, so a secret stays
@@ -137,7 +227,28 @@ fn list(config: &Config) {
     for record in config.integrations() {
         let state = if record.enabled { "on" } else { "off" };
         let host = record.host.as_deref().unwrap_or("—");
-        println!("{} {} {state} {host}", record.id, record.kind.as_str());
+        let note = list_note(config, record);
+        println!(
+            "{} {} {state} {host}{note}",
+            record.id,
+            record.kind.as_str()
+        );
+    }
+}
+
+/// The end of a list line with the integrations panel on. Empty otherwise.
+fn list_note(
+    config: &Config,
+    record: &stardust_core::integrations::IntegrationRecord,
+) -> &'static str {
+    if !config.features().integrations_panel {
+        ""
+    } else if !record.kind.delivers_alerts() {
+        " (no alert delivery)"
+    } else if record.enabled && needs_consent(record) {
+        " (needs consent)"
+    } else {
+        ""
     }
 }
 
@@ -152,7 +263,7 @@ fn set_enabled(path: &Path, config: &mut Config, id: &str, enabled: bool) -> Res
 }
 
 /// What [`save_url`] stored, for the confirmation line.
-struct SavedUrl {
+pub(crate) struct SavedUrl {
     host: String,
     /// Shown after the confirmation when routing will not use this URL.
     note: Option<&'static str>,
@@ -160,14 +271,14 @@ struct SavedUrl {
 
 /// Store a destination in the keychain and its host in `config`. The caller
 /// saves the config file.
-fn save_url(
+pub(crate) fn save_url(
     config: &mut Config,
     secrets: &dyn SecretStore,
     id: &str,
     url: &str,
     signing_secret: Option<&str>,
 ) -> Result<SavedUrl, String> {
-    let routing = config.features().routing;
+    let routing = config.features().routes_remote();
     let checked = match public_https(url) {
         Ok(checked) => checked,
         // A Teams Workflows URL carries its signature in the query, which
@@ -276,11 +387,17 @@ fn save_routing_key(
 /// Change the routing rules of a sink integration. Returns the rules now in
 /// effect, defaults included.
 fn set_route(config: &mut Config, id: &str, update: &RoutingUpdate) -> Result<String, String> {
-    if SinkKind::of(kind_of(config, id)?).is_none() {
+    let kind = kind_of(config, id)?;
+    let routed = if config.features().integrations_panel {
+        SinkKind::with_panel(kind)
+    } else {
+        SinkKind::of(kind)
+    };
+    let Some(sink) = routed else {
         return Err(
             "routing rules are for a Slack, Teams, Discord, or PagerDuty integration".to_string(),
         );
-    }
+    };
     config
         .set_integration_routing(id, update)
         .map_err(|err| err.to_string())?;
@@ -288,7 +405,7 @@ fn set_route(config: &mut Config, id: &str, update: &RoutingUpdate) -> Result<St
         .integrations()
         .iter()
         .find(|record| record.id == id)
-        .and_then(SinkRule::for_record)
+        .map(|record| SinkRule::for_sink(record, sink))
         .ok_or_else(|| format!("unknown integration {id}"))?;
     let severity = match rule.min_severity {
         Severity::Low => "low",
@@ -594,5 +711,192 @@ mod tests {
         let mut json = config_with(IntegrationKind::GenericJson, "json");
         assert!(set_route(&mut json, "json", &RoutingUpdate::default()).is_err());
         assert!(set_route(&mut json, "missing", &RoutingUpdate::default()).is_err());
+    }
+
+    mod panel {
+        use super::super::{consent_note, list_note, save_url, set_route, settle_consent};
+        use super::config_with;
+        use stardust_core::config::{Config, Feature, RoutingUpdate};
+        use stardust_core::consent::has_valid_consent;
+        use stardust_core::integrations::{IntegrationKind, MemorySecretStore};
+
+        const SLACK: &str = "https://hooks.slack.com/services/T000/B000/example";
+
+        #[test]
+        fn accept_is_refused_without_the_panel_before_any_file_is_written() {
+            use crate::cli::IntegrationAction;
+            use stardust_core::config::{load_config, save_config};
+            let dir = std::env::temp_dir().join(format!(
+                "stardust-accept-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let path = dir.join("config.json");
+            let enable = || IntegrationAction::Enable {
+                id: "ops".to_string(),
+                accept: true,
+            };
+            let refused = "unexpected arguments after the integration command";
+            assert_eq!(super::super::apply(&path, enable()).unwrap_err(), refused);
+            assert!(!dir.exists(), "nothing created");
+
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, "not json").unwrap();
+            assert_eq!(super::super::apply(&path, enable()).unwrap_err(), refused);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+
+            let off = config_with(IntegrationKind::SlackIncoming, "ops");
+            save_config(&path, &off).unwrap();
+            let before = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(super::super::apply(&path, enable()).unwrap_err(), refused);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(load_config(&path).unwrap().unwrap(), off);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn slack_with_panel() -> Config {
+            let mut config = config_with(IntegrationKind::SlackIncoming, "ops");
+            config.set_feature(Feature::IntegrationsPanel, true);
+            let secrets = MemorySecretStore::new();
+            save_url(&mut config, &secrets, "ops", SLACK, None).unwrap();
+            config
+        }
+
+        fn ask(
+            config: &mut Config,
+            id: &str,
+            accept: bool,
+            typed: &str,
+        ) -> (Result<(), String>, String) {
+            let mut said = Vec::new();
+            let result = settle_consent(config, id, accept, typed.as_bytes(), &mut said);
+            (result, String::from_utf8(said).unwrap())
+        }
+
+        #[test]
+        fn enabling_states_the_host_and_the_list_and_takes_a_typed_yes() {
+            let mut config = slack_with_panel();
+            let (result, said) = ask(&mut config, "ops", false, "yes\n");
+            result.unwrap();
+            assert_eq!(
+                said,
+                "ops sends each alert to hooks.slack.com.\n\
+                 Alert title, severity, time, and ORBIT link. Nothing else.\n\
+                 Type yes to accept and turn it on:\n"
+            );
+            assert!(!said.contains("services/T000"), "never the URL");
+            assert!(has_valid_consent(&config.integrations()[0]));
+            let (result, said) = ask(&mut config, "ops", false, "");
+            result.unwrap();
+            assert_eq!(said, "", "asked once, for this host");
+        }
+
+        #[test]
+        fn anything_but_yes_leaves_it_off_and_unrecorded() {
+            for typed in ["no\n", "y\n", "\n", "", "yes please\n"] {
+                let mut config = slack_with_panel();
+                let (result, _) = ask(&mut config, "ops", false, typed);
+                assert!(result.is_err(), "{typed:?}");
+                assert_eq!(config.integrations()[0].consent, None, "{typed:?}");
+            }
+            let mut config = slack_with_panel();
+            let (result, _) = ask(&mut config, "ops", false, "YES\n");
+            result.unwrap();
+        }
+
+        #[test]
+        fn accept_still_states_the_list_and_skips_only_the_question() {
+            let mut config = slack_with_panel();
+            let (result, said) = ask(&mut config, "ops", true, "");
+            result.unwrap();
+            assert!(said.contains("hooks.slack.com"), "{said}");
+            assert!(said.contains("Nothing else."), "{said}");
+            assert!(!said.contains("Type yes"), "{said}");
+            assert!(has_valid_consent(&config.integrations()[0]));
+        }
+
+        #[test]
+        fn nothing_can_be_accepted_without_a_destination_and_mcp_is_not_asked() {
+            let mut json = config_with(IntegrationKind::GenericJson, "json");
+            json.set_feature(Feature::IntegrationsPanel, true);
+            let (result, said) = ask(&mut json, "json", true, "");
+            assert!(result.unwrap_err().contains("save a destination"));
+            assert_eq!(said, "");
+            let (result, _) = ask(&mut json, "missing", true, "");
+            assert!(result.is_err());
+
+            let mut pager = config_with(IntegrationKind::PagerDuty, "pd");
+            pager.set_feature(Feature::IntegrationsPanel, true);
+            let (result, said) = ask(&mut pager, "pd", true, "");
+            result.unwrap();
+            assert!(said.contains("events.pagerduty.com"), "{said}");
+            assert!(said.contains("routing key"), "{said}");
+
+            let mut mcp = config_with(IntegrationKind::OrbitMcp, "orbit");
+            mcp.set_feature(Feature::IntegrationsPanel, true);
+            let (result, said) = ask(&mut mcp, "orbit", false, "");
+            result.unwrap();
+            assert_eq!(said, "");
+            assert_eq!(mcp.integrations()[0].consent, None);
+            assert_eq!(
+                list_note(&mcp, &mcp.integrations()[0]),
+                " (no alert delivery)"
+            );
+        }
+
+        #[test]
+        fn a_new_host_voids_the_yes_and_says_so() {
+            let mut config = slack_with_panel();
+            let (result, _) = ask(&mut config, "ops", true, "");
+            result.unwrap();
+            config.set_integration_enabled("ops", true).unwrap();
+            assert_eq!(consent_note(&config, "ops"), None);
+            assert_eq!(list_note(&config, &config.integrations()[0]), "");
+            let secrets = MemorySecretStore::new();
+            save_url(
+                &mut config,
+                &secrets,
+                "ops",
+                "https://hooks.slack-gov.com/services/T/B/x",
+                None,
+            )
+            .unwrap();
+            let note = consent_note(&config, "ops").unwrap();
+            assert!(note.contains("stardust integration enable ops"), "{note}");
+            assert!(!note.contains("services"), "{note}");
+            assert_eq!(
+                list_note(&config, &config.integrations()[0]),
+                " (needs consent)"
+            );
+        }
+
+        #[test]
+        fn notes_and_extra_kinds_appear_only_with_the_panel_on() {
+            let mut json = config_with(IntegrationKind::GenericJson, "json");
+            json.set_integration_enabled("json", true).unwrap();
+            assert_eq!(list_note(&json, &json.integrations()[0]), "");
+            assert_eq!(consent_note(&json, "json"), None);
+            assert!(set_route(&mut json, "json", &RoutingUpdate::default()).is_err());
+            json.set_feature(Feature::IntegrationsPanel, true);
+            assert_eq!(
+                set_route(&mut json, "json", &RoutingUpdate::default()).unwrap(),
+                "json: min severity low, at most 30 an hour, high alerts during quiet hours on"
+            );
+            let mut mcp = config_with(IntegrationKind::OrbitMcp, "orbit");
+            mcp.set_feature(Feature::IntegrationsPanel, true);
+            assert!(set_route(&mut mcp, "orbit", &RoutingUpdate::default()).is_err());
+        }
+
+        #[test]
+        fn the_panel_accepts_a_teams_workflows_url_because_it_routes_by_itself() {
+            let workflow = "https://prod-00.westus.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?api-version=2016-06-01&sig=example";
+            let mut config = config_with(IntegrationKind::TeamsIncoming, "team");
+            let secrets = MemorySecretStore::new();
+            assert!(save_url(&mut config, &secrets, "team", workflow, None).is_err());
+            config.set_feature(Feature::IntegrationsPanel, true);
+            let saved = save_url(&mut config, &secrets, "team", workflow, None).unwrap();
+            assert_eq!(saved.host, "prod-00.westus.logic.azure.com");
+            assert_eq!(saved.note, None);
+        }
     }
 }
