@@ -1,6 +1,6 @@
 # Stardust
 
-Stardust is an early-preview desktop companion for [ORBIT](https://github.com/stardusting-labs/rust-orbit). It checks ORBIT on a schedule you choose and shows the result in a small speech bubble. A high-severity item also raises an OS notification from that same check.
+Stardust is an early-preview desktop companion for [ORBIT](https://github.com/stardusting-labs/rust-orbit). Builds are an unsigned preview: Gatekeeper and SmartScreen may warn. It checks ORBIT on a schedule you choose and shows the result in a small speech bubble. A high-severity item also raises an OS notification from that same check.
 
 This is not a chat product. There is no message composer, no conversational assistant, and no language-model call. Choosing a bubble opens the matching ORBIT workspace page in your browser.
 
@@ -45,13 +45,15 @@ The first check waits until the next slot. Check now, in the tray menu, runs one
 
 ## Install
 
-Release archives are unsigned. They are built by the `release-build` GitHub Actions workflow, which runs only when someone starts it by hand. The workflow uploads the archives and a `SHA256SUMS` file as workflow artifacts. It does not create a GitHub release.
+Stardust releases are an **unsigned preview**. There is no code-signing certificate and no Apple notarization. Gatekeeper on macOS and SmartScreen on Windows may warn before the app opens. That warning is expected for this preview. Compare each archive with `SHA256SUMS` before you run it.
+
+Release archives are built by the `release-build` GitHub Actions workflow, which runs only when someone starts it by hand. The workflow uploads the archives and a `SHA256SUMS` file as workflow artifacts. Publishing a GitHub Release is a separate step.
 
 - Linux: `stardust-linux-x86_64.tar.gz`. Unpack it and run `stardust`. The machine needs the usual Wayland or X11 libraries (`libxkbcommon`, `libwayland-client`, `libx11`).
-- macOS: `stardust-macos-universal.zip`, an unsigned universal `.app`. The first open can be blocked. Allow it under System Settings, Privacy & Security. Move it to the Applications folder before you turn on start at login.
-- Windows: `stardust-windows-x86_64.zip`. Unpack it and run `stardust.exe`. SmartScreen can warn because the file is unsigned.
+- macOS: `stardust-macos-universal.zip`, an unsigned universal `.app`. Gatekeeper can block the first open. Allow it under System Settings, Privacy & Security, or right-click the app and choose Open. Move it to the Applications folder before you turn on start at login.
+- Windows: `stardust-windows-x86_64.zip`. Unpack it and run `stardust.exe`. SmartScreen can warn because the file is unsigned. Choose More info, then Run anyway, only after the checksum matches.
 
-Compare the archive checksum with `SHA256SUMS` before you run it.
+See also [PRIVACY.md](PRIVACY.md).
 
 ## Settings and first start
 
@@ -160,6 +162,8 @@ stardust integration connect slack
 ```
 
 ## Privacy
+
+The same text is in [PRIVACY.md](PRIVACY.md).
 
 Stardust does not send telemetry.
 
