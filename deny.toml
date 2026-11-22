@@ -20,6 +20,10 @@ ignore = [
   "RUSTSEC-2026-0370",
   "RUSTSEC-2026-0371",
   "RUSTSEC-2026-0372",
+  # chrono and chrono-tz are existing unmaintained Stardust dependencies, not introduced by cpal.
+  # Temporary until a separately approved replacement (t5602s25359).
+  { id = "RUSTSEC-2026-0543", reason = "chrono: existing unmaintained dependency; temporary until a separately approved replacement" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz: existing unmaintained dependency; temporary until a separately approved replacement" },
 ]
 
 [licenses]
