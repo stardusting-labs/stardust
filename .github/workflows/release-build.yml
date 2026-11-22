@@ -30,7 +30,7 @@ jobs:
 
       - name: Install Linux build libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libasound2-dev
 
       - name: Build Linux archive
         if: runner.os == 'Linux'
