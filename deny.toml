@@ -20,7 +20,11 @@ ignore = [
   "RUSTSEC-2026-0370",
   "RUSTSEC-2026-0371",
   "RUSTSEC-2026-0372",
-  # chrono and chrono-tz are existing unmaintained Stardust dependencies, not introduced by cpal.
+  # Unmaintained crates pulled in only by the default-off gpui-kit-spike feature (gpui-kit 0.9.1).
+  { id = "RUSTSEC-2024-0384", reason = "instant: accepted pre-launch per t5335s24151; replace after launch" },
+  { id = "RUSTSEC-2024-0436", reason = "paste: accepted pre-launch per t5335s24151; replace after launch" },
+  { id = "RUSTSEC-2026-0206", reason = "rustybuzz: accepted pre-launch per t5335s24151; replace after launch" },
+  # chrono and chrono-tz are existing unmaintained Stardust dependencies, not introduced by gpui-kit.
   # Temporary until a separately approved replacement (t5602s25359).
   { id = "RUSTSEC-2026-0543", reason = "chrono: existing unmaintained dependency; temporary until a separately approved replacement" },
   { id = "RUSTSEC-2026-0555", reason = "chrono-tz: existing unmaintained dependency; temporary until a separately approved replacement" },
@@ -44,6 +48,13 @@ allow = [
   "Unicode-DFS-2016",
   "Unlicense",
   "Zlib",
+]
+# Owner approval t5157s23263 (Unsu, 2026-11-18): 0BSD is allowed ONLY for these two
+# exact crates, pulled in by gpui-kit 0.9.1 (via gpui-component) for the default-off
+# gpui-kit-spike example. Not a global allow; any other 0BSD crate still fails.
+exceptions = [
+  { allow = ["0BSD"], crate = "enum-iterator@2.3.0" },
+  { allow = ["0BSD"], crate = "enum-iterator-derive@1.5.0" },
 ]
 
 [licenses.private]

@@ -13,6 +13,7 @@ stardust-core = { path = "../stardust-core" }
 arboard = { version = "3.7.0", default-features = false }
 chrono = { workspace = true }
 cpal = "=0.18.2"
+gpui-kit = { version = "=0.9.1", optional = true }
 iana-time-zone = "0.1.65"
 keyring = "4.2.0"
 notify-rust = "4.18.2"
@@ -24,6 +25,15 @@ tray-icon = { version = "0.26.1", default-features = false }
 ureq = { workspace = true }
 uuid = { workspace = true }
 winit = "0.30.13"
+
+[features]
+# G1 spike only (default off): pulls in the gpui-kit UI toolkit for the
+# `gpui_spike` example. No product screen uses it.
+gpui-kit-spike = ["dep:gpui-kit"]
+
+[[example]]
+name = "gpui_spike"
+required-features = ["gpui-kit-spike"]
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
