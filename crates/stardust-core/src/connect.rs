@@ -8,8 +8,8 @@
 //! jitter without passing the code's expiry.
 
 use crate::api::{
-    verification_url, DeviceCodeResponse, DevicePoll, DeviceTokenResponse, OrbitError,
-    DEVICE_CODE_TTL_SECONDS,
+    verification_address, verification_url, DeviceCodeResponse, DevicePoll, DeviceTokenResponse,
+    OrbitError, DEVICE_CODE_TTL_SECONDS,
 };
 use crate::check::full_jitter;
 use crate::i18n::{tr, Language, Msg};
@@ -125,14 +125,27 @@ pub enum FlowStep {
     Ended(OrbitError),
 }
 
+/// What the sign-in window may show and open. The user code is not a secret,
+/// and neither address carries the device code or a token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuedCode {
+    pub user_code: String,
+    /// The page to type on another device, without its scheme.
+    pub address: Option<String>,
+    /// The page the Open row opens: https on the configured host.
+    pub open_url: Option<String>,
+}
+
 pub struct DeviceFlow {
     device_code: String,
     user_code: String,
     verification: Option<String>,
+    address: Option<String>,
     interval: Duration,
     next_poll: Instant,
     deadline: Instant,
     failures: u32,
+    window_attempt: Option<u64>,
 }
 
 impl fmt::Debug for DeviceFlow {
@@ -163,13 +176,42 @@ impl DeviceFlow {
         let lifetime = Duration::from_secs(started.expires_in.clamp(1, DEVICE_CODE_TTL_SECONDS));
         Ok(Self {
             verification: verification_url(server_base, &started),
+            address: verification_address(server_base, &started),
             device_code: started.device_code,
             user_code: started.user_code,
             interval,
             next_poll: now + interval,
             deadline: now + lifetime,
             failures: 0,
+            window_attempt: None,
         })
+    }
+
+    /// This flow belongs to attempt `attempt` of the sign-in window. Its
+    /// updates carry that number, and after a network error the poll interval
+    /// doubles, so a retry always comes less often than the one before.
+    #[must_use]
+    pub fn for_window(mut self, attempt: u64) -> Self {
+        self.window_attempt = Some(attempt);
+        self
+    }
+
+    pub fn window_attempt(&self) -> Option<u64> {
+        self.window_attempt
+    }
+
+    /// What the sign-in window shows for this code.
+    pub fn issued(&self) -> IssuedCode {
+        IssuedCode {
+            user_code: self.user_code.clone(),
+            address: self.address.clone(),
+            open_url: self.verification.clone(),
+        }
+    }
+
+    /// Time left before the code expires.
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
     }
 
     pub fn user_code(&self) -> &str {
@@ -216,11 +258,22 @@ impl DeviceFlow {
             }
             Err(OrbitError::Unreachable) => {
                 self.failures = self.failures.saturating_add(1);
-                let backoff = self.interval.max(full_jitter(self.failures, entropy));
+                let floor = if self.window_attempt.is_some() {
+                    self.doubled_interval()
+                } else {
+                    self.interval
+                };
+                let backoff = floor.max(full_jitter(self.failures, entropy));
                 FlowStep::Offline(self.schedule(now, backoff))
             }
             Err(err) => FlowStep::Ended(err),
         }
+    }
+
+    /// The poll interval doubled once for each network error in a row.
+    fn doubled_interval(&self) -> Duration {
+        let factor = 1_u32 << self.failures.min(16);
+        self.interval.saturating_mul(factor).min(MAX_POLL_INTERVAL)
     }
 
     fn schedule(&mut self, now: Instant, delay: Duration) -> Duration {
@@ -494,6 +547,115 @@ mod tests {
             "a reachable poll resets the backoff"
         );
         assert_eq!(server.count(PATH_DEVICE_TOKEN), 1);
+    }
+
+    #[test]
+    fn a_window_flow_polls_less_often_after_each_network_error() {
+        let server = scripted(5, 600, Vec::new());
+        let reachable = client(&server, None);
+        let t0 = Instant::now();
+        let mut flow = DeviceFlow::start(&reachable, &server.base(), || t0)
+            .unwrap()
+            .for_window(7);
+        assert_eq!(flow.window_attempt(), Some(7));
+        let closed =
+            HttpOrbitClient::with_timeout("http://127.0.0.1:1", Duration::from_millis(500))
+                .unwrap();
+        let mut now = t0 + Duration::from_secs(5);
+        let mut last = flow.interval();
+        for expected in [10, 20, 40] {
+            let FlowStep::Offline(backoff) = flow.step(&closed, now, 0) else {
+                panic!("expected a backoff");
+            };
+            assert_eq!(backoff, Duration::from_secs(expected));
+            assert!(backoff > last, "the rate drops on every timeout");
+            last = backoff;
+            now += backoff;
+        }
+        assert_eq!(
+            flow.step(&reachable, now, 0),
+            FlowStep::Pending(Duration::from_secs(5)),
+            "a reachable poll goes back to the interval"
+        );
+        let FlowStep::Offline(after_reset) = flow.step(&closed, now + Duration::from_secs(5), 0)
+        else {
+            panic!("expected a backoff");
+        };
+        assert_eq!(after_reset, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_window_flow_backoff_stays_within_the_code_lifetime() {
+        let server = scripted(5, 30, Vec::new());
+        let reachable = client(&server, None);
+        let t0 = Instant::now();
+        let mut flow = DeviceFlow::start(&reachable, &server.base(), || t0)
+            .unwrap()
+            .for_window(1);
+        let closed =
+            HttpOrbitClient::with_timeout("http://127.0.0.1:1", Duration::from_millis(500))
+                .unwrap();
+        for _ in 0..40 {
+            flow.failures = flow.failures.saturating_add(1);
+            assert!(flow.doubled_interval() <= MAX_POLL_INTERVAL);
+        }
+        flow.failures = 0;
+        let now = t0 + Duration::from_secs(25);
+        assert_eq!(
+            flow.step(&closed, now, 0),
+            FlowStep::Offline(Duration::from_secs(5)),
+            "the next poll is cut to the expiry"
+        );
+        assert_eq!(flow.remaining(now), Duration::from_secs(5));
+        assert_eq!(flow.remaining(t0 + Duration::from_secs(99)), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_window_gets_the_plain_address_and_never_the_device_code() {
+        let server = scripted(5, 600, Vec::new());
+        let client = client(&server, None);
+        let t0 = Instant::now();
+        let flow = DeviceFlow::start(&client, "https://helloorbit.app", || t0).unwrap();
+        let issued = flow.issued();
+        assert_eq!(issued.user_code, "ABCD-EFGH");
+        assert_eq!(
+            issued.address.as_deref(),
+            Some("helloorbit.app/rust-preview/pqc/account"),
+            "the plain page, so the code is typed and compared"
+        );
+        assert_eq!(
+            issued.open_url.as_deref(),
+            Some("https://helloorbit.app/rust-preview/pqc/account?user_code=ABCD-EFGH")
+        );
+        assert!(!format!("{issued:?}").contains(DEVICE_CODE));
+        let plain = DeviceFlow::start(&client, &server.base(), || t0).unwrap();
+        assert_eq!(plain.issued().address, None, "no page on plain http");
+        assert_eq!(plain.issued().open_url, None);
+        let other = DeviceFlow::start(&client, "https://other.example", || t0).unwrap();
+        assert_eq!(other.issued().address, None, "another host is not shown");
+    }
+
+    #[test]
+    fn the_address_must_be_printable_ascii() {
+        let response = |uri: &str| crate::api::DeviceCodeResponse {
+            device_code: DEVICE_CODE.to_string(),
+            user_code: "ABCD-EFGH".to_string(),
+            verification_uri: uri.to_string(),
+            verification_uri_complete: String::new(),
+            expires_in: 600,
+            interval: 5,
+        };
+        let base = "https://helloorbit.app";
+        let address = |uri: &str| crate::api::verification_address(base, &response(uri));
+        assert_eq!(
+            address("https://helloorbit.app/a/b").as_deref(),
+            Some("helloorbit.app/a/b")
+        );
+        assert_eq!(address("https://helloorbit.app/caf\u{e9}"), None);
+        assert_eq!(address("https://helloorbit.app/a\u{202e}b"), None);
+        assert_eq!(address("https://helloorbit.app/a b"), None);
+        assert_eq!(address("https://helloorbit.app.evil.example/a"), None);
+        assert_eq!(address("http://helloorbit.app/a"), None);
     }
 
     #[test]

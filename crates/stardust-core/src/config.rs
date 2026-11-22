@@ -97,6 +97,15 @@ pub struct Features {
     /// loadable by an older build.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub integrations_panel: bool,
+    /// Starting the app with no usable session opens a sign-in window. The
+    /// tray then shows the connection and offers Sign out. Left out of the
+    /// file while off, so turning on another feature writes what it always did.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub launch_sign_in_window: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Features {
@@ -110,6 +119,12 @@ impl Features {
     pub fn routes_remote(&self) -> bool {
         self.routing || self.integrations_panel
     }
+
+    /// The device sign-in runs on the check timer, the tray shows the
+    /// connection line, and sign-out revokes a saved refresh token.
+    pub fn sign_in_on_timer(&self) -> bool {
+        self.auto_sign_in || self.launch_sign_in_window
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,14 +133,16 @@ pub enum Feature {
     JitteredBackoff,
     Routing,
     IntegrationsPanel,
+    LaunchSignInWindow,
 }
 
 impl Feature {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::AutoSignIn,
         Self::JitteredBackoff,
         Self::Routing,
         Self::IntegrationsPanel,
+        Self::LaunchSignInWindow,
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -134,6 +151,7 @@ impl Feature {
             "jittered-backoff" | "jittered_backoff" => Some(Self::JitteredBackoff),
             "routing" => Some(Self::Routing),
             "integrations-panel" | "integrations_panel" => Some(Self::IntegrationsPanel),
+            "launch-sign-in-window" | "launch_sign_in_window" => Some(Self::LaunchSignInWindow),
             _ => None,
         }
     }
@@ -144,6 +162,7 @@ impl Feature {
             Self::JitteredBackoff => "jittered-backoff",
             Self::Routing => "routing",
             Self::IntegrationsPanel => "integrations-panel",
+            Self::LaunchSignInWindow => "launch-sign-in-window",
         }
     }
 }
@@ -241,6 +260,7 @@ impl Config {
             Feature::JitteredBackoff => features.jittered_backoff,
             Feature::Routing => features.routing,
             Feature::IntegrationsPanel => features.integrations_panel,
+            Feature::LaunchSignInWindow => features.launch_sign_in_window,
         }
     }
 
@@ -251,6 +271,7 @@ impl Config {
             Feature::JitteredBackoff => features.jittered_backoff = on,
             Feature::Routing => features.routing = on,
             Feature::IntegrationsPanel => features.integrations_panel = on,
+            Feature::LaunchSignInWindow => features.launch_sign_in_window = on,
         }
     }
 
@@ -1136,6 +1157,35 @@ mod tests {
         running.adopt_saved_integrations(&path);
         assert_eq!(running.integrations().len(), 1, "missing: keep ours");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_launch_window_flag_stays_out_of_the_file_until_it_is_on() {
+        use super::Feature;
+        let mut config = Config::default_for("UTC").unwrap();
+        assert!(!config.features().sign_in_on_timer());
+        config.set_feature(Feature::AutoSignIn, true);
+        assert!(config.features().sign_in_on_timer());
+        let other_feature_only = config.to_json().unwrap();
+        assert!(other_feature_only.contains("\"auto_sign_in\": true"));
+        assert!(
+            !other_feature_only.contains("launch_sign_in_window"),
+            "a file an older build can still read"
+        );
+        config.set_feature(Feature::AutoSignIn, false);
+        config.set_feature(Feature::LaunchSignInWindow, true);
+        assert!(config.features().sign_in_on_timer());
+        let text = config.to_json().unwrap();
+        assert!(text.contains("\"launch_sign_in_window\": true"));
+        let loaded = parse_config(&text).unwrap();
+        assert!(loaded.feature(Feature::LaunchSignInWindow));
+        assert!(!loaded.feature(Feature::AutoSignIn));
+        assert_eq!(
+            Feature::parse("launch_sign_in_window"),
+            Some(Feature::LaunchSignInWindow)
+        );
+        config.set_feature(Feature::LaunchSignInWindow, false);
+        assert!(!config.to_json().unwrap().contains("features"));
     }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);

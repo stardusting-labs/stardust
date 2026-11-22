@@ -6,11 +6,17 @@
 //!     rustc --edition 2021 -O scripts/mock_orbit.rs -o /tmp/mock_orbit
 //!     /tmp/mock_orbit 0
 //!
-//! The argument is the port on 127.0.0.1. 0, or no argument, picks a free
-//! port. The bound address is printed to stdout as `listening 127.0.0.1:PORT`.
-//! One request per connection, answered with `Connection: close`. Each
-//! request is logged to stderr as `METHOD PATH STATUS`. Headers and bodies
-//! are not logged, so the bearer token does not appear in the log.
+//! The first argument is the port on 127.0.0.1. 0, or no argument, picks a
+//! free port. The bound address is printed to stdout as
+//! `listening 127.0.0.1:PORT`. One request per connection, answered with
+//! `Connection: close`. Each request is logged to stderr as
+//! `METHOD PATH STATUS`. Headers and bodies are not logged, so the bearer
+//! token does not appear in the log.
+//!
+//! An optional second argument scripts how a device-token poll answers, for
+//! trying the sign-in window by hand: `approve` (the default), `pending`,
+//! `deny`, `expire`, or `off` (the device routes answer 404). With `pending`
+//! the code is never approved, so the window keeps counting down.
 
 #![forbid(unsafe_code)]
 
@@ -37,6 +43,9 @@ const DESKTOP_STATUS: &str = r#"{"organization_id":"00000000-0000-4000-8000-0000
 const DESKTOP_ALERTS: &str = r#"{"alerts":[{"id":"mock-1","severity":"medium","title":"Example connection finding","created_at":"2026-10-21T00:00:00Z","workspace_path":"/rust-preview/pqc/studio/app/findings/by-severity","immediate":false}]}"#;
 const INVALID_GRANT: &str = r#"{"error":"invalid_grant"}"#;
 const INVALID_TOKEN: &str = r#"{"error":"invalid_token"}"#;
+const AUTHORIZATION_PENDING: &str = r#"{"error":"authorization_pending"}"#;
+const ACCESS_DENIED: &str = r#"{"error":"access_denied"}"#;
+const EXPIRED_TOKEN: &str = r#"{"error":"expired_token"}"#;
 
 const HEAD_LIMIT: usize = 16 * 1024;
 const BODY_LIMIT: usize = 64 * 1024;
@@ -52,13 +61,23 @@ fn main() -> ExitCode {
             Err(_) => return usage(),
         },
     };
+    let script = match args.next().as_deref() {
+        None | Some("approve") => Script::Approve,
+        Some("pending") => Script::Pending,
+        Some("deny") => Script::Deny,
+        Some("expire") => Script::Expire,
+        Some("off") => Script::Off,
+        Some(_) => return usage(),
+    };
     if args.next().is_some() {
         return usage();
     }
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(err) => {
-            say_err(&format!("mock_orbit: cannot listen on 127.0.0.1:{port}: {err}"));
+            say_err(&format!(
+                "mock_orbit: cannot listen on 127.0.0.1:{port}: {err}"
+            ));
             return ExitCode::FAILURE;
         }
     };
@@ -76,15 +95,25 @@ fn main() -> ExitCode {
         let _ = stdout.write_all(ready.as_bytes());
         let _ = stdout.flush();
     }
-    serve_forever(&listener)
+    serve_forever(&listener, script)
 }
 
 fn usage() -> ExitCode {
-    say_err("usage: mock_orbit [PORT]   (0 picks a free port)");
+    say_err("usage: mock_orbit [PORT] [approve|pending|deny|expire|off]   (0 picks a free port)");
     ExitCode::from(2)
 }
 
-fn serve_forever(listener: &TcpListener) -> ! {
+/// How the device routes answer.
+#[derive(Clone, Copy)]
+pub enum Script {
+    Approve,
+    Pending,
+    Deny,
+    Expire,
+    Off,
+}
+
+pub fn serve_forever(listener: &TcpListener, script: Script) -> ! {
     let open = Arc::new(AtomicUsize::new(0));
     loop {
         let stream = match listener.accept() {
@@ -106,7 +135,7 @@ fn serve_forever(listener: &TcpListener) -> ! {
             .name("mock-orbit-conn".to_string())
             .spawn(move || {
                 let _slot = slot;
-                serve(stream);
+                serve(stream, script);
             });
     }
 }
@@ -174,7 +203,7 @@ impl Reply {
     }
 }
 
-fn serve(mut stream: TcpStream) {
+fn serve(mut stream: TcpStream, script: Script) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let (method, path, reply) = match read_request(&mut stream) {
@@ -185,7 +214,7 @@ fn serve(mut stream: TcpStream) {
             status,
         } => (method, path, Reply::empty(status)),
         Incoming::Complete(request) => {
-            let reply = route(&request);
+            let reply = route(&request, script);
             (request.method, request.path, reply)
         }
     };
@@ -195,13 +224,21 @@ fn serve(mut stream: TcpStream) {
     let _ = stream.shutdown(Shutdown::Write);
 }
 
-fn route(request: &Request) -> Reply {
+fn route(request: &Request, script: Script) -> Reply {
     match (request.method.as_str(), request.path.as_str()) {
+        ("POST", PATH_DEVICE_CODE | PATH_DEVICE_TOKEN) if matches!(script, Script::Off) => {
+            Reply::empty(404)
+        }
         ("POST", PATH_DEVICE_CODE) => Reply::json(200, device_code_body()),
         ("POST", PATH_DEVICE_TOKEN) if contains(&request.body, b"refresh_token") => {
             Reply::json(400, INVALID_GRANT)
         }
-        ("POST", PATH_DEVICE_TOKEN) => Reply::json(200, token_body()),
+        ("POST", PATH_DEVICE_TOKEN) => match script {
+            Script::Approve | Script::Off => Reply::json(200, token_body()),
+            Script::Pending => Reply::json(400, AUTHORIZATION_PENDING),
+            Script::Deny => Reply::json(400, ACCESS_DENIED),
+            Script::Expire => Reply::json(400, EXPIRED_TOKEN),
+        },
         ("GET", PATH_DESKTOP_STATUS | PATH_DESKTOP_ALERTS) if !request.bearer_ok => {
             Reply::json(401, INVALID_TOKEN)
         }

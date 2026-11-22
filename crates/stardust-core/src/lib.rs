@@ -28,6 +28,7 @@ pub mod route;
 pub mod schedule;
 pub mod session;
 pub mod settings;
+pub mod signin_window;
 pub mod sink;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testserver;
