@@ -12,7 +12,9 @@ pub mod autostart;
 pub mod check;
 pub mod config;
 pub mod connect;
+pub mod consent;
 pub mod copy;
+pub mod delivery;
 pub mod dnd;
 pub mod http;
 pub mod i18n;
@@ -28,7 +30,7 @@ pub mod session;
 pub mod settings;
 pub mod signin_window;
 pub mod sink;
-#[cfg(test)]
-mod testserver;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testserver;
 pub mod text;
 pub mod token;

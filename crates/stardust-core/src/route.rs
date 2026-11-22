@@ -56,15 +56,19 @@ impl SinkRule {
 
     /// The rule for an integration, or `None` for a kind that is not a sink.
     pub fn for_record(record: &IntegrationRecord) -> Option<Self> {
-        let kind = SinkKind::of(record.kind)?;
-        Some(Self {
+        Some(Self::for_sink(record, SinkKind::of(record.kind)?))
+    }
+
+    /// The rule for an integration routed as `kind`.
+    pub fn for_sink(record: &IntegrationRecord, kind: SinkKind) -> Self {
+        Self {
             min_severity: record
                 .min_severity
                 .unwrap_or_else(|| kind.default_min_severity()),
             max_per_hour: Some(record.max_per_hour.unwrap_or(DEFAULT_MAX_PER_HOUR)),
             quiet_high_bypass: record.quiet_high_bypass.unwrap_or(true),
             local: false,
-        })
+        }
     }
 }
 

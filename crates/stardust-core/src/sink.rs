@@ -1,24 +1,33 @@
-//! One message per alert to Slack, Teams, Discord, or PagerDuty.
+//! One message per alert to Slack, Teams, Discord, or PagerDuty, and with the
+//! integrations panel on, one signed post per alert to a JSON webhook.
 //!
 //! Rendering, destination checks, and status handling live here. Sockets do
 //! not: the app passes a [`Transport`] that pins the resolved public address.
-//! A sink is used only when routing is on and its integration is enabled.
-//! Destination URLs and routing keys come from the keychain and are redacted
-//! in Debug output.
+//! A sink is used only when routing or the panel is on and its integration is
+//! enabled. Destination URLs, routing keys, and signing secrets come from the
+//! keychain and are redacted in Debug output.
 
 use crate::api::{https_origin, workspace_url, AlertItem, Severity};
 use crate::integrations::IntegrationKind;
-use crate::outbound::{public_https, public_https_with_query, CheckedUrl};
+use crate::outbound::{
+    public_https, public_https_with_query, sign, CheckedUrl, PREVIEW_TENANT, PREVIEW_WORKSPACE,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 pub const PAGERDUTY_ENQUEUE_US: &str = "https://events.pagerduty.com/v2/enqueue";
 pub const PAGERDUTY_ENQUEUE_EU: &str = "https://events.eu.pagerduty.com/v2/enqueue";
+/// Where PagerDuty alerts go when no URL is saved.
+pub const PAGERDUTY_DEFAULT_HOST: &str = "events.pagerduty.com";
 /// Id of the fixed message that "Send test" posts.
 pub const TEST_ALERT_ID: &str = "stardust-test";
 
 const OPEN_LABEL: &str = "Open in ORBIT";
+const EVENT_FINDING: &str = "finding.created";
+/// A JSON webhook can tell "Send test" from a real alert by this.
+const EVENT_TEST: &str = "stardust.test";
 const SLACK_HOSTS: [&str; 2] = ["hooks.slack.com", "hooks.slack-gov.com"];
 const DISCORD_HOSTS: [&str; 4] = [
     "discord.com",
@@ -94,6 +103,10 @@ pub enum SinkError {
     /// address, as behind a DNS blocker or a split resolver.
     #[error("the destination resolved to an address that is not public")]
     Blocked,
+    /// Integrations panel only: the user has not accepted what this
+    /// integration sends, to this host.
+    #[error("this integration needs consent first")]
+    NeedsConsent,
 }
 
 impl SinkError {
@@ -123,6 +136,17 @@ pub trait Sink {
 /// was not sent or no answer came back.
 pub trait Transport {
     fn post_json(&self, url: &CheckedUrl, body: &[u8]) -> Result<u16, SinkError>;
+
+    /// [`Transport::post_json`] with extra headers. A transport that cannot
+    /// send them refuses, so a signed post never goes out unsigned.
+    fn post_json_with_headers(
+        &self,
+        _url: &CheckedUrl,
+        _body: &[u8],
+        _headers: &[(String, String)],
+    ) -> Result<u16, SinkError> {
+        Err(SinkError::Refused)
+    }
 }
 
 /// 2xx is delivered. 408, 425, 429, and 5xx are tried again later. Other
@@ -141,6 +165,8 @@ pub enum SinkKind {
     Teams,
     Discord,
     PagerDuty,
+    /// The signed JSON webhook. Routed only with the integrations panel on.
+    Generic,
 }
 
 impl SinkKind {
@@ -156,11 +182,20 @@ impl SinkKind {
         }
     }
 
+    /// [`SinkKind::of`] with the integrations panel on, where the JSON
+    /// webhook goes through the router too. MCP kinds are never routed.
+    pub fn with_panel(kind: IntegrationKind) -> Option<Self> {
+        match kind {
+            IntegrationKind::GenericJson => Some(Self::Generic),
+            other => Self::of(other),
+        }
+    }
+
     /// PagerDuty pages people, so it starts at high. The rest take all.
     pub fn default_min_severity(self) -> Severity {
         match self {
             Self::PagerDuty => Severity::High,
-            Self::Slack | Self::Teams | Self::Discord => Severity::Low,
+            Self::Slack | Self::Teams | Self::Discord | Self::Generic => Severity::Low,
         }
     }
 }
@@ -186,13 +221,17 @@ impl fmt::Debug for SinkSecret {
 /// Slack and Discord must be on their webhook hosts, Teams on a Power
 /// Automate Workflows host (the query holds its signature), and PagerDuty
 /// one of the two Events API v2 endpoints. The port is 443, written or not.
+/// A JSON webhook is any public https URL, the same check `integration url`
+/// makes.
 pub fn check_url(kind: SinkKind, value: &str) -> Result<CheckedUrl, SinkError> {
     let mut checked = match kind {
         SinkKind::Teams => public_https_with_query(value),
-        SinkKind::Slack | SinkKind::Discord | SinkKind::PagerDuty => public_https(value),
+        SinkKind::Slack | SinkKind::Discord | SinkKind::PagerDuty | SinkKind::Generic => {
+            public_https(value)
+        }
     }
     .map_err(|_| SinkError::Refused)?;
-    if !default_port(&checked.url) {
+    if kind != SinkKind::Generic && !default_port(&checked.url) {
         return Err(SinkError::Refused);
     }
     if kind == SinkKind::PagerDuty {
@@ -219,6 +258,7 @@ pub fn check_url(kind: SinkKind, value: &str) -> Result<CheckedUrl, SinkError> {
         SinkKind::PagerDuty => {
             checked.url == PAGERDUTY_ENQUEUE_US || checked.url == PAGERDUTY_ENQUEUE_EU
         }
+        SinkKind::Generic => true,
     };
     if allowed {
         Ok(checked)
@@ -282,12 +322,14 @@ fn discord_webhook_path(path: &str) -> bool {
         && parts.next().is_none()
 }
 
-/// A Slack, Teams, Discord, or PagerDuty destination.
+/// A Slack, Teams, Discord, PagerDuty, or signed JSON destination.
 pub struct WebhookSink<'a> {
     id: String,
     kind: SinkKind,
     url: CheckedUrl,
     routing_key: Option<SinkSecret>,
+    signing_secret: Option<SinkSecret>,
+    interval_minutes: u32,
     source: String,
     transport: &'a dyn Transport,
 }
@@ -307,7 +349,8 @@ impl fmt::Debug for WebhookSink<'_> {
 
 impl<'a> WebhookSink<'a> {
     /// `url` is the saved destination. PagerDuty may leave it out to use the
-    /// US endpoint and must have a routing key.
+    /// US endpoint and must have a routing key. A JSON webhook is built with
+    /// [`WebhookSink::signed_json`], so it cannot be built without a secret.
     pub fn new(
         id: &str,
         kind: SinkKind,
@@ -317,20 +360,47 @@ impl<'a> WebhookSink<'a> {
         transport: &'a dyn Transport,
     ) -> Result<Self, SinkError> {
         let url = match (kind, url) {
+            (SinkKind::Generic, _) => return Err(SinkError::Refused),
             (_, Some(url)) => check_url(kind, url)?,
             (SinkKind::PagerDuty, None) => check_url(kind, PAGERDUTY_ENQUEUE_US)?,
             (_, None) => return Err(SinkError::Missing),
         };
         let routing_key = match kind {
             SinkKind::PagerDuty => Some(check_routing_key(routing_key.ok_or(SinkError::Missing)?)?),
-            SinkKind::Slack | SinkKind::Teams | SinkKind::Discord => None,
+            SinkKind::Slack | SinkKind::Teams | SinkKind::Discord | SinkKind::Generic => None,
         };
         Ok(Self {
             id: id.to_string(),
             kind,
             url,
             routing_key,
+            signing_secret: None,
+            interval_minutes: 0,
             source: source_name(server_base),
+            transport,
+        })
+    }
+
+    /// A JSON webhook. Every post is signed, so it needs its signing secret.
+    pub fn signed_json(
+        id: &str,
+        url: Option<&str>,
+        signing_secret: Option<&str>,
+        interval_minutes: u32,
+        transport: &'a dyn Transport,
+    ) -> Result<Self, SinkError> {
+        let url = check_url(SinkKind::Generic, url.ok_or(SinkError::Missing)?)?;
+        let secret = signing_secret
+            .filter(|secret| !secret.is_empty())
+            .ok_or(SinkError::Missing)?;
+        Ok(Self {
+            id: id.to_string(),
+            kind: SinkKind::Generic,
+            url,
+            routing_key: None,
+            signing_secret: Some(SinkSecret(secret.to_string())),
+            interval_minutes: interval_minutes.clamp(1, 10_080),
+            source: String::new(),
             transport,
         })
     }
@@ -359,8 +429,32 @@ impl<'a> WebhookSink<'a> {
                 let body = pagerduty_change(&sample, &self.source, self.key());
                 self.post(&change, &body)
             }
-            SinkKind::Slack | SinkKind::Teams | SinkKind::Discord => self.deliver(&sample),
+            SinkKind::Slack | SinkKind::Teams | SinkKind::Discord | SinkKind::Generic => {
+                self.deliver(&sample)
+            }
         }
+    }
+
+    /// Post one alert to the JSON webhook, with the headers
+    /// [`crate::outbound::prepare_posts`] uses. The signature's timestamp is
+    /// the time of this try, so a retry stays inside the receiver's window.
+    fn post_signed(&self, alert: &Alert, now: DateTime<Utc>) -> Result<(), SinkError> {
+        let secret = self.signing_secret.as_ref().ok_or(SinkError::Missing)?;
+        let event = alert_event(alert, self.interval_minutes, now);
+        let bytes = serde_json::to_vec(&event).map_err(|_| SinkError::Refused)?;
+        let headers = [
+            ("Orbit-Event", event_type(alert).to_string()),
+            ("Orbit-Delivery", event_id(alert)),
+            (
+                "Orbit-Signature",
+                sign(secret.expose(), now.timestamp(), &bytes),
+            ),
+        ]
+        .map(|(name, value)| (name.to_string(), value));
+        status_result(
+            self.transport
+                .post_json_with_headers(&self.url, &bytes, &headers)?,
+        )
     }
 
     fn key(&self) -> &str {
@@ -378,19 +472,62 @@ impl<'a> WebhookSink<'a> {
 
 impl Sink for WebhookSink<'_> {
     fn deliver(&self, alert: &Alert) -> Result<(), SinkError> {
-        let body = render(self.kind, alert, &self.source, self.key());
+        let body = match self.kind {
+            SinkKind::Slack => slack(alert),
+            SinkKind::Teams => teams(alert),
+            SinkKind::Discord => discord(alert),
+            SinkKind::PagerDuty => pagerduty_trigger(alert, &self.source, self.key()),
+            SinkKind::Generic => return self.post_signed(alert, Utc::now()),
+        };
         self.post(&self.url, &body)
     }
 }
 
-/// The JSON body for one alert.
-pub fn render(kind: SinkKind, alert: &Alert, source: &str, routing_key: &str) -> Value {
-    match kind {
-        SinkKind::Slack => slack(alert),
-        SinkKind::Teams => teams(alert),
-        SinkKind::Discord => discord(alert),
-        SinkKind::PagerDuty => pagerduty_trigger(alert, source, routing_key),
+/// The JSON webhook body for one alert, in the shape of ORBIT's webhook event
+/// draft. Anything added here must be added to what
+/// [`crate::consent::what_is_sent`] states for this kind.
+fn alert_event(alert: &Alert, interval_minutes: u32, now: DateTime<Utc>) -> Value {
+    let mut event = json!({
+        "schema_version": "1",
+        "event_id": event_id(alert),
+        "event_type": event_type(alert),
+        "occurred_at": stamp(alert.created_at),
+        "tenant_id": PREVIEW_TENANT,
+        "workspace_id": PREVIEW_WORKSPACE,
+        "severity": severity_key(alert.severity),
+        "subject_id": alert.id,
+        "summary": alert.title,
+        "last_checked_at": stamp(now),
+        "check_interval_minutes": interval_minutes,
+    });
+    if let Some(link) = &alert.link {
+        event["workspace_url"] = json!(link);
     }
+    event
+}
+
+fn event_type(alert: &Alert) -> &'static str {
+    if alert.is_test() {
+        EVENT_TEST
+    } else {
+        EVENT_FINDING
+    }
+}
+
+/// Follows the alert and its severity, so a retry, or a repeat after a
+/// restart, carries the same id and the receiver can drop it. A higher
+/// severity is a new event, as it is for the router.
+fn event_id(alert: &Alert) -> String {
+    let digest = Sha256::digest(format!(
+        "stardust-alert-event\n{}\n{}",
+        alert.id,
+        severity_key(alert.severity)
+    ));
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes)
+        .into_uuid()
+        .to_string()
 }
 
 /// Slack incoming webhook with Block Kit. `text` is the notification
@@ -904,6 +1041,321 @@ mod tests {
             .unwrap_err(),
             SinkError::Missing
         );
+    }
+
+    /// Every leaf of a JSON value as `path=value`.
+    fn leaves(value: &Value, path: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, inner) in map {
+                    leaves(inner, &format!("{path}.{key}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for inner in items {
+                    leaves(inner, &format!("{path}[]"), out);
+                }
+            }
+            other => out.push(format!("{path}={other}")),
+        }
+    }
+
+    /// The consent wording promises a list. Each real payload is compared
+    /// with it: every value that varies must be one the wording names, and
+    /// the rest are fixed labels of the format.
+    #[test]
+    fn each_consent_statement_covers_exactly_what_its_payload_carries() {
+        use crate::consent::what_is_sent;
+        use crate::integrations::IntegrationKind;
+        let server = TestServer::start(|_| Reply::json(200, "ok"));
+        let transport = LocalTransport::to(&server);
+        let alert = Alert {
+            id: "alert-id-1".to_string(),
+            severity: Severity::High,
+            title: "Example title".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 26, 0, 0, 0).unwrap(),
+            link: Some("https://helloorbit.app/page".to_string()),
+        };
+        let values = [
+            "Example title",
+            "2026-10-26T00:00:00Z",
+            "https://helloorbit.app/page",
+        ];
+        for (kind, integration, url) in [
+            (
+                SinkKind::Slack,
+                IntegrationKind::SlackIncoming,
+                Some(SLACK_URL),
+            ),
+            (
+                SinkKind::Teams,
+                IntegrationKind::TeamsIncoming,
+                Some(TEAMS_URL),
+            ),
+            (
+                SinkKind::Discord,
+                IntegrationKind::DiscordWebhook,
+                Some(DISCORD_URL),
+            ),
+        ] {
+            let sink =
+                WebhookSink::new("ops", kind, url, None, DEFAULT_SERVER_BASE, &transport).unwrap();
+            sink.deliver(&alert).unwrap();
+            let body = server.requests().pop().unwrap().body;
+            for value in values {
+                assert!(body.contains(value), "{kind:?} sends {value}: {body}");
+            }
+            assert!(!body.contains("alert-id-1"), "{kind:?}: {body}");
+            assert!(!body.contains("helloorbit.app\""), "{kind:?}: {body}");
+            assert_eq!(
+                what_is_sent(integration),
+                Some("Alert title, severity, time, and ORBIT link. Nothing else.")
+            );
+        }
+
+        let pager = WebhookSink::new(
+            "pd",
+            SinkKind::PagerDuty,
+            None,
+            Some(ROUTING_KEY),
+            DEFAULT_SERVER_BASE,
+            &transport,
+        )
+        .unwrap();
+        pager.deliver(&alert).unwrap();
+        let body = server.requests().pop().unwrap().json();
+        assert_eq!(body["payload"]["source"], "helloorbit.app");
+        assert_eq!(body["payload"]["custom_details"]["alert_id"], "alert-id-1");
+        assert_eq!(body["routing_key"], ROUTING_KEY);
+        let stated = what_is_sent(IntegrationKind::PagerDuty).unwrap();
+        for part in ["alert ID", "ORBIT host", "routing key"] {
+            assert!(stated.contains(part), "{part}");
+        }
+
+        let json = WebhookSink::signed_json(
+            "json",
+            Some("https://hooks.example/inbound"),
+            Some("example-signing-secret"),
+            45,
+            &transport,
+        )
+        .unwrap();
+        json.deliver(&alert).unwrap();
+        let request = server.requests().pop().unwrap();
+        let mut found = Vec::new();
+        leaves(&request.json(), "", &mut found);
+        let mut keys: Vec<&str> = found
+            .iter()
+            .map(|leaf| leaf.split('=').next().unwrap_or(""))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                ".check_interval_minutes",
+                ".event_id",
+                ".event_type",
+                ".last_checked_at",
+                ".occurred_at",
+                ".schema_version",
+                ".severity",
+                ".subject_id",
+                ".summary",
+                ".tenant_id",
+                ".workspace_id",
+                ".workspace_url",
+            ],
+            "anything new here must be named in the consent wording"
+        );
+        let stated = what_is_sent(IntegrationKind::GenericJson).unwrap();
+        for part in [
+            "title",
+            "severity",
+            "alert and check times",
+            "ORBIT link",
+            "alert ID",
+            "event ID",
+            "placeholder tenant and workspace IDs",
+            "check interval",
+        ] {
+            assert!(stated.contains(part), "{part}");
+        }
+    }
+
+    #[test]
+    fn the_json_webhook_posts_one_signed_event_per_alert() {
+        let server = TestServer::start(|request| match request.path() {
+            "/busy" => Reply::empty(503),
+            "/gone" => Reply::empty(410),
+            _ => Reply::empty(204),
+        });
+        let transport = LocalTransport::to(&server);
+        let secret = "example-signing-secret";
+        let sink = WebhookSink::signed_json(
+            "json",
+            Some("https://hooks.example/inbound"),
+            Some(secret),
+            45,
+            &transport,
+        )
+        .unwrap();
+        assert_eq!(sink.host(), "hooks.example");
+        let alert = high();
+        sink.deliver(&alert).unwrap();
+        let first = server.requests().pop().unwrap();
+        assert_eq!(first.path(), "/inbound");
+        assert_eq!(first.header("orbit-event"), Some("finding.created"));
+        let signature = first.header("orbit-signature").unwrap();
+        assert!(!signature.contains(secret));
+        let now = Utc::now().timestamp();
+        assert!(crate::outbound::verify(
+            secret,
+            signature,
+            first.body.as_bytes(),
+            now
+        ));
+        assert!(!crate::outbound::verify(
+            "another-secret",
+            signature,
+            first.body.as_bytes(),
+            now
+        ));
+        let event = first.json();
+        assert_eq!(event["schema_version"], "1");
+        assert_eq!(event["event_type"], "finding.created");
+        assert_eq!(event["severity"], "high");
+        assert_eq!(event["subject_id"], "mp-41-key-exchange");
+        assert_eq!(event["occurred_at"], "2026-10-26T00:00:00Z");
+        assert_eq!(event["check_interval_minutes"], 45);
+        assert_eq!(event["tenant_id"], "00000000-0000-4000-8000-000000000001");
+        assert_eq!(
+            event["workspace_url"],
+            "https://helloorbit.app/rust-preview/pqc/studio/app/control-room/needs-attention"
+        );
+        assert_eq!(find_disallowed_copy(&first.body), None);
+        let debug = format!("{sink:?}");
+        assert!(!debug.contains(secret), "{debug}");
+        assert!(!debug.contains("/inbound"), "{debug}");
+
+        // A retry, or a repeat after a restart, keeps its id. A rise in
+        // severity is a new event.
+        sink.deliver(&alert).unwrap();
+        let again = server.requests().pop().unwrap();
+        assert_eq!(event["event_id"], again.json()["event_id"]);
+        assert_eq!(first.header("orbit-delivery"), event["event_id"].as_str());
+        assert!(uuid::Uuid::parse_str(event["event_id"].as_str().unwrap()).is_ok());
+        let lower = Alert {
+            severity: Severity::Medium,
+            ..alert.clone()
+        };
+        sink.deliver(&lower).unwrap();
+        let medium = server.requests().pop().unwrap().json();
+        assert_ne!(event["event_id"], medium["event_id"]);
+        assert_eq!(medium["severity"], "medium");
+
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 9, 0, 0).unwrap();
+        sink.send_test(DEFAULT_SERVER_BASE, now).unwrap();
+        let test = server.requests().pop().unwrap();
+        assert_eq!(test.header("orbit-event"), Some("stardust.test"));
+        assert_eq!(test.json()["event_type"], "stardust.test");
+        assert_eq!(test.json()["workspace_url"], "https://helloorbit.app");
+
+        for (url, expected) in [
+            ("https://hooks.example/busy", SinkError::Busy(503)),
+            ("https://hooks.example/gone", SinkError::Rejected(410)),
+        ] {
+            let sink =
+                WebhookSink::signed_json("json", Some(url), Some(secret), 45, &transport).unwrap();
+            assert_eq!(sink.deliver(&alert), Err(expected));
+        }
+    }
+
+    #[test]
+    fn a_json_webhook_needs_a_public_https_url_and_its_secret() {
+        let transport = LocalTransport::closed();
+        let build = |url, secret| WebhookSink::signed_json("json", url, secret, 60, &transport);
+        let url = Some("https://hooks.example/inbound");
+        assert_eq!(build(None, Some("s")).unwrap_err(), SinkError::Missing);
+        assert_eq!(build(url, None).unwrap_err(), SinkError::Missing);
+        assert_eq!(build(url, Some("")).unwrap_err(), SinkError::Missing);
+        assert!(build(Some("https://hooks.example:8443/inbound"), Some("s")).is_ok());
+        for refused in [
+            "http://hooks.example/inbound",
+            "https://127.0.0.1/inbound",
+            "https://localhost/inbound",
+            "https://user@hooks.example/inbound",
+            "https://hooks.example/inbound?token=1",
+        ] {
+            assert_eq!(
+                build(Some(refused), Some("s")).unwrap_err(),
+                SinkError::Refused,
+                "{refused}"
+            );
+        }
+        assert_eq!(
+            WebhookSink::new(
+                "json",
+                SinkKind::Generic,
+                url,
+                None,
+                DEFAULT_SERVER_BASE,
+                &transport
+            )
+            .unwrap_err(),
+            SinkError::Refused,
+            "never built without a secret"
+        );
+    }
+
+    #[test]
+    fn a_transport_without_headers_refuses_rather_than_posting_unsigned() {
+        struct Plain(std::cell::Cell<u32>);
+        impl super::Transport for Plain {
+            fn post_json(
+                &self,
+                _: &crate::outbound::CheckedUrl,
+                _: &[u8],
+            ) -> Result<u16, SinkError> {
+                self.0.set(self.0.get() + 1);
+                Ok(200)
+            }
+        }
+        let plain = Plain(std::cell::Cell::new(0));
+        let sink = WebhookSink::signed_json(
+            "json",
+            Some("https://hooks.example/inbound"),
+            Some("secret"),
+            60,
+            &plain,
+        )
+        .unwrap();
+        assert_eq!(sink.deliver(&high()), Err(SinkError::Refused));
+        assert_eq!(plain.0.get(), 0);
+    }
+
+    #[test]
+    fn the_panel_routes_the_json_webhook_and_nothing_changes_without_it() {
+        use crate::integrations::IntegrationKind;
+        assert_eq!(SinkKind::of(IntegrationKind::GenericJson), None);
+        assert_eq!(
+            SinkKind::with_panel(IntegrationKind::GenericJson),
+            Some(SinkKind::Generic)
+        );
+        for mcp in [IntegrationKind::OrbitMcp, IntegrationKind::SlackMcp] {
+            assert_eq!(SinkKind::of(mcp), None);
+            assert_eq!(SinkKind::with_panel(mcp), None, "never routed");
+        }
+        for kind in [
+            IntegrationKind::SlackIncoming,
+            IntegrationKind::TeamsIncoming,
+            IntegrationKind::DiscordWebhook,
+            IntegrationKind::PagerDuty,
+        ] {
+            assert_eq!(SinkKind::with_panel(kind), SinkKind::of(kind));
+        }
+        assert_eq!(SinkKind::Generic.default_min_severity(), Severity::Low);
+        assert!(!SinkError::NeedsConsent.retry());
+        assert!(!SinkError::NeedsConsent.gone());
     }
 
     #[test]

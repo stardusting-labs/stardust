@@ -65,6 +65,20 @@ impl IntegrationKind {
             Self::SlackIncoming | Self::TeamsIncoming | Self::DiscordWebhook | Self::PagerDuty
         )
     }
+
+    /// Kinds an alert can reach at all. The MCP kinds only list tools when
+    /// asked, so no alert ever goes to them.
+    pub fn delivers_alerts(self) -> bool {
+        !matches!(self, Self::OrbitMcp | Self::SlackMcp)
+    }
+
+    /// The name people know this kind by, from the catalog.
+    pub fn label(self) -> &'static str {
+        catalog()
+            .iter()
+            .find(|entry| entry.kind == self)
+            .map_or("Integration", |entry| entry.name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +179,10 @@ pub struct IntegrationRecord {
     /// Unset means yes, the same rule the bubble follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_high_bypass: Option<bool>,
+    /// Integrations panel only: the user accepted what this integration
+    /// sends, to this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent: Option<crate::consent::Consent>,
 }
 
 impl IntegrationRecord {
@@ -179,6 +197,7 @@ impl IntegrationRecord {
             min_severity: None,
             max_per_hour: None,
             quiet_high_bypass: None,
+            consent: None,
         })
     }
 }
@@ -199,6 +218,10 @@ pub enum IntegrationError {
     Endpoint,
     #[error("max per hour must be 1 through 3600")]
     Rate,
+    #[error("save a destination first with: stardust integration url ID URL")]
+    NoDestination,
+    #[error("the destination changed; review it again before turning it on")]
+    HostChanged,
 }
 
 pub fn parse_id(value: &str) -> Result<String, IntegrationError> {

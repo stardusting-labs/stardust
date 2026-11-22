@@ -12,6 +12,8 @@ mod autostart;
 mod cli;
 mod deliver;
 mod dnd;
+#[cfg(test)]
+mod e2e;
 mod font;
 mod icon;
 mod inbox;

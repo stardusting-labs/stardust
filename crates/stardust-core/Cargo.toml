@@ -8,6 +8,10 @@ rust-version.workspace = true
 repository.workspace = true
 description = "Schedule, check policy, and ORBIT client for the Stardust tray app"
 
+[features]
+# The local HTTP server for tests, for the app crate's end-to-end test.
+test-support = []
+
 [dependencies]
 chrono = { workspace = true }
 chrono-tz = { workspace = true }

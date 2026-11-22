@@ -18,6 +18,8 @@ use stardust_core::check::{
 };
 use stardust_core::config::{default_config_path, load_config, save_config, Config, Feature};
 use stardust_core::connect::{DeviceFlow, FlowPhase, FlowStep};
+use stardust_core::consent::{destination_host, needs_consent};
+use stardust_core::delivery::{outcome_of_test, Outcome};
 use stardust_core::http::{HttpOrbitClient, Revoke};
 use stardust_core::i18n::Language;
 use stardust_core::integrations::{IntegrationRecord, SecretStore};
@@ -72,9 +74,8 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
                 loaded.set_feature(feature, on);
                 save_config(&path, &loaded).map_err(|err| err.to_string())?;
             }
-            for feature in Feature::ALL {
-                let state = if loaded.feature(feature) { "on" } else { "off" };
-                println!("{} {state}", feature.name());
+            for line in feature_lines(&loaded, action) {
+                println!("{line}");
             }
             Ok(())
         }
@@ -130,6 +131,58 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
             crate::integrations_cmd::apply(&config_path(config), action)
         }
     }
+}
+
+/// What `stardust feature ...` prints. The integrations-panel row is left
+/// out of the answer to setting another feature while the panel is off, so
+/// that answer stays as it was; `feature list` always shows it.
+fn feature_lines(config: &Config, action: FeatureAction) -> Vec<String> {
+    let panel = config.features().integrations_panel;
+    let launch_window = config.features().launch_sign_in_window;
+    let shows_panel_row = panel
+        || match action {
+            FeatureAction::List => true,
+            FeatureAction::Set { feature, .. } => feature == Feature::IntegrationsPanel,
+        };
+    let shows_launch_window_row = launch_window
+        || match action {
+            FeatureAction::List => true,
+            FeatureAction::Set { feature, .. } => feature == Feature::LaunchSignInWindow,
+        };
+    let mut lines: Vec<String> = Feature::ALL
+        .into_iter()
+        .filter(|feature| {
+            (*feature != Feature::IntegrationsPanel || shows_panel_row)
+                && (*feature != Feature::LaunchSignInWindow || shows_launch_window_row)
+        })
+        .map(|feature| {
+            let state = if config.feature(feature) { "on" } else { "off" };
+            format!("{} {state}", feature.name())
+        })
+        .collect();
+    if !panel {
+        return lines;
+    }
+    if matches!(
+        action,
+        FeatureAction::Set {
+            feature: Feature::IntegrationsPanel,
+            on: true
+        }
+    ) {
+        // A running app keeps the setting it started with and writes it back.
+        lines.push("If Stardust is running, quit it and start it again to use this.".to_string());
+    }
+    // Turning the panel on stops these until accepted. Say so.
+    for record in config.integrations().iter().filter(|record| {
+        record.enabled && needs_consent(record) && destination_host(record).is_some()
+    }) {
+        let id = &record.id;
+        lines.push(format!(
+            "{id} sends nothing until accepted: stardust integration enable {id}"
+        ));
+    }
+    lines
 }
 
 /// `--demo` makes no use of a sign-in, so under the launch sign-in window flag
@@ -323,6 +376,18 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
     while windows_unavailable && !quit.load(Ordering::SeqCst) {
         match inbox.wait_timeout(Duration::from_secs(45)) {
             Some(UiMsg::Menu(id)) => {
+                let panel_on = config
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .features()
+                    .integrations_panel;
+                if panel_on && id == "integrations" {
+                    // Clickable only with the panel on, and it needs a window.
+                    println!(
+                        "The integrations page needs a window. Use: stardust integration list"
+                    );
+                    continue;
+                }
                 if let Some(request) = timer_request(&config, &live, &id) {
                     request.queue(&live);
                     wake.notify_one();
@@ -331,6 +396,7 @@ fn run_loop(path: PathBuf, headless: bool, demo: bool) -> Result<(), String> {
                 }
                 let effect = {
                     let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+                    loaded.adopt_saved_integrations(&path);
                     match apply_menu(&mut loaded, &id, Utc::now()) {
                         Ok(MenuEffect::Refresh) => {
                             if let Err(err) = save_config(&path, &loaded) {
@@ -445,7 +511,7 @@ fn scheduler_thread(job: ScheduleJob) {
                 finish_sign_out_on_quit(&backend, &config, &tokens, &live);
                 break;
             }
-            run_requests(&backend, &config, &tokens, &live, &inbox, &mut flow);
+            run_requests(&backend, &config, &path, &tokens, &live, &inbox, &mut flow);
             if manual.swap(false, Ordering::SeqCst) {
                 let signal = run_check(
                     &backend,
@@ -459,7 +525,7 @@ fn scheduler_thread(job: ScheduleJob) {
                 )
                 .await;
                 failures = next_failures(failures, signal.soften);
-                publish(&inbox, &tokens, &mut router, signal);
+                publish(&inbox, &tokens, &mut router, signal, &config, &path, &live);
                 planned = None;
                 continue;
             }
@@ -509,22 +575,77 @@ fn scheduler_thread(job: ScheduleJob) {
             )
             .await;
             failures = next_failures(failures, signal.soften);
-            publish(&inbox, &tokens, &mut router, signal);
+            publish(&inbox, &tokens, &mut router, signal, &config, &path, &live);
         }
     });
 }
 
 /// Hand a check to the tray and the windows, then make its sink posts, so
 /// the bubble does not wait for the network.
-fn publish(inbox: &Inbox, tokens: &KeychainTokenStore, router: &mut Router, signal: CheckSignal) {
+fn publish(
+    inbox: &Inbox,
+    tokens: &KeychainTokenStore,
+    router: &mut Router,
+    signal: CheckSignal,
+    config: &Mutex<Config>,
+    path: &Path,
+    live: &LivePet,
+) {
     inbox.push(UiMsg::Pet);
     if signal.publish {
         inbox.push(UiMsg::Checked(signal.presentation));
     }
     if let Some(posts) = signal.posts {
         deliver::deliver(&posts.notes);
-        routing::route_remote(router, &posts.routing(tokens), &HttpsTransport::new());
+        if posts.panel {
+            let outcomes =
+                routing::route_consented(router, &posts.routing(tokens), &HttpsTransport::new());
+            apply_outcomes(config, path, live, inbox, &outcomes);
+        } else {
+            routing::route_remote(router, &posts.routing(tokens), &HttpsTransport::new());
+        }
     }
+}
+
+/// With the integrations panel on, keep each integration's result for the
+/// panel and the tray. A destination that says it is gone (404 or 410) is
+/// switched off and saved, with a bubble so it is not missed.
+pub(crate) fn apply_outcomes(
+    config: &Mutex<Config>,
+    path: &Path,
+    live: &LivePet,
+    inbox: &Inbox,
+    outcomes: &[(String, Outcome)],
+) {
+    if outcomes.is_empty() {
+        return;
+    }
+    for (id, outcome) in outcomes {
+        live.record_delivery(id, *outcome);
+    }
+    let gone: Vec<String> = outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome == Outcome::GoneDisabled)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if !gone.is_empty() {
+        let language = {
+            let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+            loaded.adopt_saved_integrations(path);
+            for id in &gone {
+                // It may have been removed from the file since this check.
+                if loaded.set_integration_enabled(id, false).is_ok() {
+                    eprintln!("stardust: integration {id} was turned off: its destination is gone");
+                }
+            }
+            if let Err(err) = save_config(path, &loaded) {
+                eprintln!("stardust: could not save config: {err}");
+            }
+            loaded.effective_language()
+        };
+        inbox.push(UiMsg::Checked(routing::gone_presentation(&gone, language)));
+    }
+    inbox.push(UiMsg::Pet);
 }
 
 fn next_failures(current: u32, soften: bool) -> u32 {
@@ -636,6 +757,7 @@ fn timer_request_with(
 fn run_requests<S: TokenStore + SecretStore>(
     backend: &Backend,
     config: &Mutex<Config>,
+    path: &Path,
     tokens: &S,
     live: &LivePet,
     inbox: &Inbox,
@@ -671,7 +793,7 @@ fn run_requests<S: TokenStore + SecretStore>(
     }
     let tests = live.take_tests();
     if !tests.is_empty() {
-        send_tests(config, tokens, inbox, &tests);
+        send_tests(config, path, tokens, live, inbox, &tests);
     }
 }
 
@@ -886,28 +1008,49 @@ fn ended_update(attempt: Option<u64>, end: SignInEnd) -> SignInUpdate {
     }
 }
 
-fn send_tests(config: &Mutex<Config>, tokens: &dyn SecretStore, inbox: &Inbox, ids: &[String]) {
-    let (records, server_base, language, routing_on) = {
+fn send_tests<S: SecretStore>(
+    config: &Mutex<Config>,
+    path: &Path,
+    tokens: &S,
+    live: &LivePet,
+    inbox: &Inbox,
+    ids: &[String],
+) {
+    let (records, server_base, language, features, interval_minutes) = {
         let loaded = config.lock().unwrap_or_else(|err| err.into_inner());
         (
             loaded.integrations().to_vec(),
             server_base_of(&loaded).unwrap_or_else(|_| DEFAULT_SERVER_BASE.to_string()),
             loaded.effective_language(),
-            loaded.features().routing,
+            loaded.features(),
+            loaded.schedule().interval_minutes().unwrap_or(1440),
         )
     };
-    if !routing_on {
+    if !features.routes_remote() {
         return;
     }
     for id in ids {
-        let result = routing::send_test(
-            &records,
-            tokens,
-            id,
-            &server_base,
-            Utc::now(),
-            &HttpsTransport::new(),
-        );
+        let result = if features.integrations_panel {
+            let check = CheckRouting {
+                records: &records,
+                secrets: tokens,
+                items: &[],
+                server_base: &server_base,
+                quiet: false,
+                now: Instant::now(),
+                interval_minutes,
+            };
+            routing::send_test_consented(&check, id, Utc::now(), &HttpsTransport::new())
+        } else {
+            routing::send_test(
+                &records,
+                tokens,
+                id,
+                &server_base,
+                Utc::now(),
+                &HttpsTransport::new(),
+            )
+        };
         match &result {
             Ok(host) => eprintln!("stardust: test sent to {id} ({host})"),
             Err(err) => eprintln!("stardust: test to {id} did not go through: {err}"),
@@ -915,6 +1058,10 @@ fn send_tests(config: &Mutex<Config>, tokens: &dyn SecretStore, inbox: &Inbox, i
         inbox.push(UiMsg::Checked(routing::test_presentation(
             id, &result, language,
         )));
+        if features.integrations_panel {
+            let outcome = (id.clone(), outcome_of_test(&result));
+            apply_outcomes(config, path, live, inbox, &[outcome]);
+        }
     }
 }
 
@@ -989,6 +1136,10 @@ struct PendingPosts {
     server_base: String,
     quiet: bool,
     now: Instant,
+    interval_minutes: u32,
+    /// The integrations panel is on, so consent and the signed JSON webhook
+    /// apply and results are kept.
+    panel: bool,
 }
 
 impl PendingPosts {
@@ -1000,6 +1151,7 @@ impl PendingPosts {
             server_base: &self.server_base,
             quiet: self.quiet,
             now: self.now,
+            interval_minutes: self.interval_minutes,
         }
     }
 }
@@ -1083,14 +1235,20 @@ async fn run_check<S: TokenStore + SecretStore>(
         Ok(outcome) => {
             let item_count = u32::try_from(outcome.items.len()).unwrap_or(u32::MAX);
             let high_severity = outcome.items.iter().any(AlertItem::shows_immediately);
-            let (records, routing_on) = {
+            let (records, routing_on, panel_on) = {
                 let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+                loaded.adopt_saved_integrations(path);
                 note_anchor(loaded.state_mut(), kind);
                 note_success(loaded.state_mut(), now, None);
                 if let Err(err) = save_config(path, &loaded) {
                     eprintln!("stardust: could not save config: {err}");
                 }
-                (loaded.integrations().to_vec(), loaded.features().routing)
+                let features = loaded.features();
+                (
+                    loaded.integrations().to_vec(),
+                    features.routing,
+                    features.integrations_panel,
+                )
             };
             live.set_observed(ObservedCheck::Succeeded {
                 item_count,
@@ -1100,8 +1258,12 @@ async fn run_check<S: TokenStore + SecretStore>(
             let local = now.with_timezone(&schedule.timezone());
             let quiet = schedule.is_quiet_at(local);
             let manual = matches!(kind, CheckKind::Manual);
+            let interval_minutes = schedule.interval_minutes().unwrap_or(1440);
             let summary_only: Vec<IntegrationRecord>;
-            let summary_records: &[IntegrationRecord] = if routing_on {
+            let summary_records: &[IntegrationRecord] = if panel_on {
+                // What consent states holds only for the per-alert posts.
+                &[]
+            } else if routing_on {
                 summary_only = routing::summary_records(&records, true);
                 &summary_only
             } else {
@@ -1115,48 +1277,51 @@ async fn run_check<S: TokenStore + SecretStore>(
                     quiet,
                     manual,
                     now,
-                    interval_minutes: schedule.interval_minutes().unwrap_or(1440),
+                    interval_minutes,
                     server_base: &server_base,
                 },
             );
             let mut presentation = outcome.presentation;
             let mut posts = None;
-            if !routing_on {
+            if !routing_on && !panel_on {
                 deliver::deliver(&notes);
             } else {
                 let routed_at = Instant::now();
-                let reached = routing::route_local(
-                    router,
-                    &CheckRouting {
-                        records: &records,
-                        secrets: tokens,
-                        items: &outcome.items,
-                        server_base: &server_base,
-                        quiet,
-                        now: routed_at,
-                    },
-                    &crate::dnd::active,
-                );
-                if !manual {
-                    // Only what this computer has not shown yet, outside
-                    // quiet hours and do-not-disturb, and summed up again.
-                    let fresh: Vec<AlertItem> = reached
-                        .shown
-                        .iter()
-                        .map(|&at| outcome.items[at].clone())
-                        .collect();
-                    presentation = present(
-                        &fresh,
-                        quiet,
-                        local,
-                        false,
-                        &server_base,
-                        &outcome.workspace_path,
+                if routing_on {
+                    let reached = routing::route_local(
+                        router,
+                        &CheckRouting {
+                            records: &records,
+                            secrets: tokens,
+                            items: &outcome.items,
+                            server_base: &server_base,
+                            quiet,
+                            now: routed_at,
+                            interval_minutes,
+                        },
+                        &crate::dnd::active,
                     );
-                    presentation.show_bubble &= !fresh.is_empty();
+                    if !manual {
+                        // Only what this computer has not shown yet, outside
+                        // quiet hours and do-not-disturb, and summed up again.
+                        let fresh: Vec<AlertItem> = reached
+                            .shown
+                            .iter()
+                            .map(|&at| outcome.items[at].clone())
+                            .collect();
+                        presentation = present(
+                            &fresh,
+                            quiet,
+                            local,
+                            false,
+                            &server_base,
+                            &outcome.workspace_path,
+                        );
+                        presentation.show_bubble &= !fresh.is_empty();
+                    }
+                    // A check the user asked for still answers in the bubble.
+                    presentation.show_os_notification &= reached.notification;
                 }
-                // A check the user asked for still answers in the bubble.
-                presentation.show_os_notification &= reached.notification;
                 posts = Some(PendingPosts {
                     notes,
                     records,
@@ -1164,6 +1329,8 @@ async fn run_check<S: TokenStore + SecretStore>(
                     server_base: server_base.clone(),
                     quiet,
                     now: routed_at,
+                    interval_minutes,
+                    panel: panel_on,
                 });
             }
             if presentation.show_os_notification {
@@ -1234,6 +1401,7 @@ fn soft_signal(
     let previous = live.observed();
     let (language, window_flag) = {
         let mut loaded = config.lock().unwrap_or_else(|err| err.into_inner());
+        loaded.adopt_saved_integrations(path);
         note_anchor(loaded.state_mut(), kind);
         if let Err(err) = save_config(path, &loaded) {
             eprintln!("stardust: could not save config: {err}");
@@ -1392,6 +1560,7 @@ mod tests {
     use stardust_core::policy::Notice;
     use stardust_core::signin_window::{SessionRead, SignInEnd};
     use stardust_core::token::{MemoryTokenStore, StoredToken, TokenError, TokenStore};
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -1515,7 +1684,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         let attempt = live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert_eq!(orbit.count(PATH_DEVICE_CODE), 1);
         assert_eq!(flow.as_ref().unwrap().window_attempt(), Some(attempt));
         assert_eq!(
@@ -1548,7 +1725,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_connect();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert_eq!(flow.as_ref().unwrap().window_attempt(), None);
         assert!(matches!(
             updates(&inbox).as_slice(),
@@ -1566,7 +1751,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         updates(&inbox);
         step_flow(&backend, &store, &live, &inbox, &mut flow, later());
         assert!(flow.is_none());
@@ -1592,7 +1785,15 @@ mod tests {
         };
         let mut flow = None;
         let attempt = live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         updates(&inbox);
         step_flow(&backend, &store, &live, &inbox, &mut flow, later());
         assert!(flow.is_none());
@@ -1627,7 +1828,15 @@ mod tests {
             let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
             let mut flow = None;
             live.request_new_sign_in();
-            run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+            run_requests(
+                &backend,
+                &config,
+                Path::new("/tmp/stardust-run-requests.json"),
+                &store,
+                &live,
+                &inbox,
+                &mut flow,
+            );
             updates(&inbox);
             step_flow(&backend, &store, &live, &inbox, &mut flow, later());
             assert!(flow.is_none(), "{expected:?}");
@@ -1650,7 +1859,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_new_sign_in();
-        run_requests(&backend_off, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend_off,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert!(flow.is_none());
         assert_eq!(live.phase(), FlowPhase::Idle);
         assert!(matches!(
@@ -1664,7 +1881,15 @@ mod tests {
         let closed = backend("http://127.0.0.1:1");
         let config = config_on("http://127.0.0.1:1", &[Feature::LaunchSignInWindow]);
         live.request_new_sign_in();
-        run_requests(&closed, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &closed,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert!(matches!(
             updates(&inbox).as_slice(),
             [SignInUpdate::Ended {
@@ -1682,7 +1907,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_new_sign_in();
-        run_requests(&live_backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &live_backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         updates(&inbox);
         let closed = backend("http://127.0.0.1:1");
         step_flow(&closed, &store, &live, &inbox, &mut flow, later());
@@ -1708,13 +1941,29 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         step_flow(&backend, &store, &live, &inbox, &mut flow, later());
         assert_eq!(orbit.count(PATH_DEVICE_TOKEN), 1);
         while inbox.try_pop().is_some() {}
 
         live.request_cancel();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert!(flow.is_none());
         assert_eq!(live.phase(), FlowPhase::Idle);
         assert!(
@@ -1736,18 +1985,42 @@ mod tests {
 
         live.request_new_sign_in();
         live.request_cancel();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert_eq!(orbit.count(PATH_DEVICE_CODE), 0);
         assert!(flow.is_none());
 
         live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert_eq!(orbit.count(PATH_DEVICE_CODE), 1);
         let first = flow.as_ref().unwrap().window_attempt().unwrap();
 
         live.request_cancel();
         let second = live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert_eq!(orbit.count(PATH_DEVICE_CODE), 2, "the old code is replaced");
         assert_eq!(flow.as_ref().unwrap().window_attempt(), Some(second));
         assert!(second > first);
@@ -1761,9 +2034,25 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         let old = live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         let new = live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         let stamps: Vec<u64> = updates(&inbox)
             .iter()
             .filter_map(|update| match update {
@@ -1821,12 +2110,28 @@ mod tests {
             .unwrap();
         let mut flow = None;
         live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert!(flow.is_some());
 
         crate::signin::begin_sign_out(&store, &live).unwrap();
         assert!(store.load(Utc::now()).unwrap().is_none());
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert!(flow.is_none(), "it could otherwise save a token afterwards");
         assert_eq!(live.phase(), FlowPhase::Idle);
         assert_eq!(live.signed_in(), Some(false));
@@ -1918,7 +2223,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert_eq!(orbit.count(PATH_DEVICE_CODE), 1);
         updates(&inbox);
 
@@ -1928,7 +2241,15 @@ mod tests {
         step_flow(&backend, &store, &live, &inbox, &mut flow, later());
         assert!(matches!(updates(&inbox).as_slice(), [SignInUpdate::Done]));
 
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert_eq!(orbit.count(PATH_DEVICE_CODE), 1, "no code nobody needs");
         assert!(flow.is_none(), "no flow left polling with no window");
         assert!(updates(&inbox).is_empty());
@@ -1944,7 +2265,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_connect();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         live.request_connect();
         step_flow(&backend, &store, &live, &inbox, &mut flow, later());
         assert!(live.take_flow_requests().connect.is_some());
@@ -2021,7 +2350,15 @@ mod tests {
             .join("config.json");
         let mut flow = None;
         let attempt = live.request_new_sign_in();
-        run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert!(matches!(
             updates(&inbox).as_slice(),
             [SignInUpdate::Issued { attempt: stamped, .. }] if *stamped == attempt
@@ -2070,7 +2407,15 @@ mod tests {
             let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
             let mut flow = None;
             live.request_new_sign_in();
-            run_requests(&backend, &config, &store, &live, &inbox, &mut flow);
+            run_requests(
+                &backend,
+                &config,
+                Path::new("/tmp/stardust-run-requests.json"),
+                &store,
+                &live,
+                &inbox,
+                &mut flow,
+            );
             updates(&inbox);
             step_flow(&backend, &store, &live, &inbox, &mut flow, later());
             assert!(flow.is_none(), "{expected:?}");
@@ -2090,7 +2435,15 @@ mod tests {
         let (live, inbox, store) = (LivePet::new(1.0), Inbox::new(), TestStore::new());
         let mut flow = None;
         live.request_new_sign_in();
-        run_requests(&backend_off, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend_off,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         assert!(matches!(
             updates(&inbox).as_slice(),
             [SignInUpdate::Ended {
@@ -2103,7 +2456,15 @@ mod tests {
         let config = config_on(&base, &[Feature::LaunchSignInWindow]);
         let backend_pending = backend(&base);
         live.request_new_sign_in();
-        run_requests(&backend_pending, &config, &store, &live, &inbox, &mut flow);
+        run_requests(
+            &backend_pending,
+            &config,
+            Path::new("/tmp/stardust-run-requests.json"),
+            &store,
+            &live,
+            &inbox,
+            &mut flow,
+        );
         updates(&inbox);
         step_flow(&backend_pending, &store, &live, &inbox, &mut flow, later());
         assert!(flow.is_some(), "still waiting for approval");
@@ -2123,6 +2484,80 @@ mod tests {
             .unwrap()
             .set_feature(Feature::LaunchSignInWindow, true);
         assert!(!first_run_connect(&config));
+    }
+
+    #[test]
+    fn feature_output_adds_the_panel_row_only_to_the_list_while_it_is_off() {
+        use super::feature_lines;
+        use crate::cli::FeatureAction;
+        use stardust_core::integrations::IntegrationKind;
+        let mut config = Config::default_for("UTC").unwrap();
+        config.set_feature(Feature::Routing, true);
+        let set_routing = FeatureAction::Set {
+            feature: Feature::Routing,
+            on: true,
+        };
+        assert_eq!(
+            feature_lines(&config, set_routing),
+            ["auto-sign-in off", "jittered-backoff off", "routing on"],
+            "as before the flag existed"
+        );
+        assert_eq!(
+            feature_lines(&config, FeatureAction::List),
+            [
+                "auto-sign-in off",
+                "jittered-backoff off",
+                "routing on",
+                "integrations-panel off",
+                "launch-sign-in-window off"
+            ]
+        );
+        assert_eq!(
+            feature_lines(
+                &config,
+                FeatureAction::Set {
+                    feature: Feature::IntegrationsPanel,
+                    on: false
+                }
+            )
+            .len(),
+            4
+        );
+
+        config
+            .add_integration(IntegrationKind::SlackIncoming, "ops")
+            .unwrap();
+        config
+            .set_integration_host("ops", "hooks.slack.com")
+            .unwrap();
+        config.set_integration_enabled("ops", true).unwrap();
+        config
+            .add_integration(IntegrationKind::SlackIncoming, "bare")
+            .unwrap();
+        config.set_integration_enabled("bare", true).unwrap();
+        config.set_feature(Feature::IntegrationsPanel, true);
+        let lines = feature_lines(
+            &config,
+            FeatureAction::Set {
+                feature: Feature::IntegrationsPanel,
+                on: true,
+            },
+        );
+        assert_eq!(lines[3], "integrations-panel on");
+        assert_eq!(
+            lines[4],
+            "If Stardust is running, quit it and start it again to use this."
+        );
+        assert_eq!(
+            lines[5],
+            "ops sends nothing until accepted: stardust integration enable ops"
+        );
+        assert_eq!(
+            lines.len(),
+            6,
+            "one with no destination sends nothing anyway"
+        );
+        assert_eq!(feature_lines(&config, FeatureAction::List).len(), 6);
     }
 
     #[test]

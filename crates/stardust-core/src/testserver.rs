@@ -142,15 +142,26 @@ impl crate::sink::Transport for LocalTransport {
         url: &crate::outbound::CheckedUrl,
         body: &[u8],
     ) -> Result<u16, crate::sink::SinkError> {
+        self.post_json_with_headers(url, body, &[])
+    }
+
+    fn post_json_with_headers(
+        &self,
+        url: &crate::outbound::CheckedUrl,
+        body: &[u8],
+        headers: &[(String, String)],
+    ) -> Result<u16, crate::sink::SinkError> {
         let rest = url.url.strip_prefix("https://").unwrap_or(&url.url);
         let path = rest.find('/').map(|at| &rest[at..]).unwrap_or("/");
         let target = format!("{}{path}", self.base);
-        match self
+        let mut request = self
             .agent
             .post(&target)
-            .set("Content-Type", "application/json")
-            .send_bytes(body)
-        {
+            .set("Content-Type", "application/json");
+        for (name, value) in headers {
+            request = request.set(name, value);
+        }
+        match request.send_bytes(body) {
             Ok(response) => Ok(response.status()),
             Err(ureq::Error::Status(status, _)) => Ok(status),
             Err(_) => Err(crate::sink::SinkError::Unreachable),
