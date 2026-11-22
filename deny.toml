@@ -24,6 +24,10 @@ ignore = [
   { id = "RUSTSEC-2024-0384", reason = "instant: accepted pre-launch per t5335s24151; replace after launch" },
   { id = "RUSTSEC-2024-0436", reason = "paste: accepted pre-launch per t5335s24151; replace after launch" },
   { id = "RUSTSEC-2026-0206", reason = "rustybuzz: accepted pre-launch per t5335s24151; replace after launch" },
+  # chrono and chrono-tz are existing unmaintained Stardust dependencies, not introduced by gpui-kit.
+  # Temporary until a separately approved replacement (t5602s25359).
+  { id = "RUSTSEC-2026-0543", reason = "chrono: existing unmaintained dependency; temporary until a separately approved replacement" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz: existing unmaintained dependency; temporary until a separately approved replacement" },
 ]
 
 [licenses]
