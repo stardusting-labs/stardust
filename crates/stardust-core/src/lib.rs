@@ -34,3 +34,4 @@ pub mod sink;
 pub mod testserver;
 pub mod text;
 pub mod token;
+pub mod voice;
